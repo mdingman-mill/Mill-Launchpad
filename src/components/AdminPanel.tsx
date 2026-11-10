@@ -125,14 +125,6 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
     startup: users.filter((u) => u.organizationProfile?.type === 'Startup').length,
   };
 
-  // Calculate Mock Monthly Recurring Revenue (MRR)
-  const mockMRR = users.reduce((sum, u) => {
-    const p = plans.find((pl) => pl.id === u.planId);
-    if (!p || p.price === 0) return sum;
-    const isNp = u.organizationProfile?.type === 'Nonprofit';
-    const amount = isNp && u.nonprofitDiscountApproved ? p.priceNonprofit : p.price;
-    return sum + amount;
-  }, 0);
 
   /* =========================================================================
    * USER ACTIONS
@@ -406,7 +398,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
         {[
           { key: 'dashboard', label: 'Executive Dashboard', icon: LayoutDashboard },
           { key: 'users', label: `Users & Organizations (${users.length})`, icon: UsersIcon },
-          { key: 'billing', label: `Billing & MRR ($${mockMRR.toFixed(0)})`, icon: CreditCard },
+          { key: 'billing', label: 'Billing & Invoices', icon: CreditCard },
           { key: 'access', label: 'Access Control', icon: ShieldCheck },
           { key: 'plans', label: 'Plans & Limits', icon: Sliders },
           { key: 'tools', label: 'Tools Config', icon: Wrench },
@@ -442,13 +434,13 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
             <div className="bg-white p-4 rounded-2xl border border-slate-200 shadow-xs">
               <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400">Total Users</span>
               <div className="text-2xl font-extrabold text-slate-900 mt-1">{totalUsersCount}</div>
-              <span className="text-[10px] text-emerald-600 font-semibold">+15 Preloaded</span>
+              <span className="text-[10px] text-slate-500 font-medium">Firestore users</span>
             </div>
 
             <div className="bg-white p-4 rounded-2xl border border-slate-200 shadow-xs">
               <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400">Active This Month</span>
               <div className="text-2xl font-extrabold text-slate-900 mt-1">{activeThisMonthCount}</div>
-              <span className="text-[10px] text-slate-500 font-medium">Generated copy</span>
+              <span className="text-[10px] text-slate-500 font-medium">Generating copy</span>
             </div>
 
             <div className="bg-white p-4 rounded-2xl border border-slate-200 shadow-xs">
@@ -458,65 +450,67 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
             </div>
 
             <div className="bg-white p-4 rounded-2xl border border-slate-200 shadow-xs">
-              <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400">Mock MRR</span>
-              <div className="text-2xl font-extrabold text-emerald-700 mt-1">${mockMRR.toFixed(0)}</div>
-              <span className="text-[10px] text-emerald-600 font-medium">Monthly recurring</span>
+              <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400">Database</span>
+              <div className="text-lg font-extrabold text-emerald-700 mt-1">Cloud Firestore</div>
+              <span className="text-[10px] text-emerald-600 font-medium">Enterprise edition</span>
             </div>
 
             <div className="bg-white p-4 rounded-2xl border border-slate-200 shadow-xs">
               <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400">Nonprofit Ratio</span>
               <div className="text-2xl font-extrabold text-slate-900 mt-1">
-                {Math.round((usersByOrgType.nonprofit / totalUsersCount) * 100)}%
+                {totalUsersCount > 0 ? Math.round((usersByOrgType.nonprofit / totalUsersCount) * 100) : 0}%
               </div>
               <span className="text-[10px] text-slate-500 font-medium">{usersByOrgType.nonprofit} Nonprofits</span>
             </div>
 
             <div className="bg-white p-4 rounded-2xl border border-slate-200 shadow-xs">
-              <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400">Paid Tier Share</span>
+              <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400">Startups</span>
               <div className="text-2xl font-extrabold text-slate-900 mt-1">
-                {Math.round(((usersByPlan.pro + usersByPlan.team) / totalUsersCount) * 100)}%
+                {usersByOrgType.startup}
               </div>
-              <span className="text-[10px] text-slate-500 font-medium">{usersByPlan.pro + usersByPlan.team} Pro / Team</span>
+              <span className="text-[10px] text-slate-500 font-medium">Seed & venture</span>
             </div>
           </div>
 
-          {/* Charts & Breakdown Grid */}
+          {/* Real Firestore Activity Feed & Breakdown Grid */}
           <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
-            {/* Visual Bar Graph: Generations & Signups Over Time (7 cols) */}
+            {/* Live Activity Trail from Firestore (7 cols) */}
             <div className="lg:col-span-7 bg-white p-6 rounded-2xl border border-slate-200 shadow-xs space-y-4">
               <div className="flex items-center justify-between pb-3 border-b border-slate-100">
                 <div className="flex items-center gap-2">
                   <TrendingUp className="w-4 h-4 text-rose-600" />
-                  <h3 className="text-sm font-bold text-slate-900">Signups & Generation Velocity Over Time</h3>
+                  <h3 className="text-sm font-bold text-slate-900">Live Activity Feed (Cloud Firestore)</h3>
                 </div>
-                <span className="text-[10px] font-semibold text-slate-400">Last 6 Months (Simulated)</span>
+                <span className="text-[10px] font-semibold text-emerald-600 flex items-center gap-1">
+                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 inline-block"></span>
+                  Real-time
+                </span>
               </div>
 
-              {/* Bar visualization */}
-              <div className="space-y-3 pt-2">
-                {[
-                  { month: 'May 2026', signups: 2, gens: 210, barH: '35%' },
-                  { month: 'Jun 2026', signups: 3, gens: 440, barH: '55%' },
-                  { month: 'Jul 2026', signups: 2, gens: 620, barH: '65%' },
-                  { month: 'Aug 2026', signups: 3, gens: 890, barH: '80%' },
-                  { month: 'Sep 2026', signups: 2, gens: 1140, barH: '90%' },
-                  { month: 'Oct 2026', signups: 3, gens: 1480, barH: '100%' },
-                ].map((item) => (
-                  <div key={item.month} className="space-y-1">
-                    <div className="flex justify-between text-xs font-semibold">
-                      <span className="text-slate-600">{item.month}</span>
-                      <span className="font-mono text-slate-800">
-                        {item.gens} generations <span className="text-slate-400 font-normal">({item.signups} new orgs)</span>
+              {/* Real Audit logs stream */}
+              <div className="space-y-2.5 pt-1">
+                {auditLogs.length === 0 ? (
+                  <div className="p-8 text-center text-xs text-slate-400">
+                    No activity recorded yet. Live user logins, marketing tool generations, and edits will appear here.
+                  </div>
+                ) : (
+                  auditLogs.slice(0, 7).map((log) => (
+                    <div
+                      key={log.id}
+                      className="p-3 rounded-xl bg-slate-50/70 border border-slate-100 flex items-center justify-between text-xs gap-3"
+                    >
+                      <div className="min-w-0">
+                        <span className="font-bold text-slate-900 block truncate">{log.details}</span>
+                        <span className="text-[11px] text-slate-500">
+                          by {log.actorName || log.actorEmail} ({log.action})
+                        </span>
+                      </div>
+                      <span className="text-[10px] font-mono text-slate-400 shrink-0">
+                        {new Date(log.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
                       </span>
                     </div>
-                    <div className="w-full h-3 bg-slate-100 rounded-full overflow-hidden flex">
-                      <div
-                        className="bg-gradient-to-r from-rose-500 to-rose-600 h-full rounded-full transition-all duration-500"
-                        style={{ width: item.barH }}
-                      />
-                    </div>
-                  </div>
-                ))}
+                  ))
+                )}
               </div>
             </div>
 

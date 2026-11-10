@@ -1,7 +1,6 @@
 import React, { useState } from 'react';
 import { User } from '../types';
 import { authService } from '../services/authService';
-import { DemoModeBadge } from './DemoModeBadge';
 import { APP_CONFIG } from '../config';
 import {
   Sparkles,
@@ -13,7 +12,6 @@ import {
   Bookmark,
   CreditCard,
   ChevronDown,
-  Eye,
   ArrowRight,
   ExternalLink,
 } from 'lucide-react';
@@ -34,45 +32,16 @@ export const Header: React.FC<HeaderProps> = ({
   onOpenUpgrade,
 }) => {
   const [userDropdownOpen, setUserDropdownOpen] = useState(false);
-  const impersonator = authService.getImpersonatingAdmin();
 
   const handleSignOut = () => {
     setUserDropdownOpen(false);
     authService.signOut();
   };
 
-  const handleStopImpersonating = () => {
-    authService.stopImpersonating();
-    onChangeView('admin');
-  };
-
-  const isAdminRole =
-    currentUser?.role === 'super_admin' ||
-    currentUser?.role === 'admin' ||
-    currentUser?.role === 'support';
+  const isAdminRole = currentUser?.role === 'super_admin';
 
   return (
     <header className="sticky top-0 z-40 bg-white/95 backdrop-blur-md border-b border-slate-200">
-      {/* Impersonation Notification Banner */}
-      {impersonator && currentUser && (
-        <div className="bg-amber-500 text-slate-950 px-4 py-2 text-xs font-bold flex items-center justify-between">
-          <div className="flex items-center gap-2">
-            <Eye className="w-4 h-4 animate-pulse" />
-            <span>
-              Impersonation Active: Currently viewing Launchpad as <strong>{currentUser.name}</strong> ({currentUser.organizationProfile?.orgName || currentUser.email})
-            </span>
-          </div>
-
-          <button
-            onClick={handleStopImpersonating}
-            className="px-3 py-1 bg-slate-950 text-white rounded-lg text-xs font-bold hover:bg-slate-800 transition-colors flex items-center gap-1 shadow-xs"
-          >
-            <span>Exit to Admin View</span>
-            <ArrowRight className="w-3.5 h-3.5" />
-          </button>
-        </div>
-      )}
-
       <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between">
         {/* Left: Millennium Agency Brand Logo */}
         <div className="flex items-center gap-3">
@@ -99,10 +68,6 @@ export const Header: React.FC<HeaderProps> = ({
               </p>
             </div>
           </button>
-
-          <div className="ml-2">
-            <DemoModeBadge />
-          </div>
         </div>
 
         {/* Center / Navigation Links (Desktop) */}

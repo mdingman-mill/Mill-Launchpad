@@ -513,20 +513,9 @@ export const AccountBillingView: React.FC<AccountBillingViewProps> = ({
               </div>
 
               <div className="flex items-center gap-2">
-                <button
-                  onClick={onOpenUpgrade}
-                  className="px-4 py-2 rounded-xl bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold transition-all shadow-xs"
-                >
-                  Change Plan
-                </button>
-                {user.planId !== 'free' && (
-                  <button
-                    onClick={handleCancelSubscription}
-                    className="px-3 py-2 rounded-xl border border-slate-200 text-slate-600 hover:bg-slate-50 text-xs font-medium"
-                  >
-                    Cancel Subscription
-                  </button>
-                )}
+                <span className="px-3.5 py-1.5 rounded-xl bg-slate-100 text-slate-600 text-xs font-bold border border-slate-200">
+                  Paid plans coming soon
+                </span>
               </div>
             </div>
 
@@ -976,33 +965,28 @@ export const AccountBillingView: React.FC<AccountBillingViewProps> = ({
       {/* Tab 4: Billing & Invoices */}
       {activeTab === 'billing' && (
         <div className="space-y-6">
-          {/* Payment Method */}
-          <div className="bg-white rounded-2xl p-6 border border-slate-200 shadow-sm flex items-center justify-between">
+          {/* Subscription & Billing Status */}
+          <div className="bg-white rounded-2xl p-6 border border-slate-200 shadow-sm flex flex-col sm:flex-row sm:items-center justify-between gap-4">
             <div className="flex items-center gap-3.5">
-              <div className="p-3 rounded-xl bg-slate-100 text-slate-700">
+              <div className="p-3 rounded-xl bg-rose-50 text-rose-600">
                 <CreditCard className="w-6 h-6" />
               </div>
               <div>
                 <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400">
-                  Payment Method
+                  Billing & Subscriptions
                 </span>
                 <p className="font-bold text-slate-900 text-sm mt-0.5">
-                  {user.paymentMethod
-                    ? `${user.paymentMethod.brand} ending in •••• ${user.paymentMethod.last4}`
-                    : 'Visa ending in •••• 4242'}
+                  Free Starter Tier (50 generations/month)
                 </p>
                 <p className="text-xs text-slate-500">
-                  Expires {user.paymentMethod?.expMonth || '12'}/{user.paymentMethod?.expYear || '2028'}
+                  Every user starts on our complimentary Starter plan with all 8 core tools included.
                 </p>
               </div>
             </div>
 
-            <button
-              onClick={onOpenUpgrade}
-              className="px-3.5 py-1.5 rounded-xl border border-slate-200 hover:bg-slate-50 text-xs font-semibold text-slate-700"
-            >
-              Update Payment Card
-            </button>
+            <div className="px-3.5 py-1.5 rounded-xl bg-slate-100 text-slate-600 text-xs font-bold border border-slate-200 self-start sm:self-auto">
+              Paid plans coming soon
+            </div>
           </div>
 
           {/* Invoice History */}

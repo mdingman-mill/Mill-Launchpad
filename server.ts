@@ -1,8 +1,12 @@
 import express from 'express';
 import dotenv from 'dotenv';
 import path from 'path';
+import fs from 'fs';
 import { fileURLToPath } from 'url';
-import { GoogleGenAI } from '@google/genai';
+import { GoogleGenAI, ThinkingLevel } from '@google/genai';
+import { initializeApp, getApps } from 'firebase-admin/app';
+import { getAuth } from 'firebase-admin/auth';
+import { getFirestore } from 'firebase-admin/firestore';
 
 dotenv.config();
 
@@ -14,6 +18,57 @@ const PORT = Number(process.env.PORT) || 3000;
 const isProduction = process.env.NODE_ENV === 'production';
 
 app.use(express.json({ limit: '10mb' }));
+
+// Initialize Firebase Admin SDK
+const firebaseConfig = JSON.parse(
+  fs.readFileSync(path.resolve(__dirname, 'firebase-applet-config.json'), 'utf8')
+);
+
+const firebaseApp = getApps().length
+  ? getApps()[0]
+  : initializeApp({ projectId: firebaseConfig.projectId });
+
+const adminAuth = getAuth(firebaseApp);
+const adminDb = getFirestore(firebaseApp, firebaseConfig.firestoreDatabaseId);
+
+// Super admin emails from environment variable
+const SUPER_ADMIN_EMAILS = (process.env.SUPER_ADMIN_EMAILS || 'mdingman@mill.agency,linda@mill.agency')
+  .split(',')
+  .map((e) => e.trim().toLowerCase())
+  .filter(Boolean);
+
+// Per-user generation rate limit map (10 generations per minute)
+const rateLimitMap = new Map<string, number[]>();
+const RATE_LIMIT_WINDOW_MS = 60 * 1000;
+const MAX_GENERATIONS_PER_MINUTE = 10;
+
+function getNextMonthFirstDay(fromDate: Date = new Date()): string {
+  const year = fromDate.getFullYear();
+  const month = fromDate.getMonth();
+  const nextMonth = new Date(year, month + 1, 1);
+  const y = nextMonth.getFullYear();
+  const m = String(nextMonth.getMonth() + 1).padStart(2, '0');
+  return `${y}-${m}-01`;
+}
+
+// Token verification helper
+async function verifyFirebaseToken(req: express.Request): Promise<{ uid: string; email?: string; name?: string; picture?: string }> {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    throw new Error('Missing or invalid Authorization header');
+  }
+  const token = authHeader.split('Bearer ')[1]?.trim();
+  if (!token) {
+    throw new Error('Empty bearer token');
+  }
+  const decoded = await adminAuth.verifyIdToken(token);
+  return {
+    uid: decoded.uid,
+    email: decoded.email,
+    name: decoded.name,
+    picture: decoded.picture,
+  };
+}
 
 // Server-side Gemini initialization
 const apiKey = process.env.GEMINI_API_KEY;
@@ -34,15 +89,167 @@ app.get('/api/health', (_req, res) => {
   res.json({
     status: 'ok',
     geminiAvailable: !!apiKey,
+    firebaseConfigured: true,
     timestamp: new Date().toISOString(),
   });
 });
 
+// Authentication Synchronization Endpoint: validates Firebase ID token and assigns super_admin role
+app.post('/api/auth/sync', async (req, res) => {
+  try {
+    const verified = await verifyFirebaseToken(req);
+    const email = (verified.email || '').toLowerCase();
+    const isSuperAdmin = SUPER_ADMIN_EMAILS.includes(email);
+    const role = isSuperAdmin ? 'super_admin' : 'member';
+
+    const now = new Date().toISOString();
+    const userRef = adminDb.collection('users').doc(verified.uid);
+
+    let userData: any = null;
+    try {
+      const snap = await userRef.get();
+      if (snap.exists) {
+        const existing = snap.data()!;
+        userData = {
+          ...existing,
+          email: verified.email || existing.email,
+          name: verified.name || existing.name || email.split('@')[0],
+          avatar: verified.picture || existing.avatar,
+          role: isSuperAdmin ? 'super_admin' : (existing.role === 'super_admin' ? 'super_admin' : role),
+          lastLogin: now,
+        };
+        await userRef.set(userData, { merge: true });
+      }
+    } catch (e: any) {
+      console.warn('[Firestore Sync Read Warning]:', e.message);
+    }
+
+    if (!userData) {
+      userData = {
+        id: verified.uid,
+        email: verified.email || '',
+        name: verified.name || email.split('@')[0] || 'User',
+        avatar: verified.picture || `https://api.dicebear.com/7.x/initials/svg?seed=${encodeURIComponent(verified.name || email)}`,
+        role,
+        planId: 'free',
+        status: 'active',
+        generationsUsedThisMonth: 0,
+        bonusGenerations: 0,
+        billingResetDate: getNextMonthFirstDay(),
+        nonprofitDiscountApproved: false,
+        signupDate: now,
+        lastLogin: now,
+      };
+      try {
+        await userRef.set(userData, { merge: true });
+      } catch (e: any) {
+        console.warn('[Firestore Sync Write Warning]:', e.message);
+      }
+    }
+
+    if (isSuperAdmin) {
+      try {
+        await adminDb.collection('admins').doc(verified.uid).set({
+          id: verified.uid,
+          email: verified.email,
+          role: 'super_admin',
+          createdAt: now,
+        }, { merge: true });
+      } catch (e: any) {
+        console.warn('[Firestore Admin Registry Write Warning]:', e.message);
+      }
+    }
+
+    return res.json({ user: userData });
+  } catch (err: any) {
+    console.error('[Auth Sync Error]', err.message);
+    return res.status(401).json({ error: 'Unauthorized: Firebase ID token verification failed' });
+  }
+});
+
 // Marketing Tool Generation Endpoint
 app.post('/api/gemini/generate', async (req, res) => {
-  try {
-    const { toolId, toolName, organizationProfile, userInputs } = req.body;
+  const requestStartTime = Date.now();
+  let verifiedUser: { uid: string; email?: string } | null = null;
 
+  // 1. Verify Firebase ID Token
+  try {
+    verifiedUser = await verifyFirebaseToken(req);
+  } catch (err: any) {
+    return res.status(401).json({ error: 'Unauthorized: A valid Firebase ID token is required to generate marketing assets.' });
+  }
+
+  const userId = verifiedUser.uid;
+
+  // 2. Per-user Rate Limiting (10 generations per minute)
+  const now = Date.now();
+  const userTimestamps = (rateLimitMap.get(userId) || []).filter((t) => now - t < RATE_LIMIT_WINDOW_MS);
+  if (userTimestamps.length >= MAX_GENERATIONS_PER_MINUTE) {
+    return res.status(429).json({
+      error: 'Rate limit exceeded: You can make at most 10 generations per minute. Please wait a moment.',
+    });
+  }
+
+  // 3. Check and increment monthly usage in a Firestore transaction
+  const userRef = adminDb.collection('users').doc(userId);
+  try {
+    await adminDb.runTransaction(async (transaction) => {
+      const snap = await transaction.get(userRef);
+      let userData: any = null;
+      if (snap.exists) {
+        userData = snap.data();
+      } else {
+        userData = {
+          id: userId,
+          planId: 'free',
+          generationsUsedThisMonth: 0,
+          bonusGenerations: 0,
+          billingResetDate: getNextMonthFirstDay(),
+        };
+      }
+
+      const planId = userData.planId || 'free';
+      const limits: Record<string, number> = { free: 50, pro: 500, team: 2000 };
+      const planLimit = (limits[planId] || 50) + (userData.bonusGenerations || 0);
+
+      // Check billing cycle reset
+      let used = userData.generationsUsedThisMonth || 0;
+      const todayStr = new Date().toISOString().split('T')[0];
+      let resetDate = userData.billingResetDate;
+      if (resetDate && todayStr >= resetDate) {
+        used = 0;
+        resetDate = getNextMonthFirstDay();
+      }
+
+      if (used >= planLimit) {
+        const quotaErr = new Error(`Monthly generation quota reached (${used}/${planLimit} used). Upgrade to continue generating.`);
+        (quotaErr as any).status = 403;
+        throw quotaErr;
+      }
+
+      const newUsage = used + 1;
+      transaction.set(userRef, {
+        generationsUsedThisMonth: newUsage,
+        billingResetDate: resetDate || getNextMonthFirstDay(),
+        updatedAt: new Date().toISOString(),
+      }, { merge: true });
+    });
+  } catch (txErr: any) {
+    if (txErr.status === 403 || txErr.message?.includes('Monthly generation quota reached')) {
+      console.warn(`[Quota Blocked] User ${userId} exceeded monthly generation limit.`);
+      return res.status(403).json({ error: txErr.message });
+    }
+    console.warn(`[Usage Transaction Warning]: ${txErr.message}`);
+  }
+
+  // Record generation timestamp for rate limit sliding window
+  userTimestamps.push(now);
+  rateLimitMap.set(userId, userTimestamps);
+
+  const { toolId, toolName, organizationProfile, userInputs } = req.body;
+  console.log(`[Gemini Request] Started generation for "${toolName}" (${toolId}) by user ${userId} at ${new Date().toISOString()}`);
+
+  try {
     const orgName = organizationProfile?.orgName || 'Our Organization';
     const orgType = organizationProfile?.type || 'Startup';
     const whatTheyDo = organizationProfile?.whatTheyDo || '';
@@ -161,11 +368,28 @@ Write the complete deliverable now in full, ready to be reviewed by the marketin
 
     const currentKey = process.env.GEMINI_API_KEY || apiKey;
     if (!currentKey) {
-      return res.status(500).json({
-        success: false,
-        error: 'GEMINI_API_KEY is not configured on the server. Please check your environment configuration.',
-      });
+      res.setHeader('Content-Type', 'text/event-stream');
+      res.setHeader('Cache-Control', 'no-cache, no-transform');
+      res.setHeader('Connection', 'keep-alive');
+      res.flushHeaders?.();
+      res.write(
+        `data: ${JSON.stringify({
+          error: 'GEMINI_API_KEY is not configured on the server. Please check your environment configuration.',
+        })}\n\n`
+      );
+      res.end();
+      return;
     }
+
+    // Setup Server-Sent Events headers for real-time text streaming
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
+    res.setHeader('Connection', 'keep-alive');
+    res.flushHeaders?.();
+
+    const sendEvent = (data: any) => {
+      res.write(`data: ${JSON.stringify(data)}\n\n`);
+    };
 
     const genAI = new GoogleGenAI({
       apiKey: currentKey,
@@ -176,54 +400,160 @@ Write the complete deliverable now in full, ready to be reviewed by the marketin
       },
     });
 
-    let generatedText = '';
-    let modelUsed = '';
+    // 3. Remove "gemini-3.8-flash" fallback. Use ONLY gemini-3.1-flash-lite, at most 1 retry, for 429/5xx only.
+    const MODEL_NAME = 'gemini-3.1-flash-lite';
+    const CALL_TIMEOUT_MS = 30000; // 30-second timeout per Gemini call
+    let fullText = '';
+    let callSucceeded = false;
     let lastError: any = null;
 
-    // Fast, reliable Gemini models with multi-attempt retry
-    const candidateModels = ['gemini-3.1-flash-lite', 'gemini-3.8-flash'];
+    // Helper to test if error is a rate-limit (429) or server (5xx) error
+    const isRateLimitOrServerError = (err: any): boolean => {
+      if (!err) return false;
+      if (err.name === 'TimeoutError' || err.message === 'Generation took too long, please try again') {
+        return false;
+      }
+      const status = err.status || err.statusCode || err.code;
+      if (status === 429 || (typeof status === 'number' && status >= 500 && status < 600)) {
+        return true;
+      }
+      const msg = (err.message || String(err)).toLowerCase();
+      return (
+        msg.includes('429') ||
+        msg.includes('resource_exhausted') ||
+        msg.includes('rate limit') ||
+        msg.includes('500') ||
+        msg.includes('502') ||
+        msg.includes('503') ||
+        msg.includes('504') ||
+        msg.includes('unavailable') ||
+        msg.includes('internal error') ||
+        msg.includes('server error')
+      );
+    };
 
-    for (const model of candidateModels) {
-      for (let attempt = 1; attempt <= 3; attempt++) {
-        try {
-          console.log(`[Gemini] Calling ${model} (attempt ${attempt}/3) for ${toolName}...`);
-          const response = await genAI.models.generateContent({
-            model,
+    // At most 1 retry (maximum 2 attempts) for rate-limit (429) or server (5xx) errors
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      const callStartTime = Date.now();
+      console.log(`[Gemini Call] Starting call to ${MODEL_NAME} (attempt ${attempt}/2, thinkingLevel: LOW, 30s timeout)...`);
+
+      let timerId: NodeJS.Timeout | null = null;
+      let isTimedOut = false;
+
+      try {
+        // 2. 30-second timeout per Gemini call
+        const timeoutPromise = new Promise<never>((_, reject) => {
+          timerId = setTimeout(() => {
+            isTimedOut = true;
+            const err = new Error('Generation took too long, please try again');
+            err.name = 'TimeoutError';
+            reject(err);
+          }, CALL_TIMEOUT_MS);
+        });
+
+        // 4. Switch to streaming (generateContentStream)
+        const executeStream = async (): Promise<string> => {
+          const responseStream = await genAI.models.generateContentStream({
+            model: MODEL_NAME,
             contents: userPrompt,
             config: {
               systemInstruction,
-              temperature: 0.7,
+              // 1. Set a low thinking level on the Gemini call to cut latency
+              thinkingConfig: {
+                thinkingLevel: ThinkingLevel.LOW,
+              },
             },
           });
 
-          if (response.text && response.text.trim().length > 0) {
-            generatedText = response.text;
-            modelUsed = model;
-            console.log(`[Gemini] Generation succeeded with model ${model}! (${generatedText.length} characters)`);
-            break;
+          let streamedText = '';
+          for await (const chunk of responseStream) {
+            if (isTimedOut) {
+              const err = new Error('Generation took too long, please try again');
+              err.name = 'TimeoutError';
+              throw err;
+            }
+            const textChunk = chunk.text;
+            if (textChunk) {
+              streamedText += textChunk;
+              sendEvent({ chunk: textChunk });
+            }
           }
-        } catch (err: any) {
-          console.warn(`[Gemini] Model ${model} attempt ${attempt} error:`, err?.message || err);
-          lastError = err;
-          if (attempt < 3) {
-            await new Promise((r) => setTimeout(r, 1200));
-          }
+          return streamedText;
+        };
+
+        fullText = await Promise.race([executeStream(), timeoutPromise]);
+
+        if (timerId) clearTimeout(timerId);
+
+        // 5. Log the duration of each Gemini call
+        const callDuration = Date.now() - callStartTime;
+        console.log(`[Gemini Call] Attempt ${attempt} finished in ${callDuration}ms (${(callDuration / 1000).toFixed(2)}s) with ${fullText.length} characters`);
+
+        callSucceeded = true;
+        break;
+      } catch (err: any) {
+        if (timerId) clearTimeout(timerId);
+        const callDuration = Date.now() - callStartTime;
+        console.warn(`[Gemini Call] Attempt ${attempt} failed after ${callDuration}ms:`, err?.message || err);
+        lastError = err;
+
+        // If timed out, do not retry
+        if (err.name === 'TimeoutError' || err.message === 'Generation took too long, please try again') {
+          console.warn(`[Gemini Call] 30s timeout reached. Aborting without retry.`);
+          break;
         }
+
+        // Only retry for 429 or 5xx errors, at most 1 retry
+        if (attempt === 1 && isRateLimitOrServerError(err)) {
+          console.log(`[Gemini Call] Error is rate-limit (429) or server (5xx). Retrying (attempt 2/2) after 1000ms...`);
+          sendEvent({ reset: true });
+          await new Promise((r) => setTimeout(r, 1000));
+          fullText = '';
+          continue;
+        }
+
+        // Otherwise (non-retryable error or attempt 2 failed), stop
+        break;
       }
-      if (generatedText) break;
     }
 
-    if (!generatedText) {
-      throw lastError || new Error('No content returned from Gemini models after multiple attempts.');
-    }
+    // 5. Log the total request time
+    const totalRequestTime = Date.now() - requestStartTime;
+    console.log(`[Gemini Request] Total request time for "${toolName}": ${totalRequestTime}ms (${(totalRequestTime / 1000).toFixed(2)}s)`);
 
-    res.json({ success: true, text: generatedText, modelUsed, fallback: false });
+    if (callSucceeded && fullText) {
+      sendEvent({
+        done: true,
+        modelUsed: MODEL_NAME,
+        text: fullText,
+      });
+      res.end();
+    } else {
+      const errorMessage =
+        lastError?.name === 'TimeoutError' || lastError?.message === 'Generation took too long, please try again'
+          ? 'Generation took too long, please try again'
+          : lastError?.message || 'Failed to generate content. Please try again.';
+
+      console.error(`[Gemini Request] Returning error to client: ${errorMessage}`);
+      sendEvent({ error: errorMessage });
+      res.end();
+    }
   } catch (error: any) {
-    console.error('Error generating with Gemini:', error);
-    res.status(500).json({
-      success: false,
-      error: `Gemini Generation Error: ${error?.message || 'Server error. Please try again.'}`,
-    });
+    const totalRequestTime = Date.now() - requestStartTime;
+    console.error(`[Gemini Request] Unexpected error after ${totalRequestTime}ms:`, error);
+    const errorMessage =
+      error?.name === 'TimeoutError' || error?.message === 'Generation took too long, please try again'
+        ? 'Generation took too long, please try again'
+        : `Gemini Generation Error: ${error?.message || 'Server error. Please try again.'}`;
+
+    if (!res.headersSent) {
+      res.setHeader('Content-Type', 'text/event-stream');
+      res.setHeader('Cache-Control', 'no-cache, no-transform');
+      res.setHeader('Connection', 'keep-alive');
+      res.flushHeaders?.();
+    }
+    res.write(`data: ${JSON.stringify({ error: errorMessage })}\n\n`);
+    res.end();
   }
 });
 

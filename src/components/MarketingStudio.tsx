@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import { User, ToolDefinition, SavedOutput } from '../types';
 import { dataService } from '../services/dataService';
 import { billingService } from '../services/billingService';
+import { authService } from '../services/authService';
 import {
   Sparkles,
   Zap,
@@ -113,11 +114,19 @@ export const MarketingStudio: React.FC<MarketingStudioProps> = ({
     setLoading(true);
     setError(null);
     setSavedSuccess(false);
+    setOutput('');
+    setModelUsed('gemini-3.1-flash-lite');
+    setMobileTab('deliverable');
+    setOutputTitle(`${user.organizationProfile?.orgName || 'Org'} ${activeTool.name}`);
 
     try {
+      const idToken = await authService.getIdToken();
       const response = await fetch('/api/gemini/generate', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          ...(idToken ? { Authorization: `Bearer ${idToken}` } : {}),
+        },
         body: JSON.stringify({
           toolId: activeTool.id,
           toolName: activeTool.name,
@@ -126,21 +135,68 @@ export const MarketingStudio: React.FC<MarketingStudioProps> = ({
         }),
       });
 
-      const data = await response.json();
-
-      if (data.success && data.text) {
-        setOutput(data.text);
-        setModelUsed(data.modelUsed || 'gemini-3.1-flash-lite');
-        setOutputTitle(`${user.organizationProfile?.orgName || 'Org'} ${activeTool.name}`);
-
-        const newUsage = dataService.incrementUsage(user.id);
-        onUsageUpdated(newUsage);
-        dataService.logAction('TOOL_GENERATION', `Generated output with ${activeTool.name}`, user.id);
-        onToolCompleted();
-        setMobileTab('deliverable');
-      } else {
-        throw new Error(data.error || 'Failed to generate content. Please try again.');
+      if (!response.ok && !response.headers.get('content-type')?.includes('text/event-stream')) {
+        const errorData = await response.json().catch(() => ({}));
+        throw new Error(errorData.error || `Generation failed (HTTP ${response.status})`);
       }
+
+      const reader = response.body?.getReader();
+      if (!reader) {
+        throw new Error('Streaming response is unavailable. Please try again.');
+      }
+
+      const decoder = new TextDecoder();
+      let accumulatedText = '';
+      let buffer = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const events = buffer.split('\n\n');
+        buffer = events.pop() || '';
+
+        for (const event of events) {
+          const trimmed = event.trim();
+          if (!trimmed.startsWith('data:')) continue;
+          const jsonStr = trimmed.replace(/^data:\s*/, '');
+          if (!jsonStr) continue;
+
+          try {
+            const parsed = JSON.parse(jsonStr);
+            if (parsed.error) {
+              throw new Error(parsed.error);
+            }
+            if (parsed.reset) {
+              accumulatedText = '';
+              setOutput('');
+            }
+            if (parsed.chunk) {
+              accumulatedText += parsed.chunk;
+              setOutput(accumulatedText);
+            }
+            if (parsed.done) {
+              if (parsed.text) accumulatedText = parsed.text;
+              setOutput(accumulatedText);
+              setModelUsed(parsed.modelUsed || 'gemini-3.1-flash-lite');
+            }
+          } catch (e: any) {
+            if (e.message && e.message !== 'Unexpected end of JSON input') {
+              throw e;
+            }
+          }
+        }
+      }
+
+      if (!accumulatedText.trim()) {
+        throw new Error('No content was returned. Please try again.');
+      }
+
+      const newUsage = dataService.incrementUsage(user.id);
+      onUsageUpdated(newUsage);
+      dataService.logAction('TOOL_GENERATION', `Generated output with ${activeTool.name}`, user.id);
+      onToolCompleted();
     } catch (err: any) {
       setError(err?.message || 'Error communicating with generation engine.');
     } finally {
@@ -522,12 +578,17 @@ export const MarketingStudio: React.FC<MarketingStudioProps> = ({
                     placeholder="Document Title..."
                     className="w-full text-xs font-bold text-slate-900 bg-transparent border-none focus:outline-none focus:ring-1 focus:ring-rose-500 rounded px-1.5 py-0.5"
                   />
-                  {modelUsed && (
+                  {loading ? (
+                    <div className="text-[10px] text-rose-600 px-1 mt-0.5 flex items-center gap-1.5 font-medium">
+                      <span className="w-1.5 h-1.5 rounded-full bg-rose-500 animate-pulse inline-block"></span>
+                      <span>Streaming live from Gemini (gemini-3.1-flash-lite)...</span>
+                    </div>
+                  ) : modelUsed ? (
                     <div className="text-[10px] text-slate-500 px-1 mt-0.5 flex items-center gap-1.5">
                       <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 inline-block"></span>
                       <span>Live generated by Google Gemini ({modelUsed})</span>
                     </div>
-                  )}
+                  ) : null}
                 </div>
 
                 {output && (
@@ -552,8 +613,11 @@ export const MarketingStudio: React.FC<MarketingStudioProps> = ({
 
                     <button
                       onClick={handleSaveToLibrary}
+                      disabled={loading}
                       className={`px-3 py-1.5 rounded-xl text-xs font-bold flex items-center gap-1.5 transition-colors ${
-                        savedSuccess
+                        loading
+                          ? 'opacity-50 cursor-not-allowed bg-slate-100 text-slate-400'
+                          : savedSuccess
                           ? 'bg-emerald-100 text-emerald-800'
                           : 'bg-rose-50 text-rose-700 hover:bg-rose-100 border border-rose-200'
                       }`}
@@ -567,7 +631,10 @@ export const MarketingStudio: React.FC<MarketingStudioProps> = ({
 
                     <button
                       onClick={handleExportDocx}
-                      className="p-1.5 rounded-xl text-slate-500 hover:text-slate-800 hover:bg-slate-100 transition-colors"
+                      disabled={loading}
+                      className={`p-1.5 rounded-xl text-slate-500 hover:text-slate-800 hover:bg-slate-100 transition-colors ${
+                        loading ? 'opacity-50 cursor-not-allowed' : ''
+                      }`}
                       title="Export formatted Word document (.docx)"
                     >
                       <Download className="w-4 h-4" />
@@ -578,19 +645,7 @@ export const MarketingStudio: React.FC<MarketingStudioProps> = ({
 
               {/* Output Content Canvas */}
               <div className="flex-1 p-6 overflow-y-auto">
-                {loading ? (
-                  <div className="h-full flex flex-col items-center justify-center text-center p-12 text-slate-500 space-y-4">
-                    <div className="w-12 h-12 border-3 border-rose-500 border-t-transparent rounded-full animate-spin" />
-                    <div>
-                      <h4 className="text-sm font-bold text-slate-800">
-                        Millennium Agency AI is drafting your {activeTool.name}...
-                      </h4>
-                      <p className="text-xs text-slate-500 mt-1 max-w-sm">
-                        Applying tone &quot;{user.organizationProfile?.brandTone?.join(' & ')}&quot; and tailoring strategies for {user.organizationProfile?.targetAudience}.
-                      </p>
-                    </div>
-                  </div>
-                ) : output ? (
+                {output ? (
                   isEditingOutput ? (
                     <textarea
                       rows={22}
@@ -601,8 +656,27 @@ export const MarketingStudio: React.FC<MarketingStudioProps> = ({
                   ) : (
                     <div className="prose prose-xs sm:prose-sm max-w-none text-slate-900 whitespace-pre-wrap leading-relaxed font-sans">
                       {output}
+                      {loading && (
+                        <span
+                          className="inline-block w-1.5 h-4 ml-0.5 bg-rose-500 animate-pulse align-middle"
+                          aria-label="Streaming text..."
+                        />
+                      )}
                     </div>
                   )
+                ) : loading ? (
+                  <div className="h-full flex flex-col items-center justify-center text-center p-12 text-slate-500 space-y-3">
+                    <div className="flex items-center gap-2 text-rose-600 font-semibold text-xs tracking-wide">
+                      <Sparkles className="w-4 h-4 animate-spin text-rose-500" />
+                      <span>Connecting to Gemini Stream...</span>
+                    </div>
+                    <h4 className="text-sm font-bold text-slate-800">
+                      Drafting your {activeTool.name}...
+                    </h4>
+                    <p className="text-xs text-slate-500 max-w-sm">
+                      Text will stream directly here as it is generated in real-time.
+                    </p>
+                  </div>
                 ) : (
                   <div className="h-full flex flex-col items-center justify-center text-center p-12 text-slate-400 space-y-3">
                     <FileText className="w-12 h-12 text-slate-300 stroke-[1.5]" />

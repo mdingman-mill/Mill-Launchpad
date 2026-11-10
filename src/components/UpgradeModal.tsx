@@ -133,16 +133,19 @@ export const UpgradeModal: React.FC<UpgradeModalProps> = ({
                     >
                       Active Plan
                     </button>
+                  ) : plan.price > 0 ? (
+                    <button
+                      disabled
+                      className="w-full py-2.5 px-4 rounded-xl bg-slate-100 text-slate-500 text-xs font-bold cursor-not-allowed border border-slate-200"
+                    >
+                      Paid plans coming soon
+                    </button>
                   ) : (
                     <button
                       onClick={() => onSelectPlan(plan.id)}
-                      className={`w-full py-2.5 px-4 rounded-xl text-xs font-bold transition-all shadow-xs ${
-                        plan.popular
-                          ? 'bg-rose-600 hover:bg-rose-700 text-white shadow-rose-600/20'
-                          : 'bg-slate-900 hover:bg-slate-800 text-white'
-                      }`}
+                      className="w-full py-2.5 px-4 rounded-xl text-xs font-bold transition-all shadow-xs bg-slate-900 hover:bg-slate-800 text-white"
                     >
-                      {plan.price === 0 ? 'Downgrade to Starter' : `Upgrade to ${plan.name}`}
+                      Downgrade to Starter
                     </button>
                   )}
                 </div>
@@ -155,10 +158,10 @@ export const UpgradeModal: React.FC<UpgradeModalProps> = ({
         <div className="p-4 bg-slate-50 border-t border-slate-100 text-center flex items-center justify-center gap-4 text-xs text-slate-500">
           <span className="flex items-center gap-1.5">
             <ShieldCheck className="w-4 h-4 text-slate-400" />
-            Cancel or change plans anytime
+            All accounts start on the Free Starter plan (50 generations/month)
           </span>
           <span>•</span>
-          <span>Simulated Stripe test card: 4242 4242 4242 4242</span>
+          <span>Contact Millennium Agency for custom team tiers</span>
         </div>
       </div>
     </div>

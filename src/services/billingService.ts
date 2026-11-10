@@ -1,6 +1,6 @@
 import { APP_CONFIG } from '../config';
 import { Plan, Invoice, User } from '../types';
-import { dataService } from './dataService';
+import { dataService, getNextMonthFirstDay } from './dataService';
 
 export interface CheckoutOptions {
   userId: string;
@@ -134,7 +134,7 @@ class BillingService {
         expMonth: String(month).padStart(2, '0'),
         expYear: String(fullYear),
       },
-      billingResetDate: new Date(Date.now() + 30 * 86400000).toISOString().split('T')[0],
+      billingResetDate: getNextMonthFirstDay(),
     });
 
     // Create Invoice Record

@@ -1,0 +1,131 @@
+{
+  "entities": {
+    "User": {
+      "title": "User",
+      "description": "Authenticated user profile and app preferences",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "Unique Firebase Auth UID" },
+        "email": { "type": "string", "format": "email", "description": "User email address" },
+        "name": { "type": "string", "description": "Display name" },
+        "avatar": { "type": "string", "description": "Avatar URL" },
+        "role": { "type": "string", "enum": ["super_admin", "member"], "description": "System role" },
+        "organizationId": { "type": "string", "description": "Associated organization ID" },
+        "planId": { "type": "string", "enum": ["free", "pro", "team"], "description": "Subscription plan tier" },
+        "generationsUsedThisMonth": { "type": "number", "description": "AI generation count used in billing cycle" },
+        "billingResetDate": { "type": "string", "description": "ISO date for next monthly reset" },
+        "createdAt": { "type": "string", "description": "Timestamp when account was created" },
+        "updatedAt": { "type": "string", "description": "Timestamp when account was last updated" }
+      },
+      "required": ["id", "email", "name", "role", "planId", "generationsUsedThisMonth", "createdAt"]
+    },
+    "Admin": {
+      "title": "Admin",
+      "description": "Super administrator lookup document for security rules",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "UID of the super administrator" },
+        "email": { "type": "string", "format": "email", "description": "Super admin email address" },
+        "role": { "type": "string", "enum": ["super_admin"], "description": "Role marker" },
+        "createdAt": { "type": "string", "description": "Timestamp registered as admin" }
+      },
+      "required": ["id", "email", "role", "createdAt"]
+    },
+    "Organization": {
+      "title": "Organization",
+      "description": "Organization and brand profile containing marketing foundations",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "Organization unique identifier" },
+        "name": { "type": "string", "description": "Organization display name" },
+        "ownerId": { "type": "string", "description": "User ID of organization owner" },
+        "memberIds": { "type": "array", "description": "List of user IDs who are members" },
+        "type": { "type": "string", "enum": ["Nonprofit", "Startup"], "description": "Entity category" },
+        "whatTheyDo": { "type": "string", "description": "Summary of products, mission or services" },
+        "targetAudience": { "type": "string", "description": "Core personas and customer segments" },
+        "goals": { "type": "array", "description": "Top 3 priorities for the next 6 months" },
+        "brandTone": { "type": "array", "description": "Selected brand voice traits" },
+        "budget": { "type": "string", "description": "Estimated monthly marketing budget" },
+        "website": { "type": "string", "description": "Official website URL" },
+        "planId": { "type": "string", "enum": ["free", "pro", "team"], "description": "Current plan tier" },
+        "createdAt": { "type": "string", "description": "Created timestamp" },
+        "updatedAt": { "type": "string", "description": "Last updated timestamp" }
+      },
+      "required": ["id", "name", "ownerId", "memberIds", "type", "createdAt"]
+    },
+    "OutputItem": {
+      "title": "OutputItem",
+      "description": "Saved AI-generated marketing deliverable saved in library",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "Unique deliverable ID" },
+        "orgId": { "type": "string", "description": "Owning organization ID" },
+        "userId": { "type": "string", "description": "Author user ID" },
+        "toolId": { "type": "string", "description": "ID of marketing tool used" },
+        "toolName": { "type": "string", "description": "Human readable tool name" },
+        "title": { "type": "string", "description": "Deliverable title" },
+        "content": { "type": "string", "description": "Full markdown output content" },
+        "tags": { "type": "array", "description": "Categorization and search tags" },
+        "userInputs": { "type": "object", "description": "Input parameters provided to tool" },
+        "createdAt": { "type": "string", "description": "Creation timestamp" }
+      },
+      "required": ["id", "orgId", "userId", "toolId", "toolName", "title", "content", "createdAt"]
+    },
+    "Invite": {
+      "title": "Invite",
+      "description": "Team member invitation for multi-user collaboration",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "Invite ID" },
+        "orgId": { "type": "string", "description": "Inviting organization ID" },
+        "email": { "type": "string", "format": "email", "description": "Invited user email" },
+        "role": { "type": "string", "description": "Assigned role" },
+        "invitedBy": { "type": "string", "description": "User ID of inviter" },
+        "status": { "type": "string", "enum": ["pending", "accepted", "declined"], "description": "Invite status" },
+        "createdAt": { "type": "string", "description": "Invite creation timestamp" }
+      },
+      "required": ["id", "orgId", "email", "invitedBy", "status", "createdAt"]
+    },
+    "AuditLog": {
+      "title": "AuditLog",
+      "description": "Audit trail recording system actions and generations",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "Log entry unique ID" },
+        "userId": { "type": "string", "description": "User UID who triggered action" },
+        "userEmail": { "type": "string", "description": "User email address" },
+        "orgId": { "type": "string", "description": "Organization ID" },
+        "action": { "type": "string", "description": "Action name e.g. TOOL_GENERATION" },
+        "details": { "type": "string", "description": "Detailed description of action" },
+        "createdAt": { "type": "string", "description": "Timestamp of action" }
+      },
+      "required": ["id", "userId", "action", "createdAt"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": "User",
+      "description": "User accounts and profile state"
+    },
+    "/admins/{userId}": {
+      "schema": "Admin",
+      "description": "Super admin registry for security rules verification"
+    },
+    "/organizations/{orgId}": {
+      "schema": "Organization",
+      "description": "Organizations and saved brand foundations"
+    },
+    "/organizations/{orgId}/outputs/{outputId}": {
+      "schema": "OutputItem",
+      "description": "Deliverables saved to organization library"
+    },
+    "/organizations/{orgId}/invites/{inviteId}": {
+      "schema": "Invite",
+      "description": "Pending and accepted team invitations"
+    },
+    "/auditLogs/{logId}": {
+      "schema": "AuditLog",
+      "description": "System activity and generation audit log"
+    }
+  }
+}
