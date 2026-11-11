@@ -35,8 +35,14 @@ service cloud.firestore {
     match /users/{userId} {
       allow get: if isOwner(userId) || isAdmin();
       allow list: if isAdmin();
-      allow create: if isOwner(userId) && (!('role' in request.resource.data) || request.resource.data.role == 'member');
-      allow update: if (isOwner(userId) && (!('role' in request.resource.data) || request.resource.data.role == resource.data.role)) || isAdmin();
+      allow create: if isOwner(userId) &&
+        request.resource.data.planId == 'free' &&
+        request.resource.data.role == 'member' &&
+        request.resource.data.generationsUsedThisMonth == 0;
+      allow update: if isAdmin() || (
+        isOwner(userId) &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['name', 'avatar', 'organizationProfile', 'lastLogin'])
+      );
       allow delete: if isAdmin();
     }
 
@@ -77,6 +83,16 @@ service cloud.firestore {
       allow list: if isAdmin();
       allow create: if isSignedIn() && request.resource.data.userId == request.auth.uid;
       allow update, delete: if isAdmin();
+    }
+
+    // Top-Level Invites Collection (Complimentary Access System)
+    match /invites/{inviteId} {
+      allow read: if isAdmin() || (
+        isSignedIn() &&
+        request.auth.token.email != null &&
+        resource.data.email == request.auth.token.email
+      );
+      allow write: if isAdmin();
     }
   }
 }

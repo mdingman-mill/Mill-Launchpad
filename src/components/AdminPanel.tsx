@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   User,
   Invoice,
@@ -8,6 +8,9 @@ import {
   ToolDefinition,
   AgencySettings,
   UserRole,
+  Invite,
+  PlanId,
+  OrganizationType,
 } from '../types';
 import { dataService } from '../services/dataService';
 import { billingService } from '../services/billingService';
@@ -40,6 +43,10 @@ import {
   HeartHandshake,
   UserCheck,
   TrendingUp,
+  Mail,
+  Copy,
+  Check,
+  Clock,
 } from 'lucide-react';
 
 interface AdminPanelProps {
@@ -56,7 +63,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
   onDataReset,
 }) => {
   const [activeTab, setActiveTab] = useState<
-    'dashboard' | 'users' | 'billing' | 'access' | 'plans' | 'tools' | 'audit' | 'settings'
+    'dashboard' | 'users' | 'invites' | 'billing' | 'access' | 'plans' | 'tools' | 'audit' | 'settings'
   >('dashboard');
 
   const [users, setUsers] = useState<User[]>(() => dataService.getUsers());
@@ -66,6 +73,20 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
   const [plans, setPlans] = useState<Plan[]>(() => dataService.getPlans());
   const [tools, setTools] = useState<ToolDefinition[]>(() => dataService.getTools());
   const [settings, setSettings] = useState<AgencySettings>(() => dataService.getSettings());
+
+  // Invites state
+  const [invites, setInvites] = useState<Invite[]>([]);
+  const [isLoadingInvites, setIsLoadingInvites] = useState(false);
+  const [newInviteEmail, setNewInviteEmail] = useState('');
+  const [newInviteNote, setNewInviteNote] = useState('');
+  const [newInviteExpiresAt, setNewInviteExpiresAt] = useState('');
+  const [isCreatingInvite, setIsCreatingInvite] = useState(false);
+  const [copiedInviteId, setCopiedInviteId] = useState<string | null>(null);
+
+  // Direct user invite modal state
+  const [inviteName, setInviteName] = useState('');
+  const [inviteEmail, setInviteEmail] = useState('');
+  const [inviteOrgType, setInviteOrgType] = useState<OrganizationType>('Startup');
 
   // Search & Filter state for Users table
   const [userSearch, setUserSearch] = useState('');
@@ -81,11 +102,6 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
   const [newRuleValue, setNewRuleValue] = useState('');
   const [newRuleNotes, setNewRuleNotes] = useState('');
 
-  // New Invite State
-  const [inviteName, setInviteName] = useState('');
-  const [inviteEmail, setInviteEmail] = useState('');
-  const [inviteOrgType, setInviteOrgType] = useState<'Nonprofit' | 'Startup'>('Startup');
-
   // Notification feedback
   const [adminNotification, setAdminNotification] = useState<string | null>(null);
 
@@ -97,6 +113,24 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
     setTimeout(() => setAdminNotification(null), 3500);
   };
 
+  const refreshInvites = async () => {
+    try {
+      setIsLoadingInvites(true);
+      const list = await dataService.fetchInvites();
+      setInvites(list);
+    } catch (err: any) {
+      console.error('Failed to load invites:', err);
+    } finally {
+      setIsLoadingInvites(false);
+    }
+  };
+
+  useEffect(() => {
+    if (isSuperAdmin) {
+      refreshInvites();
+    }
+  }, [isSuperAdmin]);
+
   const refreshAll = () => {
     setUsers(dataService.getUsers());
     setInvoices(dataService.getInvoices());
@@ -105,6 +139,9 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
     setPlans(dataService.getPlans());
     setTools(dataService.getTools());
     setSettings(dataService.getSettings());
+    if (isSuperAdmin) {
+      refreshInvites();
+    }
   };
 
   /* =========================================================================
@@ -118,6 +155,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
     free: users.filter((u) => u.planId === 'free').length,
     pro: users.filter((u) => u.planId === 'pro').length,
     team: users.filter((u) => u.planId === 'team').length,
+    complimentary: users.filter((u) => u.planId === 'complimentary').length,
   };
 
   const usersByOrgType = {
@@ -125,18 +163,64 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
     startup: users.filter((u) => u.organizationProfile?.type === 'Startup').length,
   };
 
-
   /* =========================================================================
    * USER ACTIONS
    * ========================================================================= */
-  const handleUpdateUserPlan = (userId: string, newPlanId: 'free' | 'pro' | 'team') => {
-    dataService.updateUser(userId, { planId: newPlanId });
-    dataService.logAction('ADMIN_PLAN_CHANGE', `Admin changed user ${userId} plan to ${newPlanId}`, userId);
-    refreshAll();
-    if (selectedUserDetail?.id === userId) {
-      setSelectedUserDetail(dataService.getUserById(userId));
+  const handleUpdateUserPlan = async (userId: string, newPlanId: PlanId) => {
+    try {
+      await dataService.updateUserPlanServer(userId, newPlanId);
+      refreshAll();
+      if (selectedUserDetail?.id === userId) {
+        setSelectedUserDetail(dataService.getUserById(userId));
+      }
+      notify(`User plan updated to ${newPlanId.toUpperCase()}`);
+    } catch (err: any) {
+      notify(`Failed to update plan: ${err.message}`);
     }
-    notify(`User plan updated to ${newPlanId.toUpperCase()}`);
+  };
+
+  /* =========================================================================
+   * COMPLIMENTARY INVITE ACTIONS
+   * ========================================================================= */
+  const handleCreateInvite = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!newInviteEmail.trim()) return;
+    try {
+      setIsCreatingInvite(true);
+      const created = await dataService.createInvite(newInviteEmail, newInviteNote, newInviteExpiresAt);
+      setNewInviteEmail('');
+      setNewInviteNote('');
+      setNewInviteExpiresAt('');
+      await refreshInvites();
+      refreshAll();
+      notify(`Complimentary access invite created for ${created.email}`);
+    } catch (err: any) {
+      notify(`Failed to create invite: ${err.message}`);
+    } finally {
+      setIsCreatingInvite(false);
+    }
+  };
+
+  const handleRevokeInvite = async (inviteId: string, email: string) => {
+    if (window.confirm(`Revoke complimentary access invite for ${email}?\nIf the user already accepted, their plan will be reverted to Free.`)) {
+      try {
+        await dataService.revokeInvite(inviteId);
+        await refreshInvites();
+        refreshAll();
+        notify(`Revoked invite for ${email}`);
+      } catch (err: any) {
+        notify(`Failed to revoke invite: ${err.message}`);
+      }
+    }
+  };
+
+  const handleCopyInviteLink = (inviteId: string) => {
+    const link = `${window.location.origin}/invite/${inviteId}`;
+    navigator.clipboard.writeText(link).then(() => {
+      setCopiedInviteId(inviteId);
+      setTimeout(() => setCopiedInviteId(null), 2500);
+      notify(`Invite link copied: /invite/${inviteId}`);
+    });
   };
 
   const handleGrantBonus = (userId: string, amount: number) => {
@@ -187,18 +271,21 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
     }
   };
 
-  const handleUpdateRole = (userId: string, newRole: UserRole) => {
+  const handleUpdateRole = async (userId: string, newRole: UserRole) => {
     if (!isSuperAdmin) {
       alert('Only Super Admins can modify user administrative roles.');
       return;
     }
-    dataService.updateUser(userId, { role: newRole });
-    dataService.logAction('ROLE_MODIFIED', `Admin assigned role ${newRole} to ${userId}`, userId);
-    refreshAll();
-    if (selectedUserDetail?.id === userId) {
-      setSelectedUserDetail(dataService.getUserById(userId));
+    try {
+      await dataService.updateUserRoleServer(userId, newRole);
+      refreshAll();
+      if (selectedUserDetail?.id === userId) {
+        setSelectedUserDetail(dataService.getUserById(userId));
+      }
+      notify(`Assigned role ${newRole}`);
+    } catch (err: any) {
+      notify(`Failed to assign role: ${err.message}`);
     }
-    notify(`Assigned role ${newRole}`);
   };
 
   /* =========================================================================
@@ -310,22 +397,6 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
     notify(`Tool ${!current ? 'Enabled globally' : 'Disabled globally'}`);
   };
 
-  /* =========================================================================
-   * RESET DEMO DATA
-   * ========================================================================= */
-  const handleResetDemoData = () => {
-    if (
-      window.confirm(
-        '⚠️ RESET ALL DEMO DATA?\nThis will restore all 15 pristine sample users, outputs, invoices, and settings in browser localStorage.'
-      )
-    ) {
-      dataService.resetDemoData();
-      onDataReset();
-      refreshAll();
-      setSelectedUserDetail(null);
-      notify('Demo data has been restored to pristine seed state.');
-    }
-  };
 
   // Filter users list
   const filteredUsers = users.filter((u) => {
@@ -371,15 +442,6 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
             <RefreshCw className="w-3.5 h-3.5" />
             <span className="hidden sm:inline">Refresh Data</span>
           </button>
-
-          <button
-            onClick={handleResetDemoData}
-            className="px-3.5 py-2 rounded-xl bg-rose-600/80 hover:bg-rose-600 text-white text-xs font-bold flex items-center gap-1.5 transition-colors shadow-xs"
-            title="Restore 15 sample accounts and initial invoices"
-          >
-            <RefreshCw className="w-3.5 h-3.5" />
-            <span>Reset Demo Data</span>
-          </button>
         </div>
       </div>
 
@@ -398,6 +460,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
         {[
           { key: 'dashboard', label: 'Executive Dashboard', icon: LayoutDashboard },
           { key: 'users', label: `Users & Organizations (${users.length})`, icon: UsersIcon },
+          { key: 'invites', label: `Invites (${invites.length})`, icon: Mail },
           { key: 'billing', label: 'Billing & Invoices', icon: CreditCard },
           { key: 'access', label: 'Access Control', icon: ShieldCheck },
           { key: 'plans', label: 'Plans & Limits', icon: Sliders },
@@ -613,6 +676,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                 <option value="free">Free Starter</option>
                 <option value="pro">Pro Growth</option>
                 <option value="team">Agency Team</option>
+                <option value="complimentary">Complimentary</option>
               </select>
 
               <select
@@ -808,8 +872,8 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                 <span className="font-bold text-slate-800 uppercase tracking-wide text-[10px]">
                   Subscription Plan & Quota
                 </span>
-                <div className="grid grid-cols-3 gap-2">
-                  {(['free', 'pro', 'team'] as const).map((pId) => (
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                  {(['free', 'pro', 'team', 'complimentary'] as const).map((pId) => (
                     <button
                       key={pId}
                       onClick={() => handleUpdateUserPlan(selectedUserDetail.id, pId)}
@@ -819,7 +883,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                           : 'border-slate-200 text-slate-600 hover:bg-slate-50'
                       }`}
                     >
-                      <div className="capitalize">{pId}</div>
+                      <div className="capitalize truncate text-[11px] font-bold">{pId}</div>
                       <div className="text-[10px] text-slate-400">
                         {pId === 'free' ? '50/mo' : pId === 'pro' ? '500/mo' : '2000/mo'}
                       </div>
@@ -930,6 +994,229 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                 </button>
               </div>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* =====================================================================
+       * TAB: COMPLIMENTARY INVITES SYSTEM
+       * ===================================================================== */}
+      {activeTab === 'invites' && (
+        <div className="space-y-6">
+          {/* Create Invite Form */}
+          <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-6 space-y-4">
+            <div className="flex items-center justify-between pb-3 border-b border-slate-100">
+              <div className="flex items-center gap-2.5">
+                <div className="w-9 h-9 rounded-xl bg-rose-50 text-rose-600 flex items-center justify-center border border-rose-100">
+                  <Mail className="w-4 h-4" />
+                </div>
+                <div>
+                  <h3 className="text-sm font-bold text-slate-900">Create Complimentary Access Invite</h3>
+                  <p className="text-xs text-slate-500">
+                    Grant 2,000 monthly AI generations, full marketing tool access, and zero payment required.
+                  </p>
+                </div>
+              </div>
+              <span className="px-2.5 py-1 rounded-full text-[10px] font-extrabold bg-rose-50 text-rose-700 border border-rose-200">
+                Super Admin Only
+              </span>
+            </div>
+
+            <form onSubmit={handleCreateInvite} className="grid grid-cols-1 sm:grid-cols-3 gap-4 items-end">
+              <div>
+                <label className="block text-xs font-bold text-slate-700 mb-1">
+                  Recipient Email Address <span className="text-rose-600">*</span>
+                </label>
+                <input
+                  type="email"
+                  required
+                  value={newInviteEmail}
+                  onChange={(e) => setNewInviteEmail(e.target.value)}
+                  placeholder="partner@organization.org"
+                  className="w-full px-3 py-2 text-xs rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-rose-500 bg-slate-50"
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs font-bold text-slate-700 mb-1">
+                  Optional Note / Reference
+                </label>
+                <input
+                  type="text"
+                  value={newInviteNote}
+                  onChange={(e) => setNewInviteNote(e.target.value)}
+                  placeholder="e.g. VIP partner fall cohort"
+                  className="w-full px-3 py-2 text-xs rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-rose-500 bg-slate-50"
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs font-bold text-slate-700 mb-1">
+                  Optional Expiration Date
+                </label>
+                <input
+                  type="date"
+                  value={newInviteExpiresAt}
+                  onChange={(e) => setNewInviteExpiresAt(e.target.value)}
+                  className="w-full px-3 py-2 text-xs rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-rose-500 bg-slate-50"
+                />
+              </div>
+
+              <div className="sm:col-span-3 flex justify-end pt-2">
+                <button
+                  type="submit"
+                  disabled={isCreatingInvite || !newInviteEmail.trim()}
+                  className="px-5 py-2.5 bg-rose-600 hover:bg-rose-700 text-white rounded-xl text-xs font-bold flex items-center gap-2 shadow-xs cursor-pointer disabled:opacity-50 transition-all"
+                >
+                  {isCreatingInvite ? (
+                    <div className="w-3.5 h-3.5 border-2 border-white border-t-transparent rounded-full animate-spin" />
+                  ) : (
+                    <Plus className="w-4 h-4" />
+                  )}
+                  <span>Create invite</span>
+                </button>
+              </div>
+            </form>
+          </div>
+
+          {/* Invites Ledger */}
+          <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden p-5 space-y-4">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-slate-100">
+              <div>
+                <h3 className="text-sm font-bold text-slate-900">Complimentary Invitations Ledger</h3>
+                <p className="text-xs text-slate-500">
+                  Track pending, accepted, expired, and revoked complimentary access links.
+                </p>
+              </div>
+
+              <button
+                onClick={refreshInvites}
+                disabled={isLoadingInvites}
+                className="px-3 py-1.5 rounded-xl border border-slate-200 hover:bg-slate-50 text-xs font-semibold text-slate-700 flex items-center gap-1.5 self-start sm:self-auto cursor-pointer"
+              >
+                <RefreshCw className={`w-3.5 h-3.5 ${isLoadingInvites ? 'animate-spin' : ''}`} />
+                <span>Refresh Invites</span>
+              </button>
+            </div>
+
+            {invites.length === 0 ? (
+              <div className="py-12 text-center text-slate-400 space-y-2">
+                <Mail className="w-8 h-8 mx-auto text-slate-300" />
+                <p className="text-xs font-semibold">No complimentary invitations issued yet.</p>
+                <p className="text-[11px] text-slate-400">Use the form above to invite a partner or VIP organization.</p>
+              </div>
+            ) : (
+              <div className="overflow-x-auto">
+                <table className="w-full text-left text-xs">
+                  <thead className="bg-slate-50 text-slate-500 uppercase text-[10px] font-bold border-b border-slate-200">
+                    <tr>
+                      <th className="py-2.5 px-3">Invitee Email</th>
+                      <th className="py-2.5 px-3">Plan</th>
+                      <th className="py-2.5 px-3">Status</th>
+                      <th className="py-2.5 px-3">Created By</th>
+                      <th className="py-2.5 px-3">Created At</th>
+                      <th className="py-2.5 px-3">Expires At</th>
+                      <th className="py-2.5 px-3">Note</th>
+                      <th className="py-2.5 px-3 text-right">Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100">
+                    {invites.map((inv) => {
+                      const isExpired = inv.status === 'expired';
+                      const isRevoked = inv.status === 'revoked';
+                      const isAccepted = inv.status === 'accepted';
+                      const isPending = inv.status === 'pending';
+
+                      return (
+                        <tr key={inv.id} className="hover:bg-slate-50 transition-colors">
+                          <td className="py-3 px-3 font-mono font-bold text-slate-900">
+                            {inv.email}
+                          </td>
+                          <td className="py-3 px-3">
+                            <span className="px-2 py-0.5 rounded-md text-[10px] font-bold bg-rose-50 text-rose-700 border border-rose-200">
+                              Complimentary
+                            </span>
+                          </td>
+                          <td className="py-3 px-3">
+                            {isPending && (
+                              <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold bg-amber-50 text-amber-800 border border-amber-200">
+                                <Clock className="w-3 h-3 text-amber-600" />
+                                <span>Pending</span>
+                              </span>
+                            )}
+                            {isAccepted && (
+                              <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold bg-emerald-50 text-emerald-800 border border-emerald-200">
+                                <CheckCircle2 className="w-3 h-3 text-emerald-600" />
+                                <span>Accepted</span>
+                              </span>
+                            )}
+                            {isRevoked && (
+                              <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold bg-rose-50 text-rose-800 border border-rose-200">
+                                <X className="w-3 h-3 text-rose-600" />
+                                <span>Revoked</span>
+                              </span>
+                            )}
+                            {isExpired && (
+                              <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold bg-slate-100 text-slate-600 border border-slate-200">
+                                <AlertCircle className="w-3 h-3 text-slate-400" />
+                                <span>Expired</span>
+                              </span>
+                            )}
+                          </td>
+                          <td className="py-3 px-3 text-slate-600 text-[11px]">
+                            {inv.createdByEmail || inv.createdBy}
+                          </td>
+                          <td className="py-3 px-3 text-slate-500 text-[11px]">
+                            {new Date(inv.createdAt).toLocaleDateString()}
+                          </td>
+                          <td className="py-3 px-3 text-slate-500 text-[11px]">
+                            {inv.expiresAt ? new Date(inv.expiresAt).toLocaleDateString() : 'Never'}
+                          </td>
+                          <td className="py-3 px-3 text-slate-600 text-[11px] max-w-[150px] truncate">
+                            {inv.note || '—'}
+                          </td>
+                          <td className="py-3 px-3 text-right">
+                            <div className="flex items-center justify-end gap-1.5">
+                              <button
+                                onClick={() => handleCopyInviteLink(inv.id)}
+                                className={`px-2.5 py-1 rounded-lg text-xs font-semibold border flex items-center gap-1 transition-all cursor-pointer ${
+                                  copiedInviteId === inv.id
+                                    ? 'bg-emerald-50 text-emerald-800 border-emerald-300'
+                                    : 'bg-white hover:bg-slate-100 text-slate-700 border-slate-200'
+                                }`}
+                                title="Copy invite link to clipboard"
+                              >
+                                {copiedInviteId === inv.id ? (
+                                  <>
+                                    <Check className="w-3.5 h-3.5 text-emerald-600" />
+                                    <span>Copied</span>
+                                  </>
+                                ) : (
+                                  <>
+                                    <Copy className="w-3.5 h-3.5 text-slate-400" />
+                                    <span>Copy Link</span>
+                                  </>
+                                )}
+                              </button>
+
+                              {(isPending || isAccepted) && (
+                                <button
+                                  onClick={() => handleRevokeInvite(inv.id, inv.email)}
+                                  className="px-2.5 py-1 rounded-lg bg-rose-50 hover:bg-rose-100 text-rose-700 border border-rose-200 text-xs font-semibold cursor-pointer transition-colors"
+                                  title="Revoke access and revert user to free"
+                                >
+                                  Revoke
+                                </button>
+                              )}
+                            </div>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            )}
           </div>
         </div>
       )}
@@ -1397,14 +1684,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
               </div>
             </div>
 
-            <div className="pt-4 border-t border-slate-200 flex justify-between items-center">
-              <button
-                onClick={handleResetDemoData}
-                className="px-4 py-2 bg-rose-50 text-rose-700 hover:bg-rose-100 border border-rose-200 rounded-xl font-bold"
-              >
-                Reset Demo Data
-              </button>
-
+            <div className="pt-4 border-t border-slate-200 flex justify-end items-center">
               <button
                 onClick={() => {
                   dataService.updateSettings(settings);

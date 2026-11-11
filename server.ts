@@ -32,7 +32,11 @@ const adminAuth = getAuth(firebaseApp);
 const adminDb = getFirestore(firebaseApp, firebaseConfig.firestoreDatabaseId);
 
 // Super admin emails from environment variable
-const SUPER_ADMIN_EMAILS = (process.env.SUPER_ADMIN_EMAILS || 'mdingman@mill.agency,linda@mill.agency')
+const rawSuperAdminEmails = process.env.SUPER_ADMIN_EMAILS;
+if (!rawSuperAdminEmails || !rawSuperAdminEmails.trim()) {
+  console.warn('SUPER_ADMIN_EMAILS not set; no users assigned super_admin role');
+}
+const SUPER_ADMIN_EMAILS = (rawSuperAdminEmails || '')
   .split(',')
   .map((e) => e.trim().toLowerCase())
   .filter(Boolean);
@@ -94,6 +98,31 @@ app.get('/api/health', (_req, res) => {
   });
 });
 
+// Audit log helper function using Admin SDK
+async function logServerAudit(
+  action: string,
+  details: string,
+  actor: { uid: string; email?: string; name?: string },
+  targetUserId?: string
+) {
+  try {
+    const id = `log_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
+    const entry = {
+      id,
+      timestamp: new Date().toISOString(),
+      actorId: actor.uid,
+      actorEmail: actor.email || 'system@mill.agency',
+      actorName: actor.name || (actor.email ? actor.email.split('@')[0] : 'System'),
+      action,
+      details,
+      targetUserId: targetUserId || actor.uid,
+    };
+    await adminDb.collection('auditLogs').doc(id).set(entry);
+  } catch (err: any) {
+    console.warn('[Audit Log Write Warning]:', err.message);
+  }
+}
+
 // Authentication Synchronization Endpoint: validates Firebase ID token and assigns super_admin role
 app.post('/api/auth/sync', async (req, res) => {
   try {
@@ -147,6 +176,38 @@ app.post('/api/auth/sync', async (req, res) => {
       }
     }
 
+    // Check for pending, unexpired invite matching user's exact email
+    try {
+      const inviteSnap = await adminDb
+        .collection('invites')
+        .where('email', '==', email)
+        .where('status', '==', 'pending')
+        .get();
+
+      if (!inviteSnap.empty) {
+        for (const doc of inviteSnap.docs) {
+          const inv = doc.data();
+          const expiresAt = inv.expiresAt;
+          if (expiresAt && new Date(expiresAt).getTime() <= Date.now()) {
+            await doc.ref.update({ status: 'expired' });
+          } else {
+            userData.planId = 'complimentary';
+            await userRef.set({ planId: 'complimentary', updatedAt: now }, { merge: true });
+            await doc.ref.update({
+              status: 'accepted',
+              acceptedAt: now,
+              acceptedBy: verified.uid,
+            });
+            await logServerAudit('INVITE_ACCEPTED', `Accepted complimentary access invite for ${email}`, verified, verified.uid);
+            await logServerAudit('PLAN_CHANGED', `Plan changed to complimentary for ${email} via invite`, verified, verified.uid);
+            break;
+          }
+        }
+      }
+    } catch (invErr: any) {
+      console.warn('[Invite Check Warning]:', invErr.message);
+    }
+
     if (isSuperAdmin) {
       try {
         await adminDb.collection('admins').doc(verified.uid).set({
@@ -164,6 +225,329 @@ app.post('/api/auth/sync', async (req, res) => {
   } catch (err: any) {
     console.error('[Auth Sync Error]', err.message);
     return res.status(401).json({ error: 'Unauthorized: Firebase ID token verification failed' });
+  }
+});
+
+// =========================================================================
+// INVITES & ADMIN PLAN/ROLE ENDPOINTS
+// =========================================================================
+
+// List all invites (super admins only)
+app.get('/api/invites', async (req, res) => {
+  try {
+    const verified = await verifyFirebaseToken(req);
+    const email = (verified.email || '').toLowerCase();
+    if (!SUPER_ADMIN_EMAILS.includes(email)) {
+      return res.status(403).json({ error: 'Forbidden: Super admin privileges required' });
+    }
+
+    const snap = await adminDb.collection('invites').get();
+    const invites: any[] = [];
+    const now = Date.now();
+
+    for (const doc of snap.docs) {
+      const data = doc.data();
+      let status = data.status || 'pending';
+      if (status === 'pending' && data.expiresAt && new Date(data.expiresAt).getTime() <= now) {
+        status = 'expired';
+        await doc.ref.update({ status: 'expired' });
+      }
+      invites.push({
+        id: doc.id,
+        ...data,
+        status,
+      });
+    }
+
+    invites.sort((a, b) => new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime());
+    return res.json({ invites });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// Create invite (super admins only)
+app.post('/api/invites', async (req, res) => {
+  try {
+    const verified = await verifyFirebaseToken(req);
+    const superAdminEmail = (verified.email || '').toLowerCase();
+    if (!SUPER_ADMIN_EMAILS.includes(superAdminEmail)) {
+      return res.status(403).json({ error: 'Forbidden: Super admin privileges required' });
+    }
+
+    const { email, note, expiresAt } = req.body;
+    if (!email || typeof email !== 'string' || !email.includes('@')) {
+      return res.status(400).json({ error: 'Valid email address is required' });
+    }
+
+    const cleanEmail = email.trim().toLowerCase();
+    const now = new Date().toISOString();
+    const inviteRef = adminDb.collection('invites').doc();
+
+    const inviteData = {
+      id: inviteRef.id,
+      email: cleanEmail,
+      plan: 'complimentary',
+      status: 'pending',
+      createdBy: verified.uid,
+      createdByEmail: verified.email || '',
+      createdAt: now,
+      expiresAt: expiresAt ? new Date(expiresAt).toISOString() : null,
+      note: note ? String(note).trim() : '',
+    };
+
+    await inviteRef.set(inviteData);
+
+    await logServerAudit(
+      'INVITE_CREATED',
+      `Created complimentary access invite for ${cleanEmail}${expiresAt ? ` (expires ${expiresAt})` : ''}`,
+      verified
+    );
+
+    return res.json({ invite: inviteData });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// Revoke invite (super admins only)
+app.post('/api/invites/:id/revoke', async (req, res) => {
+  try {
+    const verified = await verifyFirebaseToken(req);
+    const superAdminEmail = (verified.email || '').toLowerCase();
+    if (!SUPER_ADMIN_EMAILS.includes(superAdminEmail)) {
+      return res.status(403).json({ error: 'Forbidden: Super admin privileges required' });
+    }
+
+    const inviteId = req.params.id;
+    const inviteRef = adminDb.collection('invites').doc(inviteId);
+    const snap = await inviteRef.get();
+    if (!snap.exists) {
+      return res.status(404).json({ error: 'Invite not found' });
+    }
+
+    const invData = snap.data()!;
+    const now = new Date().toISOString();
+
+    await inviteRef.update({
+      status: 'revoked',
+      revokedAt: now,
+      revokedBy: verified.uid,
+    });
+
+    // Revoking an invite moves an accepted user back to the free plan
+    const userQuery = await adminDb
+      .collection('users')
+      .where('email', '==', invData.email.toLowerCase())
+      .get();
+
+    for (const uDoc of userQuery.docs) {
+      const uData = uDoc.data();
+      if (uData.planId === 'complimentary') {
+        await uDoc.ref.update({
+          planId: 'free',
+          updatedAt: now,
+        });
+        await logServerAudit(
+          'PLAN_CHANGED',
+          `Plan reverted to free due to invite revocation for ${invData.email}`,
+          verified,
+          uDoc.id
+        );
+      }
+    }
+
+    await logServerAudit(
+      'INVITE_REVOKED',
+      `Revoked complimentary access invite for ${invData.email}`,
+      verified
+    );
+
+    return res.json({ success: true });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// Get single invite details
+app.get('/api/invites/:id', async (req, res) => {
+  try {
+    const inviteId = req.params.id;
+    const inviteRef = adminDb.collection('invites').doc(inviteId);
+    const snap = await inviteRef.get();
+    if (!snap.exists) {
+      return res.status(404).json({ error: 'Invite not found' });
+    }
+
+    const data = snap.data()!;
+    const now = Date.now();
+    let status = data.status || 'pending';
+    if (status === 'pending' && data.expiresAt && new Date(data.expiresAt).getTime() <= now) {
+      status = 'expired';
+    }
+
+    return res.json({
+      invite: {
+        id: snap.id,
+        email: data.email,
+        plan: data.plan,
+        status,
+        note: data.note,
+        expiresAt: data.expiresAt,
+        createdAt: data.createdAt,
+      },
+    });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// Accept invite via link
+app.post('/api/invites/:id/accept', async (req, res) => {
+  try {
+    const verified = await verifyFirebaseToken(req);
+    const userEmail = (verified.email || '').toLowerCase();
+    const inviteId = req.params.id;
+
+    const inviteRef = adminDb.collection('invites').doc(inviteId);
+    const snap = await inviteRef.get();
+    if (!snap.exists) {
+      return res.status(404).json({ error: 'Invite not found' });
+    }
+
+    const invData = snap.data()!;
+    if (invData.email.toLowerCase() !== userEmail) {
+      return res.status(403).json({
+        error: `This invite was sent to ${invData.email}. You are signed in as ${userEmail}. Please sign in with the invited email address.`,
+      });
+    }
+
+    const now = new Date().toISOString();
+    if (invData.expiresAt && new Date(invData.expiresAt).getTime() <= Date.now()) {
+      await inviteRef.update({ status: 'expired' });
+      return res.status(400).json({ error: 'This invitation has expired.' });
+    }
+
+    if (invData.status === 'revoked') {
+      return res.status(400).json({ error: 'This invitation has been revoked.' });
+    }
+
+    // Set user's plan to complimentary
+    const userRef = adminDb.collection('users').doc(verified.uid);
+    await userRef.set({
+      planId: 'complimentary',
+      updatedAt: now,
+    }, { merge: true });
+
+    await inviteRef.update({
+      status: 'accepted',
+      acceptedAt: now,
+      acceptedBy: verified.uid,
+    });
+
+    await logServerAudit('INVITE_ACCEPTED', `User ${userEmail} accepted complimentary access invite ${inviteId}`, verified, verified.uid);
+    await logServerAudit('PLAN_CHANGED', `Plan changed to complimentary for ${userEmail} via invite ${inviteId}`, verified, verified.uid);
+
+    const userSnap = await userRef.get();
+    return res.json({ success: true, user: userSnap.data() });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// Super Admin Update User Plan
+app.post('/api/admin/users/:userId/plan', async (req, res) => {
+  try {
+    const verified = await verifyFirebaseToken(req);
+    const email = (verified.email || '').toLowerCase();
+    if (!SUPER_ADMIN_EMAILS.includes(email)) {
+      return res.status(403).json({ error: 'Forbidden: Super admin privileges required' });
+    }
+
+    const { userId } = req.params;
+    const { planId } = req.body;
+    if (!['free', 'pro', 'team', 'complimentary'].includes(planId)) {
+      return res.status(400).json({ error: 'Invalid planId' });
+    }
+
+    const userRef = adminDb.collection('users').doc(userId);
+    const snap = await userRef.get();
+    if (!snap.exists) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    const prevPlan = snap.data()?.planId || 'free';
+    const targetEmail = snap.data()?.email || userId;
+
+    await userRef.update({
+      planId,
+      updatedAt: new Date().toISOString(),
+    });
+
+    await logServerAudit(
+      'PLAN_CHANGED',
+      `Super admin changed plan for ${targetEmail} from ${prevPlan} to ${planId}`,
+      verified,
+      userId
+    );
+
+    return res.json({ success: true });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// Super Admin Update User Role
+app.post('/api/admin/users/:userId/role', async (req, res) => {
+  try {
+    const verified = await verifyFirebaseToken(req);
+    const email = (verified.email || '').toLowerCase();
+    if (!SUPER_ADMIN_EMAILS.includes(email)) {
+      return res.status(403).json({ error: 'Forbidden: Super admin privileges required' });
+    }
+
+    const { userId } = req.params;
+    const { role } = req.body;
+    if (!['super_admin', 'member', 'admin', 'support'].includes(role)) {
+      return res.status(400).json({ error: 'Invalid role' });
+    }
+
+    const userRef = adminDb.collection('users').doc(userId);
+    const snap = await userRef.get();
+    if (!snap.exists) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    const prevRole = snap.data()?.role || 'member';
+    const targetEmail = snap.data()?.email || userId;
+    const now = new Date().toISOString();
+
+    await userRef.update({
+      role,
+      updatedAt: now,
+    });
+
+    if (role === 'super_admin') {
+      await adminDb.collection('admins').doc(userId).set({
+        id: userId,
+        email: targetEmail,
+        role: 'super_admin',
+        createdAt: now,
+      }, { merge: true });
+    } else if (prevRole === 'super_admin') {
+      await adminDb.collection('admins').doc(userId).delete().catch(() => {});
+    }
+
+    await logServerAudit(
+      'ROLE_CHANGED',
+      `Super admin changed role for ${targetEmail} from ${prevRole} to ${role}`,
+      verified,
+      userId
+    );
+
+    return res.json({ success: true });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
   }
 });
 
@@ -209,7 +593,7 @@ app.post('/api/gemini/generate', async (req, res) => {
       }
 
       const planId = userData.planId || 'free';
-      const limits: Record<string, number> = { free: 50, pro: 500, team: 2000 };
+      const limits: Record<string, number> = { free: 50, pro: 500, team: 2000, complimentary: 2000 };
       const planLimit = (limits[planId] || 50) + (userData.bonusGenerations || 0);
 
       // Check billing cycle reset
@@ -239,7 +623,8 @@ app.post('/api/gemini/generate', async (req, res) => {
       console.warn(`[Quota Blocked] User ${userId} exceeded monthly generation limit.`);
       return res.status(403).json({ error: txErr.message });
     }
-    console.warn(`[Usage Transaction Warning]: ${txErr.message}`);
+    console.error(`[Usage Transaction Error]: ${txErr.message}`);
+    return res.status(503).json({ error: 'Usage transaction failed. Please try again later.' });
   }
 
   // Record generation timestamp for rate limit sliding window

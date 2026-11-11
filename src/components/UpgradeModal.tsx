@@ -1,5 +1,5 @@
 import React from 'react';
-import { User, Plan } from '../types';
+import { User, Plan, PlanId } from '../types';
 import { billingService } from '../services/billingService';
 import { Check, Sparkles, X, ShieldCheck, Zap, HeartHandshake } from 'lucide-react';
 
@@ -7,7 +7,7 @@ interface UpgradeModalProps {
   user: User;
   isOpen: boolean;
   onClose: () => void;
-  onSelectPlan: (planId: 'free' | 'pro' | 'team') => void;
+  onSelectPlan: (planId: PlanId) => void;
   reason?: 'limit_reached' | 'upgrade_click' | 'feature_locked';
 }
 
@@ -20,7 +20,7 @@ export const UpgradeModal: React.FC<UpgradeModalProps> = ({
 }) => {
   if (!isOpen) return null;
 
-  const plans = billingService.getPlans();
+  const plans = billingService.getPlans().filter((p) => p.id !== 'complimentary');
   const isNonprofit = user.organizationProfile?.type === 'Nonprofit';
   const hasDiscount = isNonprofit && user.nonprofitDiscountApproved;
 

@@ -17,6 +17,7 @@ import { OnboardingModal } from './components/OnboardingModal';
 import { UpgradeModal } from './components/UpgradeModal';
 import { ReceiptModal } from './components/ReceiptModal';
 import { StrategyCallModal } from './components/StrategyCallModal';
+import { InviteAcceptView } from './components/InviteAcceptView';
 import { APP_CONFIG } from './config';
 import {
   Sparkles,
@@ -35,6 +36,17 @@ export default function App() {
   const [activeView, setActiveView] = useState<'tools' | 'library' | 'account' | 'admin'>('tools');
   const [isSigningIn, setIsSigningIn] = useState(false);
   const [signInError, setSignInError] = useState<string | null>(null);
+
+  // Invite link routing
+  const [currentInviteId, setCurrentInviteId] = useState<string | null>(() => {
+    if (typeof window !== 'undefined') {
+      const path = window.location.pathname;
+      if (path.startsWith('/invite/')) {
+        return path.split('/invite/')[1]?.split('/')[0]?.split('?')[0] || null;
+      }
+    }
+    return null;
+  });
 
   // Modals state
   const [onboardingOpen, setOnboardingOpen] = useState(false);
@@ -110,10 +122,26 @@ export default function App() {
       />
 
       {/* Main Content Area */}
-      <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-6">
-        {currentUser ? (
-          <>
-            {activeView === 'tools' && (
+      {currentInviteId ? (
+        <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-6">
+          <InviteAcceptView
+            inviteId={currentInviteId}
+            currentUser={currentUser}
+            onSignedIn={(user) => {
+              setCurrentUser(user);
+            }}
+            onContinueToApp={() => {
+              setCurrentInviteId(null);
+              window.history.pushState({}, '', '/');
+              setActiveView('tools');
+            }}
+          />
+        </main>
+      ) : (
+        <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-6">
+          {currentUser ? (
+            <>
+              {activeView === 'tools' && (
               <MarketingStudio
                 user={currentUser}
                 onUsageUpdated={(newUsage) => {
@@ -263,6 +291,7 @@ export default function App() {
           </div>
         )}
       </main>
+      )}
 
       {/* Footer */}
       <Footer />

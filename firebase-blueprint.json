@@ -11,7 +11,7 @@
         "avatar": { "type": "string", "description": "Avatar URL" },
         "role": { "type": "string", "enum": ["super_admin", "member"], "description": "System role" },
         "organizationId": { "type": "string", "description": "Associated organization ID" },
-        "planId": { "type": "string", "enum": ["free", "pro", "team"], "description": "Subscription plan tier" },
+        "planId": { "type": "string", "enum": ["free", "pro", "team", "complimentary"], "description": "Subscription plan tier" },
         "generationsUsedThisMonth": { "type": "number", "description": "AI generation count used in billing cycle" },
         "billingResetDate": { "type": "string", "description": "ISO date for next monthly reset" },
         "createdAt": { "type": "string", "description": "Timestamp when account was created" },
@@ -126,6 +126,10 @@
     "/auditLogs/{logId}": {
       "schema": "AuditLog",
       "description": "System activity and generation audit log"
+    },
+    "/invites/{inviteId}": {
+      "schema": "Invite",
+      "description": "Top-level complimentary access invites"
     }
   }
 }

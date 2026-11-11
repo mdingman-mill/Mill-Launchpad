@@ -21,6 +21,7 @@ import {
   Plan,
   ToolDefinition,
   AgencySettings,
+  Invite,
 } from '../types';
 
 /**
@@ -85,6 +86,21 @@ export const INITIAL_PLANS: Plan[] = [
       '25% Nonprofit discount eligible',
     ],
   },
+  {
+    id: 'complimentary',
+    name: 'Complimentary',
+    price: 0,
+    priceNonprofit: 0,
+    generationLimit: 2000,
+    description: 'Complimentary VIP access with full access to all tools and 2,000 generations/month.',
+    features: [
+      '2,000 AI generations per month',
+      'Full access to all strategy, content, and specialized marketing tools',
+      'VIP complimentary access granted by Millennium Agency super admin',
+      'No credit card or payment required',
+      'Saved deliverables library with full export capabilities',
+    ],
+  },
 ];
 
 // Official Marketing Tools
@@ -103,14 +119,12 @@ export const INITIAL_TOOLS: ToolDefinition[] = [
         label: 'Primary Mission / Core Differentiator',
         type: 'textarea',
         placeholder: 'What is the single most important change you want to make in the world or for your customers?',
-        required: true,
       },
       {
         key: 'primaryCompetitorOrAlternative',
         label: 'Current Alternative or Competitor',
         type: 'text',
         placeholder: 'What do people use or do right now if they do not work with you?',
-        required: true,
       },
     ],
   },
@@ -128,14 +142,12 @@ export const INITIAL_TOOLS: ToolDefinition[] = [
         label: 'Primary Campaign / Focus Theme',
         type: 'text',
         placeholder: 'e.g., General brand introduction, Q1 fundraising sprint, new product beta launch',
-        required: true,
       },
       {
         key: 'desiredReaction',
         label: 'What should listeners think or feel immediately?',
         type: 'text',
         placeholder: 'e.g., "This changes everything", "Where do I sign up?", "I trust this team"',
-        required: false,
       },
     ],
   },
@@ -153,21 +165,20 @@ export const INITIAL_TOOLS: ToolDefinition[] = [
         label: 'Single Most Critical Milestone for Next 90 Days',
         type: 'text',
         placeholder: 'e.g., Acquire 50 beta users, raise $25,000 for scholarship fund, sign 3 enterprise pilots',
-        required: true,
       },
       {
         key: 'weeklyHoursDedicated',
         label: 'Weekly Team Hours Dedicated to Marketing',
         type: 'select',
+        placeholder: 'Select dedicated weekly hours...',
         options: ['2-5 hours/week (Solo Founder)', '5-10 hours/week (Lean Team)', '15+ hours/week (Dedicated Team)'],
-        required: true,
       },
     ],
   },
   {
     id: 'social-generator',
     name: 'Social Post Generator',
-    category: 'Social',
+    category: 'Content',
     description: 'Craft tailored, high-converting posts for LinkedIn, Instagram, Facebook, and X, plus a 4-week content calendar.',
     whyThisMatters: 'Builds organic community traction and executive thought leadership without spending thousands on paid ads.',
     enabledGlobally: true,
@@ -178,14 +189,12 @@ export const INITIAL_TOOLS: ToolDefinition[] = [
         label: 'What story, milestone, or topic do you want to share?',
         type: 'textarea',
         placeholder: 'e.g., Behind-the-scenes look at our product build, a client breakthrough story, an industry insight',
-        required: true,
       },
       {
         key: 'callToAction',
         label: 'Desired Call-to-Action',
         type: 'text',
         placeholder: 'e.g., Share your thoughts in comments, sign up for early access, share with a founder friend',
-        required: true,
       },
     ],
   },
@@ -202,20 +211,19 @@ export const INITIAL_TOOLS: ToolDefinition[] = [
         key: 'emailType',
         label: 'Campaign Type',
         type: 'select',
+        placeholder: 'Select campaign sequence type...',
         options: [
           '3-Part Welcome Sequence',
           'Monthly Community Newsletter',
           'Urgent Campaign / Launch Announcement',
           'Re-engagement / Check-In Note',
         ],
-        required: true,
       },
       {
         key: 'keyAnnouncement',
         label: 'Core Announcement or Value Offering',
         type: 'textarea',
         placeholder: 'What are you announcing or sharing in this email sequence?',
-        required: true,
       },
     ],
   },
@@ -232,15 +240,14 @@ export const INITIAL_TOOLS: ToolDefinition[] = [
         key: 'pageType',
         label: 'Page Copy to Generate',
         type: 'select',
+        placeholder: 'Select page copy type...',
         options: ['Homepage Hero & Value Pillars', 'About Us & Founder Story', 'Services / Programs Breakdown'],
-        required: true,
       },
       {
         key: 'primaryConversionGoal',
         label: 'Primary Button / Conversion Goal',
         type: 'text',
         placeholder: 'e.g., "Schedule Discovery Call", "Apply for Fellowship", "Start Free Trial"',
-        required: true,
       },
     ],
   },
@@ -259,21 +266,18 @@ export const INITIAL_TOOLS: ToolDefinition[] = [
         label: 'Campaign or Grant Initiative Name',
         type: 'text',
         placeholder: 'e.g., 2026 Clean Waters Initiative, Annual Winter Gala Appeal',
-        required: true,
       },
       {
         key: 'fundingTarget',
         label: 'Target Funding Amount & Use of Funds',
         type: 'text',
         placeholder: 'e.g., $15,000 to equip 3 community science labs with water testing kits',
-        required: true,
       },
       {
         key: 'humanImpactStory',
         label: 'Human Story or Specific Community Impact',
         type: 'textarea',
         placeholder: 'Describe a specific person or community who benefits directly from this program',
-        required: true,
       },
     ],
   },
@@ -292,21 +296,19 @@ export const INITIAL_TOOLS: ToolDefinition[] = [
         label: 'Key Milestones & Traction to Highlight',
         type: 'textarea',
         placeholder: 'e.g., 500 waitlist users, $12k ARR, 3 LOIs from mid-market retailers, MVP live in testing',
-        required: true,
       },
       {
         key: 'theAsk',
         label: 'The Capital Ask or Launch Goal',
         type: 'text',
         placeholder: 'e.g., Raising $750k Seed Round to expand engineering, launching publicly on Product Hunt',
-        required: true,
       },
     ],
   },
   {
     id: 'keywords-content',
     name: 'Keywords & Content Ideas',
-    category: 'SEO',
+    category: 'Growth',
     description: '20 high-intent keywords categorized by search intent plus 10 engaging blog and newsletter article titles.',
     whyThisMatters: 'Establishes organic authority in Google search results and ensures you never run out of relevant content topics.',
     enabledGlobally: true,
@@ -317,14 +319,13 @@ export const INITIAL_TOOLS: ToolDefinition[] = [
         label: 'Core Search Topic or Service Category',
         type: 'text',
         placeholder: 'e.g., Nonprofit donor management, supply chain anomaly detection, sustainable packaging',
-        required: true,
       },
       {
         key: 'geographicFocus',
         label: 'Geographic Scope',
         type: 'select',
+        placeholder: 'Select geographic scope...',
         options: ['Global / Nationwide (Digital)', 'Regional / State-Level', 'Local Community Specific'],
-        required: false,
       },
     ],
   },
@@ -332,13 +333,12 @@ export const INITIAL_TOOLS: ToolDefinition[] = [
 
 export const INITIAL_SETTINGS: AgencySettings = {
   agencyName: 'Millennium Agency',
-  supportEmail: 'launchpad@mill.agency',
-  calendlyUrl: 'https://calendly.com/lindafanaras/linkedin-intro',
-  agencyWebsiteUrl: 'https://mill.agency',
-  freeTierLimit: 50,
-  proTierLimit: 500,
-  teamTierLimit: 2000,
-  nonprofitDiscountPercent: 25,
+  logoUrl: '',
+  primaryColor: '#0f172a',
+  accentColor: '#2563eb',
+  bookingUrl: 'https://calendly.com/lindafanaras/linkedin-intro',
+  openSignup: true,
+  contactEmail: 'launchpad@mill.agency',
 };
 
 class DataService {
@@ -659,6 +659,122 @@ class DataService {
     if (idx === -1) return null;
     this.cachedInvoices[idx] = { ...this.cachedInvoices[idx], ...updates };
     return this.cachedInvoices[idx];
+  }
+
+  /* =========================================================================
+   * INVITES (Complimentary Access System)
+   * ========================================================================= */
+  public async fetchInvites(): Promise<Invite[]> {
+    try {
+      const token = await auth.currentUser?.getIdToken();
+      if (!token) return [];
+      const res = await fetch('/api/invites', {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (!res.ok) {
+        throw new Error('Failed to fetch invites');
+      }
+      const data = await res.json();
+      return (data.invites || []) as Invite[];
+    } catch (err) {
+      console.error('Error fetching invites:', err);
+      return [];
+    }
+  }
+
+  public async createInvite(email: string, note?: string, expiresAt?: string): Promise<Invite> {
+    const token = await auth.currentUser?.getIdToken();
+    if (!token) throw new Error('Not authenticated');
+    const res = await fetch('/api/invites', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({ email, note, expiresAt }),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || 'Failed to create invite');
+    }
+    const data = await res.json();
+    return data.invite as Invite;
+  }
+
+  public async revokeInvite(id: string): Promise<void> {
+    const token = await auth.currentUser?.getIdToken();
+    if (!token) throw new Error('Not authenticated');
+    const res = await fetch(`/api/invites/${id}/revoke`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || 'Failed to revoke invite');
+    }
+  }
+
+  public async getInvite(id: string): Promise<Invite | null> {
+    try {
+      const token = await auth.currentUser?.getIdToken();
+      const headers: Record<string, string> = {};
+      if (token) headers['Authorization'] = `Bearer ${token}`;
+      const res = await fetch(`/api/invites/${id}`, { headers });
+      if (!res.ok) return null;
+      const data = await res.json();
+      return (data.invite || null) as Invite | null;
+    } catch {
+      return null;
+    }
+  }
+
+  public async acceptInvite(id: string): Promise<User> {
+    const token = await auth.currentUser?.getIdToken();
+    if (!token) throw new Error('Not authenticated');
+    const res = await fetch(`/api/invites/${id}/accept`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || 'Failed to accept invite');
+    }
+    const data = await res.json();
+    return data.user as User;
+  }
+
+  public async updateUserPlanServer(userId: string, planId: string): Promise<void> {
+    const token = await auth.currentUser?.getIdToken();
+    if (!token) throw new Error('Not authenticated');
+    const res = await fetch(`/api/admin/users/${userId}/plan`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({ planId }),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || 'Failed to update plan on server');
+    }
+  }
+
+  public async updateUserRoleServer(userId: string, role: string): Promise<void> {
+    const token = await auth.currentUser?.getIdToken();
+    if (!token) throw new Error('Not authenticated');
+    const res = await fetch(`/api/admin/users/${userId}/role`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({ role }),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || 'Failed to update role on server');
+    }
   }
 
   /* =========================================================================

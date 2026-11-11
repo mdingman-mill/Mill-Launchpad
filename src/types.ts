@@ -17,13 +17,15 @@ export interface OrganizationProfile {
   budget: MarketingBudget;
 }
 
+export type PlanId = 'free' | 'pro' | 'team' | 'complimentary';
+
 export interface User {
   id: string;
   name: string;
   email: string;
   avatar: string;
   role: UserRole;
-  planId: 'free' | 'pro' | 'team';
+  planId: PlanId;
   status: 'active' | 'suspended';
   organizationProfile?: OrganizationProfile;
   signupDate: string;
@@ -48,7 +50,7 @@ export interface User {
 }
 
 export interface Plan {
-  id: 'free' | 'pro' | 'team';
+  id: PlanId;
   name: string;
   price: number;
   priceNonprofit: number;
@@ -66,11 +68,29 @@ export interface Invoice {
   userEmail: string;
   date: string;
   amount: number;
-  planId: 'free' | 'pro' | 'team';
+  planId: PlanId;
   planName: string;
   status: 'paid' | 'past_due' | 'canceled' | 'refunded';
   pdfReceiptId: string;
   billingAddress?: string;
+}
+
+export type InviteStatus = 'pending' | 'accepted' | 'revoked' | 'expired';
+
+export interface Invite {
+  id: string;
+  email: string;
+  plan: 'complimentary';
+  status: InviteStatus;
+  createdBy: string;
+  createdByEmail?: string;
+  createdAt: string;
+  expiresAt?: string | null;
+  acceptedAt?: string | null;
+  acceptedBy?: string | null;
+  revokedAt?: string | null;
+  revokedBy?: string | null;
+  note?: string;
 }
 
 export interface SavedOutput {
