@@ -88,7 +88,13 @@ export const InviteAcceptView: React.FC<InviteAcceptViewProps> = ({
       onSignedIn(user);
     } catch (err: any) {
       if (err?.code !== 'auth/popup-closed-by-user') {
-        setError(err?.message || 'Authentication failed. Please try again.');
+        if (err?.code === 'auth/unauthorized-domain') {
+          setError(
+            `This domain (${window.location.hostname}) is not authorized for Google Sign-In. Add it in Firebase Console → Authentication → Settings → Authorized domains.`
+          );
+        } else {
+          setError(err?.message || 'Authentication failed. Please try again.');
+        }
       }
     } finally {
       setIsSigningIn(false);

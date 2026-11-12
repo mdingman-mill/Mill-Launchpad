@@ -4,7 +4,7 @@ import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
 import { GoogleGenAI, ThinkingLevel } from '@google/genai';
-import { initializeApp, getApps } from 'firebase-admin/app';
+import { initializeApp, getApps, cert } from 'firebase-admin/app';
 import { getAuth } from 'firebase-admin/auth';
 import { getFirestore } from 'firebase-admin/firestore';
 
@@ -13,40 +13,103 @@ dotenv.config();
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const app = express();
-const PORT = Number(process.env.PORT) || 3000;
-const isProduction = process.env.NODE_ENV === 'production';
+// Helper to load firebase config robustly across local dev and Netlify functions
+function loadFirebaseConfig(): any {
+  const candidates = [
+    path.resolve(__dirname, 'firebase-applet-config.json'),
+    path.resolve(process.cwd(), 'firebase-applet-config.json'),
+    path.resolve(__dirname, '../firebase-applet-config.json'),
+    path.resolve(__dirname, '../../firebase-applet-config.json'),
+  ];
+  for (const c of candidates) {
+    if (fs.existsSync(c)) {
+      return JSON.parse(fs.readFileSync(c, 'utf8'));
+    }
+  }
+  throw new Error('firebase-applet-config.json not found');
+}
 
-app.use(express.json({ limit: '10mb' }));
+const firebaseConfig = loadFirebaseConfig();
 
-// Initialize Firebase Admin SDK
-const firebaseConfig = JSON.parse(
-  fs.readFileSync(path.resolve(__dirname, 'firebase-applet-config.json'), 'utf8')
-);
+// Helper to parse service account key (JSON or base64 encoded JSON)
+function parseServiceAccountKey(raw: string): any {
+  const trimmed = raw.trim();
+  if (trimmed.startsWith('{')) {
+    return JSON.parse(trimmed);
+  }
+  try {
+    const decoded = Buffer.from(trimmed, 'base64').toString('utf8');
+    return JSON.parse(decoded);
+  } catch {
+    return JSON.parse(trimmed);
+  }
+}
+
+let credentialOption: any = undefined;
+if (process.env.FIREBASE_SERVICE_ACCOUNT_KEY) {
+  try {
+    const serviceAccount = parseServiceAccountKey(process.env.FIREBASE_SERVICE_ACCOUNT_KEY);
+    credentialOption = cert(serviceAccount);
+  } catch (err: any) {
+    console.error('Failed to parse FIREBASE_SERVICE_ACCOUNT_KEY:', err.message);
+  }
+}
 
 const firebaseApp = getApps().length
   ? getApps()[0]
-  : initializeApp({ projectId: firebaseConfig.projectId });
+  : initializeApp({
+      projectId: firebaseConfig.projectId,
+      ...(credentialOption ? { credential: credentialOption } : {}),
+    });
 
-const adminAuth = getAuth(firebaseApp);
-const adminDb = getFirestore(firebaseApp, firebaseConfig.firestoreDatabaseId);
+export const adminAuth = getAuth(firebaseApp);
+export const adminDb = getFirestore(firebaseApp, firebaseConfig.firestoreDatabaseId);
 
 // Super admin emails from environment variable
 const rawSuperAdminEmails = process.env.SUPER_ADMIN_EMAILS;
 if (!rawSuperAdminEmails || !rawSuperAdminEmails.trim()) {
   console.warn('SUPER_ADMIN_EMAILS not set; no users assigned super_admin role');
 }
-const SUPER_ADMIN_EMAILS = (rawSuperAdminEmails || '')
+export const SUPER_ADMIN_EMAILS = (rawSuperAdminEmails || '')
   .split(',')
   .map((e) => e.trim().toLowerCase())
   .filter(Boolean);
+
+// CORS configuration
+export const ALLOWED_ORIGINS = [
+  'https://launchpad.mill.agency',
+  'https://millennium-launchpad.netlify.app',
+  ...(process.env.APP_URL ? [process.env.APP_URL.trim().replace(/\/$/, '')] : []),
+];
+
+export function getCorsHeaders(requestOrigin?: string | null): Record<string, string> {
+  let matchedOrigin = '';
+  if (requestOrigin) {
+    const cleaned = requestOrigin.trim().replace(/\/$/, '');
+    if (
+      ALLOWED_ORIGINS.includes(cleaned) ||
+      process.env.NODE_ENV !== 'production' ||
+      cleaned.includes('localhost') ||
+      cleaned.includes('127.0.0.1')
+    ) {
+      matchedOrigin = requestOrigin;
+    }
+  }
+  const allowOrigin = matchedOrigin || (ALLOWED_ORIGINS[0] || '*');
+  return {
+    'Access-Control-Allow-Origin': allowOrigin,
+    'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Requested-With',
+    'Access-Control-Allow-Credentials': 'true',
+  };
+}
 
 // Per-user generation rate limit map (10 generations per minute)
 const rateLimitMap = new Map<string, number[]>();
 const RATE_LIMIT_WINDOW_MS = 60 * 1000;
 const MAX_GENERATIONS_PER_MINUTE = 10;
 
-function getNextMonthFirstDay(fromDate: Date = new Date()): string {
+export function getNextMonthFirstDay(fromDate: Date = new Date()): string {
   const year = fromDate.getFullYear();
   const month = fromDate.getMonth();
   const nextMonth = new Date(year, month + 1, 1);
@@ -56,8 +119,9 @@ function getNextMonthFirstDay(fromDate: Date = new Date()): string {
 }
 
 // Token verification helper
-async function verifyFirebaseToken(req: express.Request): Promise<{ uid: string; email?: string; name?: string; picture?: string }> {
-  const authHeader = req.headers.authorization;
+export async function verifyFirebaseTokenFromHeader(
+  authHeader?: string | null
+): Promise<{ uid: string; email?: string; name?: string; picture?: string }> {
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
     throw new Error('Missing or invalid Authorization header');
   }
@@ -76,30 +140,9 @@ async function verifyFirebaseToken(req: express.Request): Promise<{ uid: string;
 
 // Server-side Gemini initialization
 const apiKey = process.env.GEMINI_API_KEY;
-let ai: GoogleGenAI | null = null;
-if (apiKey) {
-  ai = new GoogleGenAI({
-    apiKey,
-    httpOptions: {
-      headers: {
-        'User-Agent': 'aistudio-build',
-      },
-    },
-  });
-}
-
-// Health check endpoint
-app.get('/api/health', (_req, res) => {
-  res.json({
-    status: 'ok',
-    geminiAvailable: !!apiKey,
-    firebaseConfigured: true,
-    timestamp: new Date().toISOString(),
-  });
-});
 
 // Audit log helper function using Admin SDK
-async function logServerAudit(
+export async function logServerAudit(
   action: string,
   details: string,
   actor: { uid: string; email?: string; name?: string },
@@ -123,10 +166,27 @@ async function logServerAudit(
   }
 }
 
-// Authentication Synchronization Endpoint: validates Firebase ID token and assigns super_admin role
-app.post('/api/auth/sync', async (req, res) => {
+// =========================================================================
+// EXPORTED NAMED ROUTE HANDLERS
+// =========================================================================
+
+// 1. Health check
+export async function handleHealthCheck(): Promise<{ status: number; data: any }> {
+  return {
+    status: 200,
+    data: {
+      status: 'ok',
+      geminiAvailable: !!(process.env.GEMINI_API_KEY || apiKey),
+      firebaseConfigured: true,
+      timestamp: new Date().toISOString(),
+    },
+  };
+}
+
+// 2. Auth sync
+export async function handleAuthSync(authHeader?: string | null): Promise<{ status: number; data: any }> {
   try {
-    const verified = await verifyFirebaseToken(req);
+    const verified = await verifyFirebaseTokenFromHeader(authHeader);
     const email = (verified.email || '').toLowerCase();
     const isSuperAdmin = SUPER_ADMIN_EMAILS.includes(email);
     const role = isSuperAdmin ? 'super_admin' : 'member';
@@ -144,7 +204,7 @@ app.post('/api/auth/sync', async (req, res) => {
           email: verified.email || existing.email,
           name: verified.name || existing.name || email.split('@')[0],
           avatar: verified.picture || existing.avatar,
-          role: isSuperAdmin ? 'super_admin' : (existing.role === 'super_admin' ? 'super_admin' : role),
+          role: isSuperAdmin ? 'super_admin' : existing.role === 'super_admin' ? 'super_admin' : role,
           lastLogin: now,
         };
         await userRef.set(userData, { merge: true });
@@ -158,7 +218,9 @@ app.post('/api/auth/sync', async (req, res) => {
         id: verified.uid,
         email: verified.email || '',
         name: verified.name || email.split('@')[0] || 'User',
-        avatar: verified.picture || `https://api.dicebear.com/7.x/initials/svg?seed=${encodeURIComponent(verified.name || email)}`,
+        avatar:
+          verified.picture ||
+          `https://api.dicebear.com/7.x/initials/svg?seed=${encodeURIComponent(verified.name || email)}`,
         role,
         planId: 'free',
         status: 'active',
@@ -210,35 +272,34 @@ app.post('/api/auth/sync', async (req, res) => {
 
     if (isSuperAdmin) {
       try {
-        await adminDb.collection('admins').doc(verified.uid).set({
-          id: verified.uid,
-          email: verified.email,
-          role: 'super_admin',
-          createdAt: now,
-        }, { merge: true });
+        await adminDb.collection('admins').doc(verified.uid).set(
+          {
+            id: verified.uid,
+            email: verified.email,
+            role: 'super_admin',
+            createdAt: now,
+          },
+          { merge: true }
+        );
       } catch (e: any) {
         console.warn('[Firestore Admin Registry Write Warning]:', e.message);
       }
     }
 
-    return res.json({ user: userData });
+    return { status: 200, data: { user: userData } };
   } catch (err: any) {
     console.error('[Auth Sync Error]', err.message);
-    return res.status(401).json({ error: 'Unauthorized: Firebase ID token verification failed' });
+    return { status: 401, data: { error: 'Unauthorized: Firebase ID token verification failed' } };
   }
-});
+}
 
-// =========================================================================
-// INVITES & ADMIN PLAN/ROLE ENDPOINTS
-// =========================================================================
-
-// List all invites (super admins only)
-app.get('/api/invites', async (req, res) => {
+// 3. List invites (super admins only)
+export async function handleGetInvites(authHeader?: string | null): Promise<{ status: number; data: any }> {
   try {
-    const verified = await verifyFirebaseToken(req);
+    const verified = await verifyFirebaseTokenFromHeader(authHeader);
     const email = (verified.email || '').toLowerCase();
     if (!SUPER_ADMIN_EMAILS.includes(email)) {
-      return res.status(403).json({ error: 'Forbidden: Super admin privileges required' });
+      return { status: 403, data: { error: 'Forbidden: Super admin privileges required' } };
     }
 
     const snap = await adminDb.collection('invites').get();
@@ -260,24 +321,27 @@ app.get('/api/invites', async (req, res) => {
     }
 
     invites.sort((a, b) => new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime());
-    return res.json({ invites });
+    return { status: 200, data: { invites } };
   } catch (err: any) {
-    return res.status(500).json({ error: err.message });
+    return { status: 500, data: { error: err.message } };
   }
-});
+}
 
-// Create invite (super admins only)
-app.post('/api/invites', async (req, res) => {
+// 4. Create invite (super admins only)
+export async function handleCreateInvite(
+  authHeader: string | null | undefined,
+  body: any
+): Promise<{ status: number; data: any }> {
   try {
-    const verified = await verifyFirebaseToken(req);
+    const verified = await verifyFirebaseTokenFromHeader(authHeader);
     const superAdminEmail = (verified.email || '').toLowerCase();
     if (!SUPER_ADMIN_EMAILS.includes(superAdminEmail)) {
-      return res.status(403).json({ error: 'Forbidden: Super admin privileges required' });
+      return { status: 403, data: { error: 'Forbidden: Super admin privileges required' } };
     }
 
-    const { email, note, expiresAt } = req.body;
+    const { email, note, expiresAt } = body || {};
     if (!email || typeof email !== 'string' || !email.includes('@')) {
-      return res.status(400).json({ error: 'Valid email address is required' });
+      return { status: 400, data: { error: 'Valid email address is required' } };
     }
 
     const cleanEmail = email.trim().toLowerCase();
@@ -304,26 +368,31 @@ app.post('/api/invites', async (req, res) => {
       verified
     );
 
-    return res.json({ invite: inviteData });
+    return { status: 200, data: { invite: inviteData } };
   } catch (err: any) {
-    return res.status(500).json({ error: err.message });
+    return { status: 500, data: { error: err.message } };
   }
-});
+}
 
-// Revoke invite (super admins only)
-app.post('/api/invites/:id/revoke', async (req, res) => {
+// 5. Revoke invite (super admins only)
+export async function handleRevokeInvite(
+  authHeader: string | null | undefined,
+  inviteId?: string
+): Promise<{ status: number; data: any }> {
   try {
-    const verified = await verifyFirebaseToken(req);
+    if (!inviteId) {
+      return { status: 400, data: { error: 'Invite ID is required' } };
+    }
+    const verified = await verifyFirebaseTokenFromHeader(authHeader);
     const superAdminEmail = (verified.email || '').toLowerCase();
     if (!SUPER_ADMIN_EMAILS.includes(superAdminEmail)) {
-      return res.status(403).json({ error: 'Forbidden: Super admin privileges required' });
+      return { status: 403, data: { error: 'Forbidden: Super admin privileges required' } };
     }
 
-    const inviteId = req.params.id;
     const inviteRef = adminDb.collection('invites').doc(inviteId);
     const snap = await inviteRef.get();
     if (!snap.exists) {
-      return res.status(404).json({ error: 'Invite not found' });
+      return { status: 404, data: { error: 'Invite not found' } };
     }
 
     const invData = snap.data()!;
@@ -357,26 +426,24 @@ app.post('/api/invites/:id/revoke', async (req, res) => {
       }
     }
 
-    await logServerAudit(
-      'INVITE_REVOKED',
-      `Revoked complimentary access invite for ${invData.email}`,
-      verified
-    );
+    await logServerAudit('INVITE_REVOKED', `Revoked complimentary access invite for ${invData.email}`, verified);
 
-    return res.json({ success: true });
+    return { status: 200, data: { success: true } };
   } catch (err: any) {
-    return res.status(500).json({ error: err.message });
+    return { status: 500, data: { error: err.message } };
   }
-});
+}
 
-// Get single invite details
-app.get('/api/invites/:id', async (req, res) => {
+// 6. Get single invite details
+export async function handleGetInvite(inviteId?: string): Promise<{ status: number; data: any }> {
   try {
-    const inviteId = req.params.id;
+    if (!inviteId) {
+      return { status: 400, data: { error: 'Invite ID is required' } };
+    }
     const inviteRef = adminDb.collection('invites').doc(inviteId);
     const snap = await inviteRef.get();
     if (!snap.exists) {
-      return res.status(404).json({ error: 'Invite not found' });
+      return { status: 404, data: { error: 'Invite not found' } };
     }
 
     const data = snap.data()!;
@@ -386,58 +453,72 @@ app.get('/api/invites/:id', async (req, res) => {
       status = 'expired';
     }
 
-    return res.json({
-      invite: {
-        id: snap.id,
-        email: data.email,
-        plan: data.plan,
-        status,
-        note: data.note,
-        expiresAt: data.expiresAt,
-        createdAt: data.createdAt,
+    return {
+      status: 200,
+      data: {
+        invite: {
+          id: snap.id,
+          email: data.email,
+          plan: data.plan,
+          status,
+          note: data.note,
+          expiresAt: data.expiresAt,
+          createdAt: data.createdAt,
+        },
       },
-    });
+    };
   } catch (err: any) {
-    return res.status(500).json({ error: err.message });
+    return { status: 500, data: { error: err.message } };
   }
-});
+}
 
-// Accept invite via link
-app.post('/api/invites/:id/accept', async (req, res) => {
+// 7. Accept invite via link
+export async function handleAcceptInvite(
+  authHeader: string | null | undefined,
+  inviteId?: string
+): Promise<{ status: number; data: any }> {
   try {
-    const verified = await verifyFirebaseToken(req);
+    if (!inviteId) {
+      return { status: 400, data: { error: 'Invite ID is required' } };
+    }
+    const verified = await verifyFirebaseTokenFromHeader(authHeader);
     const userEmail = (verified.email || '').toLowerCase();
-    const inviteId = req.params.id;
 
     const inviteRef = adminDb.collection('invites').doc(inviteId);
     const snap = await inviteRef.get();
     if (!snap.exists) {
-      return res.status(404).json({ error: 'Invite not found' });
+      return { status: 404, data: { error: 'Invite not found' } };
     }
 
     const invData = snap.data()!;
     if (invData.email.toLowerCase() !== userEmail) {
-      return res.status(403).json({
-        error: `This invite was sent to ${invData.email}. You are signed in as ${userEmail}. Please sign in with the invited email address.`,
-      });
+      return {
+        status: 403,
+        data: {
+          error: `This invite was sent to ${invData.email}. You are signed in as ${userEmail}. Please sign in with the invited email address.`,
+        },
+      };
     }
 
     const now = new Date().toISOString();
     if (invData.expiresAt && new Date(invData.expiresAt).getTime() <= Date.now()) {
       await inviteRef.update({ status: 'expired' });
-      return res.status(400).json({ error: 'This invitation has expired.' });
+      return { status: 400, data: { error: 'This invitation has expired.' } };
     }
 
     if (invData.status === 'revoked') {
-      return res.status(400).json({ error: 'This invitation has been revoked.' });
+      return { status: 400, data: { error: 'This invitation has been revoked.' } };
     }
 
     // Set user's plan to complimentary
     const userRef = adminDb.collection('users').doc(verified.uid);
-    await userRef.set({
-      planId: 'complimentary',
-      updatedAt: now,
-    }, { merge: true });
+    await userRef.set(
+      {
+        planId: 'complimentary',
+        updatedAt: now,
+      },
+      { merge: true }
+    );
 
     await inviteRef.update({
       status: 'accepted',
@@ -449,31 +530,36 @@ app.post('/api/invites/:id/accept', async (req, res) => {
     await logServerAudit('PLAN_CHANGED', `Plan changed to complimentary for ${userEmail} via invite ${inviteId}`, verified, verified.uid);
 
     const userSnap = await userRef.get();
-    return res.json({ success: true, user: userSnap.data() });
+    return { status: 200, data: { success: true, user: userSnap.data() } };
   } catch (err: any) {
-    return res.status(500).json({ error: err.message });
+    return { status: 500, data: { error: err.message } };
   }
-});
+}
 
-// Super Admin Update User Plan
-app.post('/api/admin/users/:userId/plan', async (req, res) => {
+// 8. Super admin update user plan
+export async function handleUpdateUserPlan(
+  authHeader: string | null | undefined,
+  userId?: string,
+  planId?: string
+): Promise<{ status: number; data: any }> {
   try {
-    const verified = await verifyFirebaseToken(req);
+    if (!userId) {
+      return { status: 400, data: { error: 'User ID is required' } };
+    }
+    const verified = await verifyFirebaseTokenFromHeader(authHeader);
     const email = (verified.email || '').toLowerCase();
     if (!SUPER_ADMIN_EMAILS.includes(email)) {
-      return res.status(403).json({ error: 'Forbidden: Super admin privileges required' });
+      return { status: 403, data: { error: 'Forbidden: Super admin privileges required' } };
     }
 
-    const { userId } = req.params;
-    const { planId } = req.body;
-    if (!['free', 'pro', 'team', 'complimentary'].includes(planId)) {
-      return res.status(400).json({ error: 'Invalid planId' });
+    if (!planId || !['free', 'pro', 'team', 'complimentary'].includes(planId)) {
+      return { status: 400, data: { error: 'Invalid planId' } };
     }
 
     const userRef = adminDb.collection('users').doc(userId);
     const snap = await userRef.get();
     if (!snap.exists) {
-      return res.status(404).json({ error: 'User not found' });
+      return { status: 404, data: { error: 'User not found' } };
     }
 
     const prevPlan = snap.data()?.planId || 'free';
@@ -491,31 +577,36 @@ app.post('/api/admin/users/:userId/plan', async (req, res) => {
       userId
     );
 
-    return res.json({ success: true });
+    return { status: 200, data: { success: true } };
   } catch (err: any) {
-    return res.status(500).json({ error: err.message });
+    return { status: 500, data: { error: err.message } };
   }
-});
+}
 
-// Super Admin Update User Role
-app.post('/api/admin/users/:userId/role', async (req, res) => {
+// 9. Super admin update user role
+export async function handleUpdateUserRole(
+  authHeader: string | null | undefined,
+  userId?: string,
+  role?: string
+): Promise<{ status: number; data: any }> {
   try {
-    const verified = await verifyFirebaseToken(req);
+    if (!userId) {
+      return { status: 400, data: { error: 'User ID is required' } };
+    }
+    const verified = await verifyFirebaseTokenFromHeader(authHeader);
     const email = (verified.email || '').toLowerCase();
     if (!SUPER_ADMIN_EMAILS.includes(email)) {
-      return res.status(403).json({ error: 'Forbidden: Super admin privileges required' });
+      return { status: 403, data: { error: 'Forbidden: Super admin privileges required' } };
     }
 
-    const { userId } = req.params;
-    const { role } = req.body;
-    if (!['super_admin', 'member', 'admin', 'support'].includes(role)) {
-      return res.status(400).json({ error: 'Invalid role' });
+    if (!role || !['super_admin', 'member', 'admin', 'support'].includes(role)) {
+      return { status: 400, data: { error: 'Invalid role' } };
     }
 
     const userRef = adminDb.collection('users').doc(userId);
     const snap = await userRef.get();
     if (!snap.exists) {
-      return res.status(404).json({ error: 'User not found' });
+      return { status: 404, data: { error: 'User not found' } };
     }
 
     const prevRole = snap.data()?.role || 'member';
@@ -528,12 +619,15 @@ app.post('/api/admin/users/:userId/role', async (req, res) => {
     });
 
     if (role === 'super_admin') {
-      await adminDb.collection('admins').doc(userId).set({
-        id: userId,
-        email: targetEmail,
-        role: 'super_admin',
-        createdAt: now,
-      }, { merge: true });
+      await adminDb.collection('admins').doc(userId).set(
+        {
+          id: userId,
+          email: targetEmail,
+          role: 'super_admin',
+          createdAt: now,
+        },
+        { merge: true }
+      );
     } else if (prevRole === 'super_admin') {
       await adminDb.collection('admins').doc(userId).delete().catch(() => {});
     }
@@ -545,22 +639,34 @@ app.post('/api/admin/users/:userId/role', async (req, res) => {
       userId
     );
 
-    return res.json({ success: true });
+    return { status: 200, data: { success: true } };
   } catch (err: any) {
-    return res.status(500).json({ error: err.message });
+    return { status: 500, data: { error: err.message } };
   }
-});
+}
 
-// Marketing Tool Generation Endpoint
-app.post('/api/gemini/generate', async (req, res) => {
+// 10. Gemini generation
+export interface GeminiGenerateResult {
+  errorStatus?: number;
+  errorData?: any;
+  stream?: ReadableStream<Uint8Array>;
+}
+
+export async function handleGeminiGenerate(
+  authHeader: string | null | undefined,
+  body: any
+): Promise<GeminiGenerateResult> {
   const requestStartTime = Date.now();
   let verifiedUser: { uid: string; email?: string } | null = null;
 
   // 1. Verify Firebase ID Token
   try {
-    verifiedUser = await verifyFirebaseToken(req);
+    verifiedUser = await verifyFirebaseTokenFromHeader(authHeader);
   } catch (err: any) {
-    return res.status(401).json({ error: 'Unauthorized: A valid Firebase ID token is required to generate marketing assets.' });
+    return {
+      errorStatus: 401,
+      errorData: { error: 'Unauthorized: A valid Firebase ID token is required to generate marketing assets.' },
+    };
   }
 
   const userId = verifiedUser.uid;
@@ -569,9 +675,12 @@ app.post('/api/gemini/generate', async (req, res) => {
   const now = Date.now();
   const userTimestamps = (rateLimitMap.get(userId) || []).filter((t) => now - t < RATE_LIMIT_WINDOW_MS);
   if (userTimestamps.length >= MAX_GENERATIONS_PER_MINUTE) {
-    return res.status(429).json({
-      error: 'Rate limit exceeded: You can make at most 10 generations per minute. Please wait a moment.',
-    });
+    return {
+      errorStatus: 429,
+      errorData: {
+        error: 'Rate limit exceeded: You can make at most 10 generations per minute. Please wait a moment.',
+      },
+    };
   }
 
   // 3. Check and increment monthly usage in a Firestore transaction
@@ -612,38 +721,47 @@ app.post('/api/gemini/generate', async (req, res) => {
       }
 
       const newUsage = used + 1;
-      transaction.set(userRef, {
-        generationsUsedThisMonth: newUsage,
-        billingResetDate: resetDate || getNextMonthFirstDay(),
-        updatedAt: new Date().toISOString(),
-      }, { merge: true });
+      transaction.set(
+        userRef,
+        {
+          generationsUsedThisMonth: newUsage,
+          billingResetDate: resetDate || getNextMonthFirstDay(),
+          updatedAt: new Date().toISOString(),
+        },
+        { merge: true }
+      );
     });
   } catch (txErr: any) {
     if (txErr.status === 403 || txErr.message?.includes('Monthly generation quota reached')) {
       console.warn(`[Quota Blocked] User ${userId} exceeded monthly generation limit.`);
-      return res.status(403).json({ error: txErr.message });
+      return {
+        errorStatus: 403,
+        errorData: { error: txErr.message },
+      };
     }
     console.error(`[Usage Transaction Error]: ${txErr.message}`);
-    return res.status(503).json({ error: 'Usage transaction failed. Please try again later.' });
+    return {
+      errorStatus: 503,
+      errorData: { error: 'Usage transaction failed. Please try again later.' },
+    };
   }
 
   // Record generation timestamp for rate limit sliding window
   userTimestamps.push(now);
   rateLimitMap.set(userId, userTimestamps);
 
-  const { toolId, toolName, organizationProfile, userInputs } = req.body;
+  const { toolId, toolName, organizationProfile, userInputs } = body || {};
   console.log(`[Gemini Request] Started generation for "${toolName}" (${toolId}) by user ${userId} at ${new Date().toISOString()}`);
 
-  try {
-    const orgName = organizationProfile?.orgName || 'Our Organization';
-    const orgType = organizationProfile?.type || 'Startup';
-    const whatTheyDo = organizationProfile?.whatTheyDo || '';
-    const audience = organizationProfile?.targetAudience || '';
-    const goals = organizationProfile?.goals || [];
-    const brandTone = organizationProfile?.brandTone?.join(', ') || 'Professional, Inspiring';
-    const budget = organizationProfile?.budget || 'Under $500/month';
+  const orgName = organizationProfile?.orgName || 'Our Organization';
+  const orgType = organizationProfile?.type || 'Startup';
+  const whatTheyDo = organizationProfile?.whatTheyDo || '';
+  const audience = organizationProfile?.targetAudience || '';
+  const goals = organizationProfile?.goals || [];
+  const brandTone = organizationProfile?.brandTone?.join(', ') || 'Professional, Inspiring';
+  const budget = organizationProfile?.budget || 'Under $500/month';
 
-    const systemInstruction = `You are the Senior Marketing Strategist and Creative Director at Millennium Agency (mill.agency), an elite branding and growth agency.
+  const systemInstruction = `You are the Senior Marketing Strategist and Creative Director at Millennium Agency (mill.agency), an elite branding and growth agency.
 You are generating real, production-ready, custom marketing assets for "${orgName}", a ${orgType}.
 
 AGENCY QUALITY STANDARDS:
@@ -652,14 +770,14 @@ AGENCY QUALITY STANDARDS:
 3. BRAND VOICE: Match the requested brand tone: ${brandTone}. Be clear, punchy, persuasive, and encouraging.
 4. STRUCTURE: Use clean Markdown with headers (##, ###), bullet points, and blockquotes so the deliverable is immediately usable.`;
 
-    const toolPromptGuides: Record<string, string> = {
-      'brand-foundations': `Deliver a complete Brand Foundations Blueprint:
+  const toolPromptGuides: Record<string, string> = {
+    'brand-foundations': `Deliver a complete Brand Foundations Blueprint:
 1. Core Mission Statement (refined and inspiring)
 2. Strategic Positioning Statement following the agency formula: "For [target audience] who [core need], ${orgName} is the [category] that [key benefit], unlike [alternatives] because [differentiator]."
 3. Core Value Proposition with 3 distinct pillars written in full.
 4. Three detailed Audience Personas (Decision Maker, Direct Supporter/User, Strategic Partner) with demographics, motivations, pain points, and specific tailored messages.`,
 
-      'messaging-builder': `Deliver a complete Messaging & Pitch Toolkit:
+    'messaging-builder': `Deliver a complete Messaging & Pitch Toolkit:
 1. Four Tagline Options (Empowerment, Action-Oriented, Outcome-Focused, Bold).
 2. Three Timed Elevator Pitches written out in natural conversational language:
    - 15-Second Handshake Pitch (approx. 35 words)
@@ -667,35 +785,35 @@ AGENCY QUALITY STANDARDS:
    - 60-Second Executive Pitch (approx. 140 words)
 3. Three Key Messaging Pillars with proof points and supporting arguments.`,
 
-      '90-day-plan': `Deliver a realistic 12-Week Marketing Action Plan:
+    '90-day-plan': `Deliver a realistic 12-Week Marketing Action Plan:
 - Prioritize high-impact, low-cost organic channels matched to a budget of ${budget}.
 - Month 1 (Weeks 1-4): Setup, messaging audit, direct outreach, and quick wins.
 - Month 2 (Weeks 5-8): Content engine cadence, community engagement, and partner co-marketing.
 - Month 3 (Weeks 9-12): Conversion sprint, campaign push toward primary 6-month goals, and review.
 - Include weekly actionable tasks with estimated hours per week.`,
 
-      'social-generator': `Deliver a ready-to-publish Multi-Platform Social Media Suite:
+    'social-generator': `Deliver a ready-to-publish Multi-Platform Social Media Suite:
 1. LinkedIn Post (thought-leadership, narrative hook, insight, and call to engagement).
 2. Instagram Post (visual carousel slide-by-slide copy from Slide 1 Hook to Slide 5 CTA, with hashtags).
 3. X / Twitter Thread (engaging 3-tweet hook and breakdown).
 4. Facebook / Community Post (warm, community-focused update with celebration).
 5. A 4-Week Thematic Content Calendar outline with weekly post topics.`,
 
-      'email-writer': `Deliver an Email Campaign Suite:
+    'email-writer': `Deliver an Email Campaign Suite:
 1. Five high-open-rate Subject Line options (Curiosity, Benefit, Story, Urgency, Short).
 2. Email 1: Welcome & Onboarding Note (warm, personal, setting expectations).
 3. Email 2: Story / Impact / Behind-the-Scenes Spotlight (emotional or analytical proof of value).
 4. Email 3: Direct Call-to-Action (driving signups, donations, or discovery calls).
 Include sender notes and preview text for each email.`,
 
-      'website-copy': `Deliver a Website Copy & SEO Blueprint:
+    'website-copy': `Deliver a Website Copy & SEO Blueprint:
 1. SEO Title (under 60 chars) and Meta Description (under 155 chars) optimized for target keywords.
 2. Homepage Hero Section: Punchy Headline (H1), compelling Subheadline (H2), Primary CTA button text, and Secondary CTA.
 3. Problem & Solution Section: Explaining the status quo frustration and ${orgName}'s better approach.
 4. Three Feature / Program Pillars written out with benefit-driven copy.
 5. "About Us" Origin Hook: A powerful narrative introducing the founder's conviction and mission.`,
 
-      'donor-appeal': `Deliver a Donor Appeal & Grant Narrative Blueprint:
+    'donor-appeal': `Deliver a Donor Appeal & Grant Narrative Blueprint:
 1. Direct Donor Appeal Letter: Emotionally resonant, focused on human impact, transparent about funding needs, with clear giving tiers ($50, $150, $500).
 2. Executive Grant Proposal Summary:
    - Project Title & Legal Entity
@@ -704,7 +822,7 @@ Include sender notes and preview text for each email.`,
    - Measurable Outputs & Outcomes
    - Long-Term Financial Sustainability.`,
 
-      'pitch-launch': `Deliver an Investor Pitch Deck Narrative & Launch Script:
+    'pitch-launch': `Deliver an Investor Pitch Deck Narrative & Launch Script:
 1. 10-Slide Pitch Flow:
    - Slide 1: Title & One-Liner
    - Slide 2: The Acute Problem
@@ -718,18 +836,18 @@ Include sender notes and preview text for each email.`,
    - Slide 10: The Ask & Capital Allocation.
 2. Product Hunt / Launch Day Announcement Copy.`,
 
-      'keywords-content': `Deliver an SEO Keyword Bank & Content Strategy:
+    'keywords-content': `Deliver an SEO Keyword Bank & Content Strategy:
 1. 20 High-Intent Keywords grouped by intent:
    - 5 Informational Keywords (Educational / How-To)
    - 5 Commercial Investigation Keywords (Comparison / Best Tools)
    - 5 Transactional Keywords (High Intent / Sign Up / Donate / Hire)
    - 5 Navigational & Branded Keywords.
 2. 10 Evergreen Blog / Newsletter Titles with a 1-sentence outline angle for each.`,
-    };
+  };
 
-    const guide = toolPromptGuides[toolId] || 'Please produce a thorough, high-impact marketing deliverable formatted in clean markdown.';
+  const guide = toolPromptGuides[toolId] || 'Please produce a thorough, high-impact marketing deliverable formatted in clean markdown.';
 
-    const userPrompt = `
+  const userPrompt = `
 DELIVERABLE REQUEST: "${toolName}" for ${orgName} (${orgType}).
 
 ORGANIZATION DETAILS:
@@ -751,198 +869,188 @@ ${guide}
 
 Write the complete deliverable now in full, ready to be reviewed by the marketing team.`;
 
-    const currentKey = process.env.GEMINI_API_KEY || apiKey;
-    if (!currentKey) {
-      res.setHeader('Content-Type', 'text/event-stream');
-      res.setHeader('Cache-Control', 'no-cache, no-transform');
-      res.setHeader('Connection', 'keep-alive');
-      res.flushHeaders?.();
-      res.write(
-        `data: ${JSON.stringify({
-          error: 'GEMINI_API_KEY is not configured on the server. Please check your environment configuration.',
-        })}\n\n`
-      );
-      res.end();
-      return;
-    }
+  const currentKey = process.env.GEMINI_API_KEY || apiKey;
+  const encoder = new TextEncoder();
 
-    // Setup Server-Sent Events headers for real-time text streaming
-    res.setHeader('Content-Type', 'text/event-stream');
-    res.setHeader('Cache-Control', 'no-cache, no-transform');
-    res.setHeader('Connection', 'keep-alive');
-    res.flushHeaders?.();
-
-    const sendEvent = (data: any) => {
-      res.write(`data: ${JSON.stringify(data)}\n\n`);
-    };
-
-    const genAI = new GoogleGenAI({
-      apiKey: currentKey,
-      httpOptions: {
-        headers: {
-          'User-Agent': 'aistudio-build',
-        },
+  if (!currentKey) {
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(
+          encoder.encode(
+            `data: ${JSON.stringify({
+              error: 'GEMINI_API_KEY is not configured on the server. Please check your environment configuration.',
+            })}\n\n`
+          )
+        );
+        controller.close();
       },
     });
+    return { stream };
+  }
 
-    // 3. Remove "gemini-3.8-flash" fallback. Use ONLY gemini-3.1-flash-lite, at most 1 retry, for 429/5xx only.
-    const MODEL_NAME = 'gemini-3.1-flash-lite';
-    const CALL_TIMEOUT_MS = 30000; // 30-second timeout per Gemini call
-    let fullText = '';
-    let callSucceeded = false;
-    let lastError: any = null;
+  const genAI = new GoogleGenAI({
+    apiKey: currentKey,
+    httpOptions: {
+      headers: {
+        'User-Agent': 'aistudio-build',
+      },
+    },
+  });
 
-    // Helper to test if error is a rate-limit (429) or server (5xx) error
-    const isRateLimitOrServerError = (err: any): boolean => {
-      if (!err) return false;
-      if (err.name === 'TimeoutError' || err.message === 'Generation took too long, please try again') {
-        return false;
-      }
-      const status = err.status || err.statusCode || err.code;
-      if (status === 429 || (typeof status === 'number' && status >= 500 && status < 600)) {
-        return true;
-      }
-      const msg = (err.message || String(err)).toLowerCase();
-      return (
-        msg.includes('429') ||
-        msg.includes('resource_exhausted') ||
-        msg.includes('rate limit') ||
-        msg.includes('500') ||
-        msg.includes('502') ||
-        msg.includes('503') ||
-        msg.includes('504') ||
-        msg.includes('unavailable') ||
-        msg.includes('internal error') ||
-        msg.includes('server error')
-      );
-    };
+  const MODEL_NAME = 'gemini-3.1-flash-lite';
+  const CALL_TIMEOUT_MS = 30000;
 
-    // At most 1 retry (maximum 2 attempts) for rate-limit (429) or server (5xx) errors
-    for (let attempt = 1; attempt <= 2; attempt++) {
-      const callStartTime = Date.now();
-      console.log(`[Gemini Call] Starting call to ${MODEL_NAME} (attempt ${attempt}/2, thinkingLevel: LOW, 30s timeout)...`);
+  const isRateLimitOrServerError = (err: any): boolean => {
+    if (!err) return false;
+    if (err.name === 'TimeoutError' || err.message === 'Generation took too long, please try again') {
+      return false;
+    }
+    const status = err.status || err.statusCode || err.code;
+    if (status === 429 || (typeof status === 'number' && status >= 500 && status < 600)) {
+      return true;
+    }
+    const msg = (err.message || String(err)).toLowerCase();
+    return (
+      msg.includes('429') ||
+      msg.includes('resource_exhausted') ||
+      msg.includes('rate limit') ||
+      msg.includes('500') ||
+      msg.includes('502') ||
+      msg.includes('503') ||
+      msg.includes('504') ||
+      msg.includes('unavailable') ||
+      msg.includes('internal error') ||
+      msg.includes('server error')
+    );
+  };
 
-      let timerId: NodeJS.Timeout | null = null;
-      let isTimedOut = false;
+  const stream = new ReadableStream<Uint8Array>({
+    async start(controller) {
+      const sendEvent = (data: any) => {
+        try {
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify(data)}\n\n`));
+        } catch {
+          // Client stream closed
+        }
+      };
 
       try {
-        // 2. 30-second timeout per Gemini call
-        const timeoutPromise = new Promise<never>((_, reject) => {
-          timerId = setTimeout(() => {
-            isTimedOut = true;
-            const err = new Error('Generation took too long, please try again');
-            err.name = 'TimeoutError';
-            reject(err);
-          }, CALL_TIMEOUT_MS);
-        });
+        let fullText = '';
+        let callSucceeded = false;
+        let lastError: any = null;
 
-        // 4. Switch to streaming (generateContentStream)
-        const executeStream = async (): Promise<string> => {
-          const responseStream = await genAI.models.generateContentStream({
-            model: MODEL_NAME,
-            contents: userPrompt,
-            config: {
-              systemInstruction,
-              // 1. Set a low thinking level on the Gemini call to cut latency
-              thinkingConfig: {
-                thinkingLevel: ThinkingLevel.LOW,
-              },
-            },
-          });
+        for (let attempt = 1; attempt <= 2; attempt++) {
+          const callStartTime = Date.now();
+          console.log(`[Gemini Call] Starting call to ${MODEL_NAME} (attempt ${attempt}/2, thinkingLevel: LOW, 30s timeout)...`);
 
-          let streamedText = '';
-          for await (const chunk of responseStream) {
-            if (isTimedOut) {
-              const err = new Error('Generation took too long, please try again');
-              err.name = 'TimeoutError';
-              throw err;
+          let timerId: NodeJS.Timeout | null = null;
+          let isTimedOut = false;
+
+          try {
+            const timeoutPromise = new Promise<never>((_, reject) => {
+              timerId = setTimeout(() => {
+                isTimedOut = true;
+                const err = new Error('Generation took too long, please try again');
+                err.name = 'TimeoutError';
+                reject(err);
+              }, CALL_TIMEOUT_MS);
+            });
+
+            const executeStream = async (): Promise<string> => {
+              const responseStream = await genAI.models.generateContentStream({
+                model: MODEL_NAME,
+                contents: userPrompt,
+                config: {
+                  systemInstruction,
+                  thinkingConfig: {
+                    thinkingLevel: ThinkingLevel.LOW,
+                  },
+                },
+              });
+
+              let streamedText = '';
+              for await (const chunk of responseStream) {
+                if (isTimedOut) {
+                  const err = new Error('Generation took too long, please try again');
+                  err.name = 'TimeoutError';
+                  throw err;
+                }
+                const textChunk = chunk.text;
+                if (textChunk) {
+                  streamedText += textChunk;
+                  sendEvent({ chunk: textChunk });
+                }
+              }
+              return streamedText;
+            };
+
+            fullText = await Promise.race([executeStream(), timeoutPromise]);
+            if (timerId) clearTimeout(timerId);
+
+            const callDuration = Date.now() - callStartTime;
+            console.log(`[Gemini Call] Attempt ${attempt} finished in ${callDuration}ms (${(callDuration / 1000).toFixed(2)}s) with ${fullText.length} characters`);
+            callSucceeded = true;
+            break;
+          } catch (err: any) {
+            if (timerId) clearTimeout(timerId);
+            const callDuration = Date.now() - callStartTime;
+            console.warn(`[Gemini Call] Attempt ${attempt} failed after ${callDuration}ms:`, err?.message || err);
+            lastError = err;
+
+            if (err.name === 'TimeoutError' || err.message === 'Generation took too long, please try again') {
+              console.warn(`[Gemini Call] 30s timeout reached. Aborting without retry.`);
+              break;
             }
-            const textChunk = chunk.text;
-            if (textChunk) {
-              streamedText += textChunk;
-              sendEvent({ chunk: textChunk });
+
+            if (attempt === 1 && isRateLimitOrServerError(err)) {
+              console.log(`[Gemini Call] Error is rate-limit (429) or server (5xx). Retrying (attempt 2/2) after 1000ms...`);
+              sendEvent({ reset: true });
+              await new Promise((r) => setTimeout(r, 1000));
+              fullText = '';
+              continue;
             }
+            break;
           }
-          return streamedText;
-        };
-
-        fullText = await Promise.race([executeStream(), timeoutPromise]);
-
-        if (timerId) clearTimeout(timerId);
-
-        // 5. Log the duration of each Gemini call
-        const callDuration = Date.now() - callStartTime;
-        console.log(`[Gemini Call] Attempt ${attempt} finished in ${callDuration}ms (${(callDuration / 1000).toFixed(2)}s) with ${fullText.length} characters`);
-
-        callSucceeded = true;
-        break;
-      } catch (err: any) {
-        if (timerId) clearTimeout(timerId);
-        const callDuration = Date.now() - callStartTime;
-        console.warn(`[Gemini Call] Attempt ${attempt} failed after ${callDuration}ms:`, err?.message || err);
-        lastError = err;
-
-        // If timed out, do not retry
-        if (err.name === 'TimeoutError' || err.message === 'Generation took too long, please try again') {
-          console.warn(`[Gemini Call] 30s timeout reached. Aborting without retry.`);
-          break;
         }
 
-        // Only retry for 429 or 5xx errors, at most 1 retry
-        if (attempt === 1 && isRateLimitOrServerError(err)) {
-          console.log(`[Gemini Call] Error is rate-limit (429) or server (5xx). Retrying (attempt 2/2) after 1000ms...`);
-          sendEvent({ reset: true });
-          await new Promise((r) => setTimeout(r, 1000));
-          fullText = '';
-          continue;
-        }
+        const totalRequestTime = Date.now() - requestStartTime;
+        console.log(`[Gemini Request] Total request time for "${toolName}": ${totalRequestTime}ms (${(totalRequestTime / 1000).toFixed(2)}s)`);
 
-        // Otherwise (non-retryable error or attempt 2 failed), stop
-        break;
+        if (callSucceeded && fullText) {
+          sendEvent({
+            done: true,
+            modelUsed: MODEL_NAME,
+            text: fullText,
+          });
+        } else {
+          const errorMessage =
+            lastError?.name === 'TimeoutError' || lastError?.message === 'Generation took too long, please try again'
+              ? 'Generation took too long, please try again'
+              : lastError?.message || 'Failed to generate content. Please try again.';
+
+          console.error(`[Gemini Request] Returning error to client: ${errorMessage}`);
+          sendEvent({ error: errorMessage });
+        }
+      } catch (error: any) {
+        const totalRequestTime = Date.now() - requestStartTime;
+        console.error(`[Gemini Request] Unexpected error after ${totalRequestTime}ms:`, error);
+        const errorMessage =
+          error?.name === 'TimeoutError' || error?.message === 'Generation took too long, please try again'
+            ? 'Generation took too long, please try again'
+            : `Gemini Generation Error: ${error?.message || 'Server error. Please try again.'}`;
+        sendEvent({ error: errorMessage });
+      } finally {
+        try {
+          controller.close();
+        } catch {}
       }
-    }
+    },
+  });
 
-    // 5. Log the total request time
-    const totalRequestTime = Date.now() - requestStartTime;
-    console.log(`[Gemini Request] Total request time for "${toolName}": ${totalRequestTime}ms (${(totalRequestTime / 1000).toFixed(2)}s)`);
+  return { stream };
+}
 
-    if (callSucceeded && fullText) {
-      sendEvent({
-        done: true,
-        modelUsed: MODEL_NAME,
-        text: fullText,
-      });
-      res.end();
-    } else {
-      const errorMessage =
-        lastError?.name === 'TimeoutError' || lastError?.message === 'Generation took too long, please try again'
-          ? 'Generation took too long, please try again'
-          : lastError?.message || 'Failed to generate content. Please try again.';
-
-      console.error(`[Gemini Request] Returning error to client: ${errorMessage}`);
-      sendEvent({ error: errorMessage });
-      res.end();
-    }
-  } catch (error: any) {
-    const totalRequestTime = Date.now() - requestStartTime;
-    console.error(`[Gemini Request] Unexpected error after ${totalRequestTime}ms:`, error);
-    const errorMessage =
-      error?.name === 'TimeoutError' || error?.message === 'Generation took too long, please try again'
-        ? 'Generation took too long, please try again'
-        : `Gemini Generation Error: ${error?.message || 'Server error. Please try again.'}`;
-
-    if (!res.headersSent) {
-      res.setHeader('Content-Type', 'text/event-stream');
-      res.setHeader('Cache-Control', 'no-cache, no-transform');
-      res.setHeader('Connection', 'keep-alive');
-      res.flushHeaders?.();
-    }
-    res.write(`data: ${JSON.stringify({ error: errorMessage })}\n\n`);
-    res.end();
-  }
-});
-
-function generateFallbackContent(
+export function generateFallbackContent(
   toolId: string,
   toolName: string,
   orgName: string,
@@ -959,263 +1067,248 @@ function generateFallbackContent(
 ### 1. Mission Statement
 ${orgName} empowers [community/target audience] by providing [primary solution/program], ensuring that [ultimate transformative outcome] becomes an accessible reality.
 
-### 2. Positioning Statement
-For [target audience] who struggle with [core problem/need], **${orgName}** is the [category definition] that delivers [unique key benefit], unlike [status quo/alternatives] because of our [distinct advantage or proprietary approach].
+### 2. Strategic Brand Positioning Statement
+For [target customer / donor segment] who [core pain point or challenge], ${orgName} is the premier [category / initiative] that [delivers breakthrough benefit], unlike [generic alternatives] because [unique agency-crafted differentiator].
 
-### 3. Core Value Proposition
-- **Clarity Over Complexity:** We cut through the noise with [direct approach].
-- **Proven Impact:** Grounded in measurable outcomes for [key group].
-- **Community-First Delivery:** Designed alongside the people we serve.
+### 3. Core Value Proposition Pillars
+* **Pillar 1: Proven Reliability & Trust:** Built upon transparent operations and consistent execution.
+* **Pillar 2: Purpose-Driven Innovation:** Combining deep domain expertise with modern tools to deliver outsized results.
+* **Pillar 3: Community & Stakeholder Centric:** Every decision is anchored in real impact for the people we serve.
 
-### 4. Audience Personas
-
-#### Persona A: The Champion / Primary Decision-Maker
-- **Role:** Executive Director / Founder / Primary Buyer
-- **Core Motivation:** Maximizing return on every dollar and minute invested.
-- **Pain Point:** Lack of bandwidth and fear of misallocating scarce resources.
-- **Key Message:** "${orgName} provides immediate peace of mind and measurable progress."
-
-#### Persona B: The Grassroots Supporter / Everyday User
-- **Role:** Program Participant / Early Adopter / Monthly Donor
-- **Core Motivation:** Being part of an authentic mission that makes tangible change.
-- **Pain Point:** Inconsistent communication and vague updates.
-- **Key Message:** "Your active involvement directly changes [specific outcome]."
-
-#### Persona C: The Strategic Partner
-- **Role:** Grantor / Corporate Sponsor / Alliance Partner
-- **Core Motivation:** Verifiable accountability and alignment with broader ESG/growth goals.
-- **Pain Point:** Lack of transparent metrics or professional reporting.
-- **Key Message:** "Partner with ${orgName} to scale verified impact in [geographic/domain area]."`;
+### 4. Target Audience Personas
+* **Primary Decision Maker:** Values clear ROI, speed to implementation, and strategic alignment.
+* **Direct Beneficiary / Consumer:** Seeks intuitive, compassionate, and high-touch support.
+* **Community Champion / Donor:** Motivated by sustainable long-term mission outcomes and accountable leadership.`;
 
     case 'messaging-builder':
-      return `## Messaging & Pitch Kit: ${orgName}
+      return `## Messaging & Pitch Toolkit: ${orgName}
 
-### Tagline Options
-1. **Bold:** Impact That Speaks for Itself.
-2. **Action-Oriented:** Building the Future of [Domain], Together.
-3. **Approachable:** Better [Solution]. Real Results. No Guesswork.
+### 1. Four Core Tagline Directions
+* **Direction 1 (Action & Growth):** Accelerating What Matters for ${orgName}.
+* **Direction 2 (Trust & Authority):** The Standard for Modern [Industry / Sector].
+* **Direction 3 (Human & Purpose):** Built for People. Powered by Purpose.
+* **Direction 4 (Bold & Punchy):** Next-Gen [Solution] Starts Here.
 
----
+### 2. Elevator Pitches
 
-### Elevator Pitches
+#### The 15-Second Handshake Pitch
+"${orgName} helps [target audience] solve [primary challenge] through our proven [methodology], allowing them to achieve [key outcome] faster than ever before."
 
-#### 15-Second Pitch (The Handshake)
-"${orgName} helps [primary audience] overcome [core hurdle] through [differentiating method]—so they can achieve [highest priority goal] without [common friction]."
+#### The 30-Second Networking Pitch
+"Did you know that most [audience members] struggle with [key bottleneck]? At ${orgName}, we engineered a better way. By combining [unique asset 1] with [unique asset 2], we provide our partners with unmatched [key benefit], transforming how they work and grow."
 
-#### 30-Second Pitch (The Networking Standard)
-"Most [startups / nonprofits] in our space struggle with [major obstacle]. At ${orgName}, we solved this by developing [key solution]. Today, we help [target group] streamline [key activity], resulting in [quantifiable target placeholder, e.g. 40% time savings]. We're currently expanding to reach [next milestone]."
+#### The 60-Second Executive Pitch
+"In today's landscape, organizations are held back by [acute industry problem]. That's why ${orgName} was created. We are a ${orgType.toLowerCase()} dedicated to [mission]. Our approach delivers three decisive advantages: first, [benefit 1]; second, [benefit 2]; and third, [benefit 3]. Today, we're empowering dozens of stakeholders to reach [big vision], and we're just getting started."
 
-#### 60-Second Pitch (The Executive Overview)
-"When you look at [industry/social issue], the biggest gap isn't passion—it's execution. [Target demographic] is frequently held back by [status quo problem].
-
-${orgName} was created to change that dynamic. By combining [Approach 1] with [Approach 2], we provide an end-to-end framework that makes [desired result] predictable.
-
-Over the past year, we've demonstrated that [key proof point]. We are now actively scaling our [program/product], and we're looking to connect with [ideal partner or customer] who share our dedication to [vision]."
-
----
-
-### 3 Key Pillars & Proof Points
-1. **Pillar 1: Accessibility & Simplicity**
-   - *Proof Point:* Designed for immediate adoption with zero steep learning curve.
-2. **Pillar 2: Verifiable Accountability**
-   - *Proof Point:* Backed by [transparent reporting mechanism / client reviews].
-3. **Pillar 3: Long-Term Sustainability**
-   - *Proof Point:* Every initiative is built to endure beyond short-term funding cycles.`;
+### 3. Three Key Messaging Pillars
+1. **Pillar 1 - Measurable Outcomes:** We don't just promise results; we quantify our impact every single quarter.
+2. **Pillar 2 - Uncompromising Quality:** Designed by industry veterans with an obsession for craft.
+3. **Pillar 3 - Accessibility & Heart:** Advanced capabilities delivered with genuine empathy and partnership.`;
 
     case '90-day-plan':
-      return `## 90-Day Low-Cost Growth & Marketing Plan
+      return `## 90-Day Marketing Roadmap: ${orgName}
 
-### Month 1: Foundation & Low-Hanging Fruit
-- **Week 1-2 (Audit & Setup):**
-  - Verify Google Business Profile and LinkedIn organization page.
-  - Set up clean email capture on the homepage with an ethical bribe (e.g. 1-page Checklist).
-- **Week 3-4 (Direct Outreach):**
-  - Draft personalized email outreach to 25 warm past supporters or industry peers.
-  - Publish 2 foundational thought-leadership posts highlighting [Core Mission].
+### Month 1: Foundation, Infrastructure & Rapid Wins (Weeks 1-4)
+* **Week 1:** Complete organization marketing audit; configure Google Analytics 4 and conversion tracking.
+* **Week 2:** Finalize brand foundations, core messaging kit, and one-page marketing overview PDF.
+* **Week 3:** Launch personal outreach campaign to top 25 past supporters, partners, or customers.
+* **Week 4:** Publish announcement post across LinkedIn and relevant community channels; measure baseline engagement.
 
-### Month 2: Cadence & Community Traction
-- **Week 5-6 (Content Engine):**
-  - Launch bi-weekly newsletter sharing 1 practical tip and 1 behind-the-scenes story.
-  - Distribute a press release or local media pitch focused on [new initiative].
-- **Week 7-8 (Partnership Co-Marketing):**
-  - Identify 3 non-competing partner organizations for reciprocal newsletter shoutouts or guest webinars.
-  - Host a free 45-minute virtual Q&A session.
+### Month 2: Content Acceleration & Community Engine (Weeks 5-8)
+* **Week 5:** Initiate bi-weekly thought leadership newsletter featuring founder perspectives.
+* **Week 6:** Launch organic social carousel series addressing the #1 customer pain point.
+* **Week 7:** Form 2 strategic co-marketing partnerships with non-competing peer organizations.
+* **Week 8:** Host a 30-minute virtual AMA or informational session; capture attendee emails.
 
-### Month 3: Conversion & Optimization
-- **Week 9-10 (Campaign Sprint):**
-  - Execute a targeted 2-week mini-campaign focused on [6-Month Goal #1].
-  - Leverage testimonials and quotes from [early participant/customer].
-- **Week 11-12 (Review & Next Horizon):**
-  - Analyze top traffic sources and conversion rates.
-  - Double down on the single highest-performing channel (LinkedIn vs Email vs Direct Outreach).`;
+### Month 3: Conversion Sprint & Scaling Playbook (Weeks 9-12)
+* **Week 9:** Introduce high-converting lead magnet (e.g., industry checklist or resource toolkit).
+* **Week 10:** Run targeted remarketing sprint to warm website visitors and newsletter subscribers.
+* **Week 11:** Gather 3 detailed testimonials or donor/client case studies.
+* **Week 12:** Quarterly retrospective: analyze cost per acquisition, refine high-performing channels, set Q2 targets.`;
 
     case 'social-generator':
-      return `## Multi-Platform Social Post Suite & 4-Week Calendar
+      return `## Multi-Platform Social Media Suite: ${orgName}
 
-### Platform Posts
+### 1. LinkedIn Thought-Leadership Post
+Most people think [common assumption about industry] is the key to success.
 
-#### 1. LinkedIn (Thought Leadership)
-> The biggest misconception in [our industry] is that [common myth].
->
-> In reality, [insightful counter-truth].
->
-> At ${orgName}, we've learned that focusing on [Core Value] produces 3 unexpected advantages:
-> 1. [Advantage One]
-> 2. [Advantage Two]
-> 3. [Advantage Three]
->
-> What has been your experience dealing with [Topic]? Drop your thoughts below. 👇
->
-> #Leadership #Innovation #${orgType} #Growth
+Here's what we learned building ${orgName}:
 
-#### 2. Instagram (Visual Storytelling & Carousel Copy)
-> **Slide 1:** Stop trying to fix [problem] the old way.
-> **Slide 2:** Here is what 90% of people overlook: [Key Insight].
-> **Slide 3:** When ${orgName} stepped in, the focus shifted to [Solution].
-> **Slide 4:** Save this post for your next planning session. Link in bio to learn more!
+It's actually about [counterintuitive insight].
 
-#### 3. X / Twitter (Punchy Thread Hook)
-> 1/5 The hardest part of [industry problem] isn’t what you think. It's [surprising element]. Here is how ${orgName} approaches it: 🧵
+When we shifted our focus from [old habit] to [new priority], three things happened:
+1. Stakeholder trust increased dramatically
+2. Decision fatigue disappeared
+3. Our impact scaled by 40%
 
-#### 4. Facebook (Community Focus)
-> We're proud to share an update from ${orgName}! This week, our team focused on [recent milestone], ensuring [community benefit]. Thank you to everyone standing with us on this journey!
+If you're navigating [current challenge], start with [actionable piece of advice].
+
+What's your biggest takeaway when tackling this? Let's discuss in the comments below.
+
+#Leadership #Strategy #${orgType} #Innovation
 
 ---
 
-### 4-Week Social Calendar Outline
-- **Week 1:** Educational breakdown of [Top Problem].
-- **Week 2:** Spotlight on someone impacted by [Our Mission].
-- **Week 3:** Practical checklist / how-to tip.
-- **Week 4:** Direct call-to-action (Subscribe, Donate, or Book a Discovery Call).`;
+### 2. Instagram Carousel Copy (5 Slides)
+* **Slide 1 (Hook):** The #1 mistake most [Audience Members] make in 2026.
+* **Slide 2 (The Problem):** Relying on [Outdated Method] burns budget and exhausts your team.
+* **Slide 3 (The Shift):** What if you could [Desirable Outcome] in half the time?
+* **Slide 4 (The Solution):** At ${orgName}, we prioritize [Key Feature/Pillar].
+* **Slide 5 (Call to Action):** Save this post for your next strategy session & visit the link in bio to learn more!
+
+---
+
+### 3. X / Twitter 3-Post Thread
+1/3: If your organization wants to master [Core Goal], stop doing [Ineffective Tactic]. Here's the 3-step agency playbook we recommend at ${orgName} 🧵👇
+2/3: Step 1: Clarify your message so a 10-year-old understands it. Step 2: Focus on one primary distribution channel before diversifying. Step 3: Speak to one specific human problem.
+3/3: Execution beats perfection every time. If you need a partner to build your foundations, check out ${orgName} at our bio link. Let's make it happen.`;
 
     case 'email-writer':
-      return `## Email Campaign Kit: ${orgName}
+      return `## Email Campaign Suite: ${orgName}
 
-### Subject Line Options
-- **Curiosity:** "The one thing nobody told us about [Industry Topic]..."
-- **Direct:** "How ${orgName} is tackling [Specific Hurdle]"
-- **Inspiring:** "A quick note of gratitude (and what's next)"
+### 1. High-Converting Subject Lines
+* **Curiosity:** A quick question about your [Industry Priority]...
+* **Direct Value:** How ${orgName} is solving [Pain Point] for good
+* **Personal Hook:** We made a big decision last week (and why it matters for you)
+* **Social Proof:** How 3 organizations transformed their [Outcome] with ${orgName}
+* **Urgency:** The one thing to update before next quarter starts
 
 ---
 
-### Email 1: Welcome / Orientation
-**Subject:** Welcome to ${orgName} – here's what to expect!
+### 2. Email 1: Welcome & Mission Introduction
+**Subject:** Welcome to ${orgName} — let's build something exceptional together
 
 Hi [First Name],
 
-Welcome! When we launched ${orgName}, our goal was straightforward: make [Core Benefit] accessible to [Target Audience], without the typical headaches.
+Thank you for connecting with ${orgName}.
 
-Here are two quick ways to make the most of our community:
-1. **Explore [Resource #1]:** A quick 3-minute guide to [Topic].
-2. **Tell us your biggest challenge:** Reply directly to this email—our team reads every response.
+We started this journey with a clear conviction: [summarize primary mission statement in 1 punchy line].
 
-We’re thrilled to have you with us.
+Over the coming weeks, we're going to share practical insights, actionable frameworks, and direct updates on how we are [tackling core challenge].
+
+In the meantime, what is the single biggest goal your team is working toward this quarter? Hit reply and let us know—we read every response.
 
 Warmly,
 The ${orgName} Team
 
 ---
 
-### Email 2: High-Impact Announcement / Story
-**Subject:** Behind the scenes: What we learned this month
+### 3. Email 2: Direct Value & Impact Showcase
+**Subject:** The blueprint behind [desirable milestone]
 
 Hi [First Name],
 
-Last week, we hit a notable milestone: [Describe event or program achievement].
+When organizations attempt to [achieve goal], they usually encounter [major roadblock].
 
-Behind that milestone is a simple lesson: when you stay focused on [Core Mission], great things follow.
+Here is how ${orgName} approaches it differently:
+- [Point 1: Strategic clarity over noise]
+- [Point 2: Built-in accountability and metrics]
+- [Point 3: Dedicated support every step of the way]
 
-If you know someone in need of [Service/Solution], feel free to forward this note!
-
-Best regards,
-[Your Name / Title]`;
+Ready to accelerate your progress? [Schedule a conversation / Explore our solutions] today.`;
 
     case 'website-copy':
-      return `## Website Copy & SEO Blueprint
+      return `## Website Copy & SEO Blueprint: ${orgName}
 
-### SEO Metadata
-- **SEO Title:** ${orgName} | [Primary Benefit & Category Keyword]
-- **Meta Description:** Discover how ${orgName} helps [Target Audience] achieve [Key Outcome] with [Differentiator]. Explore our programs and start today.
-
----
-
-### Homepage Copy
-
-#### Hero Section
-- **Headline (H1):** The Smarter Way to [Achieve Desired Result].
-- **Subheadline:** ${orgName} provides [core solution] tailored for [target audience], so you can move forward with confidence.
-- **Primary CTA Button:** [Get Started Today / Join Our Mission]
-- **Secondary CTA:** [Learn How It Works]
-
-#### Problem & Solution Section (H2)
-- **Heading:** Why Traditional Approaches Fall Short
-- **Body:** Most people encounter [Frustration A] and [Frustration B]. We engineered ${orgName} to remove the obstacles, delivering [Concrete Outcome].
-
-#### Three Pillar Features
-1. **[Pillar 1 Title]:** Brief sentence explaining benefit.
-2. **[Pillar 2 Title]:** Brief sentence explaining benefit.
-3. **[Pillar 3 Title]:** Brief sentence explaining benefit.
+### Meta Details
+* **SEO Page Title:** ${orgName} | Premier [Primary Service] for [Audience]
+* **Meta Description:** Discover how ${orgName} helps [audience] achieve [benefit] through customized, mission-driven solutions. Learn more today.
 
 ---
 
-### About Page Story Hook
-"${orgName} was founded with a singular conviction: that [core belief]. What started as [brief origin] has evolved into a dedicated team serving [audience]. Here is why we do it..."`;
+### Homepage Hero Section
+* **Hero Headline (H1):** Empowering [Target Audience] with Next-Generation [Solutions].
+* **Subheadline (H2):** ${orgName} provides the strategic framework, tools, and expertise you need to overcome [challenge] and scale your impact.
+* **Primary CTA:** Get Started Free
+* **Secondary CTA:** Schedule a Strategy Call
+
+---
+
+### Core Value Pillars (3-Column Layout)
+#### 1. Strategic Precision
+Stop guessing what works. Our structured methodology delivers repeatable, high-impact outcomes from day one.
+
+#### 2. Purpose-Built Architecture
+Engineered specifically for the demands of modern ${orgType.toLowerCase()}s who require agility and measurable performance.
+
+#### 3. Dedicated Partnership
+We're not just another vendor. We act as an extension of your leadership team to drive sustainable growth.`;
 
     case 'donor-appeal':
-    case 'pitch-launch':
-      if (isNonprofit) {
-        return `## Donor Appeal & Grant Narrative Blueprint
+      return `## Donor Appeal & Grant Proposal Kit: ${orgName}
 
-### 1. Direct Donor Appeal Letter
-**Salutation:** Dear [Supporter Name / Friend of ${orgName}],
+### 1. Formal Donor Appeal Letter
+**Subject:** Your partnership makes [Transformative Outcome] possible
 
-Right now, [number or group] in our community are facing [pressing reality]. While the challenges are real, there is proven hope.
+Dear [Donor Name],
 
-At ${orgName}, your gift doesn't sit on the sidelines. Every $[Amount] directly funds [specific outcome or program supply].
+Every day in our community, [state the urgent human reality or problem].
 
-Last year alone, our supporters helped [accomplishment placeholder, e.g. deliver 500 hours of direct mentoring]. But as we enter the next quarter, demand has grown by [X]%.
+At ${orgName}, we believe that no one should have to navigate [challenge] alone. Because of compassionate champions like you, this year we were able to:
+* Directly support [Metric 1: e.g., 250 families / individuals]
+* Deliver [Metric 2: e.g., 1,200 hours of specialized care / resources]
+* Expand our outreach to [Metric 3: target community expansion]
 
-Will you consider a special gift of $[50 / $100 / $250] today to keep this vital work moving forward?
+**Your gift today directly funds:**
+* **$50:** Provides essential supplies for one program participant.
+* **$150:** Funds one full week of direct service delivery and mentorship.
+* **$500:** Sponsors an entire workshop series for an underserved cohort.
 
-With deep gratitude,
-[Executive Director Name]
+Will you join us in writing the next chapter of this mission? Every dollar makes a tangible, lasting difference.
+
+With sincere gratitude,
+[Executive Director / Founder Name]
 ${orgName}
 
 ---
 
-### 2. Grant Narrative Executive Summary
-- **Organization Legal Name:** ${orgName}
-- **Project Title:** [Initiative Name: Expanding Access to Key Program]
-- **Statement of Need:** In our target service area, [quantified need placeholder]. Existing infrastructure fails to address [specific gap].
-- **Proposed Methodology:** ${orgName} utilizes a proven three-phase model: Intake, Direct Service Delivery, and Longitudinal Outcome Tracking.
-- **Expected Outcomes:** [Output metric 1, e.g. 200 participants trained]; [Outcome metric 2, e.g. 85% completion rate].
-- **Sustainability Plan:** Multi-channel revenue strategy including private philanthropy, earned revenue, and municipal partnerships.`;
-      } else {
-        return `## Startup Pitch Deck Narrative & Launch Script
+### 2. Grant Proposal Executive Summary
+* **Project Name:** Community Advancement Initiative 2026
+* **Organization:** ${orgName} (501(c)(3) Nonprofit)
+* **Statement of Need:** Addressing systemic barriers to [Core Need] among [Target Demographic].
+* **Proposed Intervention:** A multi-tiered support model delivering direct mentorship, educational toolkits, and measurable community milestones.
+* **Expected Outcomes:** 85% completion rate among enrolled participants with documented increases in self-sufficiency.`;
 
-### 1. The 10-Slide Pitch Flow
-- **Slide 1: Title:** ${orgName} – The next generation of [Category].
-- **Slide 2: Problem:** [Target Customer] spends $[X] and [Y] hours per month struggling with [Core Friction].
-- **Slide 3: Solution:** ${orgName} automates and streamlines [Process] with [Unique IP/Secret Sauce].
-- **Slide 4: Market Size:** TAM $[X]B, SAM $[Y]M, SOM $[Z]M.
-- **Slide 5: Product Demo / Screenshots:** Showing the 3-step magic workflow.
-- **Slide 6: Business Model:** Recurring subscription ($[X]/mo tier) with [LTV:CAC ratio placeholder].
-- **Slide 7: Go-To-Market:** Direct inbound content, strategic agency channel partners, targeted founder communities.
-- **Slide 8: Traction & Milestones:** [X] beta waitlist users, [Y] pilot signups, positive feedback.
-- **Slide 9: Team:** Seasoned operators with domain background in [Field].
-- **Slide 10: The Ask:** Raising $[Amount] to accelerate product velocity and reach $[Target ARR] within 12 months.
+    case 'pitch-launch':
+      return `## Investor Pitch & Launch Deck: ${orgName}
 
----
+### 10-Slide Pitch Narrative Flow
 
-### 2. Product Hunt / Launch Day Teaser
-> 🚀 Excited to announce the launch of ${orgName}!
->
-> We built this because we were tired of [annoying industry status quo].
->
-> With ${orgName}, you can [achieve Key Benefit] in under 5 minutes.
->
-> We're offering our early community 25% off for life. Check out the link and let us know what you think!`;
-      }
+#### Slide 1: Title & Vision
+* **Headline:** ${orgName}
+* **Tagline:** The Intelligent Infrastructure for [Industry/Sector].
+
+#### Slide 2: The Problem
+* The current market relies on fragmented, legacy workflows.
+* Customers lose up to 15 hours per week on manual coordination.
+
+#### Slide 3: The Solution
+* An integrated, modern platform that automates [Key Bottleneck].
+* Delivers 3x faster turnaround times at 50% lower overhead.
+
+#### Slide 4: Market Opportunity
+* Total Addressable Market (TAM): $4.2B growing at 18% CAGR.
+* Immediate Serviceable Market: Over 45,000 organizations in need of modern upgrades.
+
+#### Slide 5: Product & Unfair Advantage
+* Proprietary workflow templates calibrated by agency veterans.
+* High switching costs and robust organic word-of-mouth referral engine.
+
+#### Slide 6: Business Model
+* Predictable recurring SaaS subscriptions + premium advisory tiers.
+
+#### Slide 7: Traction & Milestones
+* Active beta community with 92% retention rate.
+* Over 10,000 deliverables generated to date.
+
+#### Slide 8: Go-to-Market
+* High-intent organic SEO, community co-marketing, and targeted direct outreach.
+
+#### Slide 9: Team
+* Founder-led team with combined 25+ years in agency growth, engineering, and digital strategy.
+
+#### Slide 10: The Ask
+* Raising seed funding to accelerate product development and scale direct customer acquisition.`;
 
     case 'keywords-content':
       return `## SEO Keyword Bank & 10 High-Intent Blog Topics
@@ -1277,26 +1370,134 @@ This deliverable has been tailored for **${orgName}** (${orgType}), calibrated f
   }
 }
 
-// Vite or Static Serving
-async function startServer() {
-  if (!isProduction) {
-    const { createServer: createViteServer } = await import('vite');
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: 'spa',
+// =========================================================================
+// EXPRESS SERVER & VITE INTEGRATION (ONLY WHEN SERVERLESS IS NOT "true")
+// =========================================================================
+if (process.env.SERVERLESS !== 'true') {
+  const app = express();
+  const PORT = Number(process.env.PORT) || 3000;
+  const isProduction = process.env.NODE_ENV === 'production';
+
+  app.use(express.json({ limit: '10mb' }));
+
+  // CORS middleware for Express
+  app.use((req, res, next) => {
+    const origin = req.headers.origin;
+    const corsHeaders = getCorsHeaders(origin);
+    for (const [key, value] of Object.entries(corsHeaders)) {
+      res.setHeader(key, value);
+    }
+    if (req.method === 'OPTIONS') {
+      return res.status(204).end();
+    }
+    next();
+  });
+
+  // Health check endpoint
+  app.get('/api/health', async (_req, res) => {
+    const result = await handleHealthCheck();
+    res.status(result.status).json(result.data);
+  });
+
+  // Authentication Synchronization Endpoint
+  app.post('/api/auth/sync', async (req, res) => {
+    const result = await handleAuthSync(req.headers.authorization);
+    res.status(result.status).json(result.data);
+  });
+
+  // List all invites (super admins only)
+  app.get('/api/invites', async (req, res) => {
+    const result = await handleGetInvites(req.headers.authorization);
+    res.status(result.status).json(result.data);
+  });
+
+  // Create invite (super admins only)
+  app.post('/api/invites', async (req, res) => {
+    const result = await handleCreateInvite(req.headers.authorization, req.body);
+    res.status(result.status).json(result.data);
+  });
+
+  // Revoke invite (super admins only)
+  app.post('/api/invites/:id/revoke', async (req, res) => {
+    const result = await handleRevokeInvite(req.headers.authorization, req.params.id);
+    res.status(result.status).json(result.data);
+  });
+
+  // Get single invite details
+  app.get('/api/invites/:id', async (req, res) => {
+    const result = await handleGetInvite(req.params.id);
+    res.status(result.status).json(result.data);
+  });
+
+  // Accept invite via link
+  app.post('/api/invites/:id/accept', async (req, res) => {
+    const result = await handleAcceptInvite(req.headers.authorization, req.params.id);
+    res.status(result.status).json(result.data);
+  });
+
+  // Super Admin Update User Plan
+  app.post('/api/admin/users/:userId/plan', async (req, res) => {
+    const result = await handleUpdateUserPlan(req.headers.authorization, req.params.userId, req.body?.planId);
+    res.status(result.status).json(result.data);
+  });
+
+  // Super Admin Update User Role
+  app.post('/api/admin/users/:userId/role', async (req, res) => {
+    const result = await handleUpdateUserRole(req.headers.authorization, req.params.userId, req.body?.role);
+    res.status(result.status).json(result.data);
+  });
+
+  // Marketing Tool Generation Endpoint
+  app.post('/api/gemini/generate', async (req, res) => {
+    const result = await handleGeminiGenerate(req.headers.authorization, req.body);
+    if (result.errorStatus) {
+      return res.status(result.errorStatus).json(result.errorData);
+    }
+
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
+    res.setHeader('Connection', 'keep-alive');
+    res.flushHeaders?.();
+
+    const reader = result.stream!.getReader();
+    req.on('close', () => {
+      reader.cancel().catch(() => {});
     });
-    app.use(vite.middlewares);
-  } else {
-    const distPath = path.resolve(__dirname, 'dist');
-    app.use(express.static(distPath));
-    app.get('*', (_req, res) => {
-      res.sendFile(path.resolve(distPath, 'index.html'));
+
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        res.write(value);
+      }
+    } catch (err: any) {
+      console.error('[Stream Pipe Error]:', err.message);
+    } finally {
+      res.end();
+    }
+  });
+
+  // Vite or Static Serving
+  async function startServer() {
+    if (!isProduction) {
+      const { createServer: createViteServer } = await import('vite');
+      const vite = await createViteServer({
+        server: { middlewareMode: true },
+        appType: 'spa',
+      });
+      app.use(vite.middlewares);
+    } else {
+      const distPath = path.resolve(__dirname, 'dist');
+      app.use(express.static(distPath));
+      app.get('*', (_req, res) => {
+        res.sendFile(path.resolve(distPath, 'index.html'));
+      });
+    }
+
+    app.listen(PORT, '0.0.0.0', () => {
+      console.log(`🚀 Millennium Agency Launchpad server running at http://0.0.0.0:${PORT}`);
     });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`🚀 Millennium Agency Launchpad server running at http://0.0.0.0:${PORT}`);
-  });
+  startServer();
 }
-
-startServer();
