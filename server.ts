@@ -10,16 +10,16 @@ import { getFirestore } from 'firebase-admin/firestore';
 
 dotenv.config();
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+const serverFile = fileURLToPath(import.meta.url);
+const serverDir = path.dirname(serverFile);
 
 // Helper to load firebase config robustly across local dev and Netlify functions
 function loadFirebaseConfig(): any {
   const candidates = [
-    path.resolve(__dirname, 'firebase-applet-config.json'),
+    path.resolve(serverDir, 'firebase-applet-config.json'),
     path.resolve(process.cwd(), 'firebase-applet-config.json'),
-    path.resolve(__dirname, '../firebase-applet-config.json'),
-    path.resolve(__dirname, '../../firebase-applet-config.json'),
+    path.resolve(serverDir, '../firebase-applet-config.json'),
+    path.resolve(serverDir, '../../firebase-applet-config.json'),
   ];
   for (const c of candidates) {
     if (fs.existsSync(c)) {
@@ -1487,7 +1487,7 @@ if (process.env.SERVERLESS !== 'true') {
       });
       app.use(vite.middlewares);
     } else {
-      const distPath = path.resolve(__dirname, 'dist');
+      const distPath = path.resolve(serverDir, 'dist');
       app.use(express.static(distPath));
       app.get('*', (_req, res) => {
         res.sendFile(path.resolve(distPath, 'index.html'));
