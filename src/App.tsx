@@ -61,19 +61,6 @@ export default function App() {
   });
 
   useEffect(() => {
-    const handlePopState = () => {
-      const path = window.location.pathname;
-      if (path.startsWith('/invite/')) {
-        setCurrentInviteId(path.split('/invite/')[1]?.split('/')[0]?.split('?')[0] || null);
-      } else {
-        setCurrentInviteId(null);
-      }
-    };
-    window.addEventListener('popstate', handlePopState);
-    return () => window.removeEventListener('popstate', handlePopState);
-  }, []);
-
-  useEffect(() => {
     const unsubscribe = authService.onAuthChange((user) => {
       setCurrentUser(user);
 
@@ -98,13 +85,7 @@ export default function App() {
     } catch (err: any) {
       if (err?.code !== 'auth/popup-closed-by-user') {
         console.error('Sign-in error:', err);
-        if (err?.code === 'auth/unauthorized-domain') {
-          setSignInError(
-            `This domain (${window.location.hostname}) is not authorized for Google Sign-In. Add it in Firebase Console → Authentication → Settings → Authorized domains.`
-          );
-        } else {
-          setSignInError(err?.message || 'Authentication failed. Please try again.');
-        }
+        setSignInError(err?.message || 'Authentication failed. Please try again.');
       }
     } finally {
       setIsSigningIn(false);
