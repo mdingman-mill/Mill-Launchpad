@@ -348,11 +348,37 @@ class DataService {
   private cachedLogs: AuditLogEntry[] = [];
   private cachedInvoices: Invoice[] = [];
 
+  private stripUndefined<T>(obj: T): T {
+    if (Array.isArray(obj)) {
+      return obj.map((v) => this.stripUndefined(v)) as unknown as T;
+    }
+    if (obj && typeof obj === 'object') {
+      const cleaned: Record<string, any> = {};
+      for (const [k, v] of Object.entries(obj as Record<string, any>)) {
+        if (v !== undefined) {
+          cleaned[k] = this.stripUndefined(v);
+        }
+      }
+      return cleaned as T;
+    }
+    return obj;
+  }
+
+  public setCachedUser(user: User): void {
+    this.cachedUsers.set(user.id, user);
+  }
+
+  public clearCache(): void {
+    this.cachedUsers.clear();
+    this.cachedOutputs = [];
+    this.cachedLogs = [];
+  }
+
   constructor() {
     this.refreshLocalCache();
   }
 
-  private async refreshLocalCache(): Promise<void> {
+  public async refreshLocalCache(): Promise<void> {
     if (typeof window === 'undefined') return;
     try {
       if (auth.currentUser) {
@@ -433,12 +459,12 @@ class DataService {
     const newUser: User = {
       id,
       name: userData.name,
-      email: userData.email,
+      email: userData.email.trim().toLowerCase(),
       avatar:
         userData.avatar ||
         `https://api.dicebear.com/7.x/initials/svg?seed=${encodeURIComponent(userData.name)}&backgroundColor=0f172a,e11d48`,
-      role: userData.role || 'member',
-      planId: userData.planId || 'free',
+      role: 'member',
+      planId: 'free',
       status: 'active',
       signupDate: new Date().toISOString(),
       lastLogin: new Date().toISOString(),
@@ -456,35 +482,65 @@ class DataService {
   }
 
   public updateUser(id: string, updates: Partial<User>): User | null {
-    const current = this.cachedUsers.get(id) || { id } as User;
+    const current = this.cachedUsers.get(id) || ({ id } as User);
     const updated: User = { ...current, ...updates };
     this.cachedUsers.set(id, updated);
-    this.persistUser(updated);
+
+    const cleanedUpdates = this.stripUndefined(updates);
+    if (Object.keys(cleanedUpdates).length > 0) {
+      const path = `users/${id}`;
+      setDoc(doc(db, 'users', id), cleanedUpdates, { merge: true }).catch((error) => {
+        handleFirestoreError(error, OperationType.WRITE, path);
+      });
+    }
+
+    if (updates.organizationProfile) {
+      const orgId = updated.organizationId || `org_${id}`;
+      const orgPayload = this.stripUndefined({
+        id: orgId,
+        name: updates.organizationProfile.orgName,
+        ownerId: id,
+        memberIds: [id],
+        type: updates.organizationProfile.type,
+        whatTheyDo: updates.organizationProfile.whatTheyDo,
+        targetAudience: updates.organizationProfile.targetAudience,
+        goals: updates.organizationProfile.goals,
+        brandTone: updates.organizationProfile.brandTone,
+        budget: updates.organizationProfile.budget,
+        website: updates.organizationProfile.website || '',
+        createdAt: updated.signupDate || new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      });
+      this.saveOrganization(orgPayload).catch(() => {});
+    }
+
     return updated;
   }
 
   public async persistUser(user: User): Promise<void> {
     const path = `users/${user.id}`;
     try {
-      await setDoc(doc(db, 'users', user.id), user, { merge: true });
-      // If organization profile is present, also persist to organizations collection
-      if (user.organizationProfile && user.organizationId) {
-        await this.saveOrganization({
-          id: user.organizationId,
-          name: user.organizationProfile.orgName,
-          ownerId: user.id,
-          memberIds: [user.id],
-          type: user.organizationProfile.type,
-          whatTheyDo: user.organizationProfile.whatTheyDo,
-          targetAudience: user.organizationProfile.targetAudience,
-          goals: user.organizationProfile.goals,
-          brandTone: user.organizationProfile.brandTone,
-          budget: user.organizationProfile.budget,
-          website: user.organizationProfile.website || '',
-          planId: user.planId,
-          createdAt: user.signupDate,
-          updatedAt: new Date().toISOString(),
-        });
+      const cleanUser = this.stripUndefined(user);
+      await setDoc(doc(db, 'users', user.id), cleanUser, { merge: true });
+      if (user.organizationProfile) {
+        const orgId = user.organizationId || `org_${user.id}`;
+        await this.saveOrganization(
+          this.stripUndefined({
+            id: orgId,
+            name: user.organizationProfile.orgName,
+            ownerId: user.id,
+            memberIds: [user.id],
+            type: user.organizationProfile.type,
+            whatTheyDo: user.organizationProfile.whatTheyDo,
+            targetAudience: user.organizationProfile.targetAudience,
+            goals: user.organizationProfile.goals,
+            brandTone: user.organizationProfile.brandTone,
+            budget: user.organizationProfile.budget,
+            website: user.organizationProfile.website || '',
+            createdAt: user.signupDate || new Date().toISOString(),
+            updatedAt: new Date().toISOString(),
+          })
+        );
       }
     } catch (error) {
       handleFirestoreError(error, OperationType.WRITE, path);
@@ -492,41 +548,65 @@ class DataService {
   }
 
   public async deleteUser(id: string): Promise<boolean> {
+    await this.adminUserActionServer(id, 'delete_user');
     this.cachedUsers.delete(id);
-    const path = `users/${id}`;
-    try {
-      await deleteDoc(doc(db, 'users', id));
-      return true;
-    } catch (error) {
-      handleFirestoreError(error, OperationType.DELETE, path);
+    return true;
+  }
+
+  public async deleteOwnAccountServer(): Promise<void> {
+    const token = await auth.currentUser?.getIdToken();
+    if (!token) throw new Error('Not authenticated');
+    const res = await fetch('/api/account/delete', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || 'Failed to delete account');
     }
+    this.clearCache();
   }
 
   public incrementUsage(userId: string): number {
+    // Authoritative increment happens inside /api/gemini/generate Admin SDK transaction.
+    // Only update local in-memory cache here to keep UI responsive without violating Firestore rules.
     const user = this.cachedUsers.get(userId);
     const nextCount = (user?.generationsUsedThisMonth || 0) + 1;
     if (user) {
-      this.updateUser(userId, { generationsUsedThisMonth: nextCount });
+      this.cachedUsers.set(userId, { ...user, generationsUsedThisMonth: nextCount });
     }
     return nextCount;
   }
 
-  public grantBonusGenerations(userId: string, amount: number): void {
-    const user = this.cachedUsers.get(userId);
-    if (!user) return;
-    const updatedBonus = (user.bonusGenerations || 0) + amount;
-    this.updateUser(userId, { bonusGenerations: updatedBonus });
-    this.logAction('BONUS_GENERATIONS_GRANTED', `Granted +${amount} bonus generations`, userId);
-  }
-
-  public resetUsage(userId: string): void {
-    const user = this.cachedUsers.get(userId);
-    if (!user) return;
-    this.updateUser(userId, {
-      generationsUsedThisMonth: 0,
-      billingResetDate: getNextMonthFirstDay(),
+  public async adminUserActionServer(
+    userId: string,
+    action: 'grant_bonus' | 'reset_usage' | 'toggle_discount' | 'toggle_status' | 'delete_user',
+    amount?: number
+  ): Promise<User | null> {
+    const token = await auth.currentUser?.getIdToken();
+    if (!token) throw new Error('Not authenticated');
+    const res = await fetch(`/api/admin/users/${encodeURIComponent(userId)}/action`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({ action, ...(amount !== undefined ? { amount } : {}) }),
     });
-    this.logAction('USAGE_RESET', `Monthly generation usage reset to 0`, userId);
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || 'Failed to execute admin user action');
+    }
+    const data = await res.json();
+    if (action === 'delete_user') {
+      this.cachedUsers.delete(userId);
+      return null;
+    }
+    if (data.user) {
+      this.cachedUsers.set(userId, data.user as User);
+      return data.user as User;
+    }
+    return null;
   }
 
   /* =========================================================================
@@ -535,7 +615,9 @@ class DataService {
   public async saveOrganization(org: any): Promise<void> {
     const path = `organizations/${org.id}`;
     try {
-      await setDoc(doc(db, 'organizations', org.id), org, { merge: true });
+      const cleanOrg = this.stripUndefined(org);
+      delete cleanOrg.planId;
+      await setDoc(doc(db, 'organizations', org.id), cleanOrg, { merge: true });
     } catch (error) {
       handleFirestoreError(error, OperationType.WRITE, path);
     }
@@ -555,10 +637,9 @@ class DataService {
    * OUTPUTS / MY LIBRARY CRUD (/organizations/{orgId}/outputs/{outputId})
    * ========================================================================= */
   public async fetchOutputs(orgId?: string): Promise<SavedOutput[]> {
-    const currentOrgId = orgId || auth.currentUser?.uid ? `org_${auth.currentUser?.uid}` : null;
+    const currentOrgId = orgId || (auth.currentUser?.uid ? `org_${auth.currentUser.uid}` : null);
     if (!currentOrgId) return this.cachedOutputs;
 
-    const path = `organizations/${currentOrgId}/outputs`;
     try {
       const snap = await getDocs(collection(db, 'organizations', currentOrgId, 'outputs'));
       const list: SavedOutput[] = [];
@@ -782,8 +863,17 @@ class DataService {
    * ========================================================================= */
   public async fetchAuditLogs(): Promise<AuditLogEntry[]> {
     const path = 'auditLogs';
+    const uid = auth.currentUser?.uid;
+    if (!uid) return this.cachedLogs;
+
+    const currentUser = this.cachedUsers.get(uid);
+    const isAdminUser = currentUser?.role === 'super_admin' || currentUser?.role === 'admin';
+
     try {
-      const snap = await getDocs(query(collection(db, path), limit(100)));
+      const q = isAdminUser
+        ? query(collection(db, path), limit(100))
+        : query(collection(db, path), where('actorId', '==', uid), limit(100));
+      const snap = await getDocs(q);
       const list: AuditLogEntry[] = [];
       snap.forEach((d) => list.push(d.data() as AuditLogEntry));
       list.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());

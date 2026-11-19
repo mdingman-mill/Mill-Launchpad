@@ -10,12 +10,30 @@ service cloud.firestore {
       return request.auth != null;
     }
 
+    function isValidId(id) {
+      return id is string && id.size() > 0 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-\\.]+$');
+    }
+
     function isOwner(userId) {
       return isSignedIn() && request.auth.uid == userId;
     }
 
     function isAdmin() {
       return isSignedIn() && exists(/databases/$(database)/documents/admins/$(request.auth.uid));
+    }
+
+    function hasVerifiedEmailMatch(targetEmail) {
+      return isSignedIn() &&
+        request.auth.token.email_verified == true &&
+        request.auth.token.email != null &&
+        targetEmail is string &&
+        targetEmail.lower() == request.auth.token.email.lower();
+    }
+
+    function isOrgOwner(orgId) {
+      return isSignedIn() &&
+        exists(/databases/$(database)/documents/organizations/$(orgId)) &&
+        get(/databases/$(database)/documents/organizations/$(orgId)).data.ownerId == request.auth.uid;
     }
 
     function isOrgMember(orgId) {
@@ -33,65 +51,151 @@ service cloud.firestore {
 
     // Users Collection
     match /users/{userId} {
-      allow get: if isOwner(userId) || isAdmin();
+      allow get: if isValidId(userId) && (isOwner(userId) || isAdmin());
       allow list: if isAdmin();
-      allow create: if isOwner(userId) &&
+      allow create: if isValidId(userId) &&
+        isOwner(userId) &&
+        request.resource.data.id == userId &&
         request.resource.data.planId == 'free' &&
         request.resource.data.role == 'member' &&
-        request.resource.data.generationsUsedThisMonth == 0;
-      allow update: if isAdmin() || (
-        isOwner(userId) &&
-        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['name', 'avatar', 'organizationProfile', 'lastLogin'])
+        request.resource.data.generationsUsedThisMonth == 0 &&
+        request.resource.data.get('bonusGenerations', 0) == 0 &&
+        request.resource.data.get('nonprofitDiscountApproved', false) == false &&
+        request.resource.data.get('status', 'active') == 'active';
+      allow update: if isValidId(userId) && (
+        isAdmin() || (
+          isOwner(userId) &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['name', 'avatar', 'organizationProfile', 'lastLogin']) &&
+          (!('name' in request.resource.data) || (request.resource.data.name is string && request.resource.data.name.size() <= 150)) &&
+          (!('avatar' in request.resource.data) || (request.resource.data.avatar is string && request.resource.data.avatar.size() <= 1000)) &&
+          (!('lastLogin' in request.resource.data) || (request.resource.data.lastLogin is string && request.resource.data.lastLogin.size() <= 64)) &&
+          (!('organizationProfile' in request.resource.data) || request.resource.data.organizationProfile is map)
+        )
       );
-      allow delete: if isAdmin();
+      allow delete: if isValidId(userId) && isAdmin();
     }
 
-    // Super Admins Registry
+    // Super Admins Registry (Managed by Server Admin SDK only)
     match /admins/{userId} {
-      allow read: if isSignedIn();
-      allow write: if isAdmin();
+      allow get: if isValidId(userId) && (isOwner(userId) || isAdmin());
+      allow list: if isAdmin();
+      allow write: if false;
     }
 
     // Organizations & Brand Foundations
     match /organizations/{orgId} {
-      allow get: if isAdmin() || (isSignedIn() && (resource.data.ownerId == request.auth.uid || ('memberIds' in resource.data && request.auth.uid in resource.data.memberIds)));
-      allow list: if isAdmin() || (isSignedIn() && (resource.data.ownerId == request.auth.uid || ('memberIds' in resource.data && request.auth.uid in resource.data.memberIds)));
-      allow create: if isSignedIn() && (request.resource.data.ownerId == request.auth.uid || isAdmin());
-      allow update: if isAdmin() || (isSignedIn() && (resource.data.ownerId == request.auth.uid || ('memberIds' in resource.data && request.auth.uid in resource.data.memberIds)));
-      allow delete: if isAdmin() || (isSignedIn() && resource.data.ownerId == request.auth.uid);
+      allow get: if isValidId(orgId) && (
+        (isSignedIn() && (resource.data.ownerId == request.auth.uid || ('memberIds' in resource.data && request.auth.uid in resource.data.memberIds))) ||
+        isAdmin()
+      );
+      allow list: if (isSignedIn() && (resource.data.ownerId == request.auth.uid || ('memberIds' in resource.data && request.auth.uid in resource.data.memberIds))) || isAdmin();
+      allow create: if isValidId(orgId) && (
+        isAdmin() || (
+          isSignedIn() &&
+          request.resource.data.id == orgId &&
+          request.resource.data.ownerId == request.auth.uid &&
+          request.resource.data.get('planId', 'free') == 'free' &&
+          (!('memberIds' in request.resource.data) || (request.resource.data.memberIds is list && request.resource.data.memberIds.size() <= 10 && request.auth.uid in request.resource.data.memberIds))
+        )
+      );
+      allow update: if isValidId(orgId) && (
+        isAdmin() ||
+        (
+          isSignedIn() &&
+          resource.data.ownerId == request.auth.uid &&
+          !request.resource.data.diff(resource.data).affectedKeys().hasAny(['id', 'ownerId', 'planId']) &&
+          (!('memberIds' in request.resource.data) || (request.resource.data.memberIds is list && request.resource.data.memberIds.size() <= 10))
+        ) ||
+        (
+          isSignedIn() &&
+          'memberIds' in resource.data &&
+          request.auth.uid in resource.data.memberIds &&
+          !request.resource.data.diff(resource.data).affectedKeys().hasAny(['id', 'ownerId', 'memberIds', 'planId'])
+        )
+      );
+      allow delete: if isValidId(orgId) && (isAdmin() || (isSignedIn() && resource.data.ownerId == request.auth.uid));
 
       // Outputs subcollection
       match /outputs/{outputId} {
-        allow read: if isAdmin() || isOrgMember(orgId);
-        allow create: if (isAdmin() || isOrgMember(orgId)) && request.resource.data.userId == request.auth.uid;
-        allow update: if isAdmin() || (isOrgMember(orgId) && resource.data.userId == request.auth.uid);
-        allow delete: if isAdmin() || (isOrgMember(orgId) && (resource.data.userId == request.auth.uid || get(/databases/$(database)/documents/organizations/$(orgId)).data.ownerId == request.auth.uid));
+        allow get: if isValidId(orgId) && isValidId(outputId) && (isOrgMember(orgId) || isAdmin());
+        allow list: if isValidId(orgId) && (isOrgMember(orgId) || isAdmin());
+        allow create: if isValidId(orgId) &&
+          isValidId(outputId) &&
+          (isOrgMember(orgId) || isAdmin()) &&
+          request.resource.data.id == outputId &&
+          request.resource.data.userId == request.auth.uid &&
+          request.resource.data.title is string && request.resource.data.title.size() <= 300 &&
+          request.resource.data.content is string && request.resource.data.content.size() <= 200000;
+        allow update: if isValidId(orgId) &&
+          isValidId(outputId) &&
+          (
+            isAdmin() ||
+            (
+              isOrgMember(orgId) &&
+              resource.data.userId == request.auth.uid &&
+              !request.resource.data.diff(resource.data).affectedKeys().hasAny(['id', 'userId', 'createdAt'])
+            )
+          );
+        allow delete: if isValidId(orgId) &&
+          isValidId(outputId) &&
+          (isAdmin() || (isOrgMember(orgId) && (resource.data.userId == request.auth.uid || isOrgOwner(orgId))));
       }
 
       // Invites subcollection
       match /invites/{inviteId} {
-        allow read: if isAdmin() || isOrgMember(orgId) || (isSignedIn() && request.auth.token.email != null && resource.data.email == request.auth.token.email);
-        allow create: if isAdmin() || isOrgMember(orgId);
-        allow update: if isAdmin() || isOrgMember(orgId) || (isSignedIn() && request.auth.token.email != null && resource.data.email == request.auth.token.email);
-        allow delete: if isAdmin() || isOrgMember(orgId);
+        allow get: if isValidId(orgId) && isValidId(inviteId) && (isAdmin() || isOrgMember(orgId) || hasVerifiedEmailMatch(resource.data.email));
+        allow list: if isValidId(orgId) && (isAdmin() || isOrgOwner(orgId) || hasVerifiedEmailMatch(resource.data.email));
+        allow create: if isValidId(orgId) && isValidId(inviteId) && (isAdmin() || isOrgOwner(orgId));
+        allow update: if isValidId(orgId) && isValidId(inviteId) && (
+          isAdmin() ||
+          isOrgOwner(orgId) ||
+          (
+            hasVerifiedEmailMatch(resource.data.email) &&
+            request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status']) &&
+            request.resource.data.status in ['accepted', 'declined']
+          )
+        );
+        allow delete: if isValidId(orgId) && isValidId(inviteId) && (isAdmin() || isOrgOwner(orgId));
       }
     }
 
-    // Audit logs
+    // Audit logs (append-only; privileged actions restricted to Admin SDK)
     match /auditLogs/{logId} {
-      allow get: if isAdmin() || (isSignedIn() && resource.data.userId == request.auth.uid);
-      allow list: if isAdmin();
-      allow create: if isSignedIn() && request.resource.data.userId == request.auth.uid;
-      allow update, delete: if isAdmin();
+      allow get: if isValidId(logId) && ((isSignedIn() && resource.data.actorId == request.auth.uid) || isAdmin());
+      allow list: if (isSignedIn() && resource.data.actorId == request.auth.uid) || isAdmin();
+      allow create: if isValidId(logId) &&
+        isSignedIn() &&
+        request.resource.data.id == logId &&
+        request.resource.data.actorId == request.auth.uid &&
+        request.resource.data.action is string &&
+        request.resource.data.action.size() <= 80 &&
+        request.resource.data.details is string &&
+        request.resource.data.details.size() <= 1000 &&
+        !(request.resource.data.action in [
+          'INVITE_CREATED',
+          'INVITE_ACCEPTED',
+          'INVITE_REVOKED',
+          'PLAN_CHANGED',
+          'PLAN_UPGRADED',
+          'SUBSCRIPTION_CHANGED',
+          'SUBSCRIPTION_CANCELED',
+          'ROLE_CHANGED',
+          'ADMIN_INVITE',
+          'ADMIN_PLAN_UPDATE',
+          'ADMIN_ROLE_UPDATE',
+          'BONUS_GENERATIONS_GRANTED',
+          'USAGE_RESET',
+          'DISCOUNT_TOGGLED',
+          'USER_STATUS_CHANGE',
+          'USER_DELETED'
+        ]);
+      allow update, delete: if false;
     }
 
     // Top-Level Invites Collection (Complimentary Access System)
     match /invites/{inviteId} {
-      allow read: if isAdmin() || (
-        isSignedIn() &&
-        request.auth.token.email != null &&
-        resource.data.email == request.auth.token.email
-      );
+      allow get: if isValidId(inviteId) && (hasVerifiedEmailMatch(resource.data.email) || isAdmin());
+      allow list: if hasVerifiedEmailMatch(resource.data.email) || isAdmin();
       allow write: if isAdmin();
     }
   }

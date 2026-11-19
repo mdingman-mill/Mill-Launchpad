@@ -239,14 +239,26 @@ export const MarketingStudio: React.FC<MarketingStudioProps> = ({
     URL.revokeObjectURL(url);
   };
 
+  const escapeHtml = (unsafe: string) =>
+    unsafe
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
+
   const handleExportDocx = () => {
     if (!output || !activeTool) return;
+    const safeTitle = escapeHtml(outputTitle);
+    const safeTool = escapeHtml(activeTool.name);
+    const safeOrg = escapeHtml(user.organizationProfile?.orgName || 'Client');
+    const safeOutput = escapeHtml(output);
     const htmlContent = `
       <!DOCTYPE html>
       <html>
       <head>
         <meta charset="utf-8">
-        <title>${outputTitle}</title>
+        <title>${safeTitle}</title>
         <style>
           body { font-family: Calibri, Arial, sans-serif; line-height: 1.6; color: #0f172a; padding: 40px; }
           h1, h2, h3 { color: #0f172a; margin-top: 24px; }
@@ -255,12 +267,12 @@ export const MarketingStudio: React.FC<MarketingStudioProps> = ({
         </style>
       </head>
       <body>
-        <h1>${outputTitle}</h1>
-        <p><em>Generated with Millennium Agency Launchpad (${activeTool.name}) for ${user.organizationProfile?.orgName}</em></p>
+        <h1>${safeTitle}</h1>
+        <p><em>Generated with Millennium Agency Launchpad (${safeTool}) for ${safeOrg}</em></p>
         <hr/>
-        <div style="white-space: pre-wrap;">${output}</div>
+        <div style="white-space: pre-wrap;">${safeOutput}</div>
         <div class="footer">
-          Generated for ${user.organizationProfile?.orgName || 'Client'} by Millennium Agency • https://mill.agency
+          Generated for ${safeOrg} by Millennium Agency • https://mill.agency
         </div>
       </body>
       </html>

@@ -74,14 +74,26 @@ export const LibraryView: React.FC<LibraryViewProps> = ({ user, onOpenToolWithIn
     URL.revokeObjectURL(url);
   };
 
+  const escapeHtml = (unsafe: string) =>
+    unsafe
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
+
   const handleExportDocx = (item: SavedOutput) => {
+    const safeTitle = escapeHtml(item.title);
+    const safeTool = escapeHtml(item.toolName);
+    const safeContent = escapeHtml(item.content);
+    const safeOrg = escapeHtml(user.organizationProfile?.orgName || 'Client');
     // Generate standard HTML formatted document that Microsoft Word / Google Docs opens seamlessly as .doc / .docx
     const htmlContent = `
       <!DOCTYPE html>
       <html>
       <head>
         <meta charset="utf-8">
-        <title>${item.title}</title>
+        <title>${safeTitle}</title>
         <style>
           body { font-family: Calibri, Arial, sans-serif; line-height: 1.6; color: #111; padding: 40px; }
           h1, h2, h3 { color: #0f172a; margin-top: 24px; }
@@ -91,12 +103,12 @@ export const LibraryView: React.FC<LibraryViewProps> = ({ user, onOpenToolWithIn
         </style>
       </head>
       <body>
-        <h1>${item.title}</h1>
-        <p><em>Generated with Millennium Agency Launchpad (${item.toolName}) on ${new Date(item.createdAt).toLocaleDateString()}</em></p>
+        <h1>${safeTitle}</h1>
+        <p><em>Generated with Millennium Agency Launchpad (${safeTool}) on ${new Date(item.createdAt).toLocaleDateString()}</em></p>
         <hr/>
-        <div style="white-space: pre-wrap;">${item.content}</div>
+        <div style="white-space: pre-wrap;">${safeContent}</div>
         <div class="footer">
-          Generated for ${user.organizationProfile?.orgName || 'Client'} by Millennium Agency Launchpad • https://mill.agency
+          Generated for ${safeOrg} by Millennium Agency Launchpad • https://mill.agency
         </div>
       </body>
       </html>

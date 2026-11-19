@@ -223,51 +223,69 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
     });
   };
 
-  const handleGrantBonus = (userId: string, amount: number) => {
-    dataService.grantBonusGenerations(userId, amount);
-    refreshAll();
-    if (selectedUserDetail?.id === userId) {
-      setSelectedUserDetail(dataService.getUserById(userId));
-    }
-    notify(`Granted +${amount} bonus generations`);
-  };
-
-  const handleResetUserUsage = (userId: string) => {
-    dataService.resetUsage(userId);
-    refreshAll();
-    if (selectedUserDetail?.id === userId) {
-      setSelectedUserDetail(dataService.getUserById(userId));
-    }
-    notify('Monthly generation usage reset to 0');
-  };
-
-  const handleToggleNonprofitDiscount = (userId: string, current: boolean) => {
-    dataService.updateUser(userId, { nonprofitDiscountApproved: !current });
-    dataService.logAction('DISCOUNT_TOGGLED', `Admin toggled nonprofit 25% discount to ${!current}`, userId);
-    refreshAll();
-    if (selectedUserDetail?.id === userId) {
-      setSelectedUserDetail(dataService.getUserById(userId));
-    }
-    notify(`Nonprofit discount ${!current ? 'Approved (25% off)' : 'Revoked'}`);
-  };
-
-  const handleToggleSuspend = (userId: string, currentStatus: 'active' | 'suspended') => {
-    const nextStatus = currentStatus === 'active' ? 'suspended' : 'active';
-    dataService.updateUser(userId, { status: nextStatus });
-    dataService.logAction('USER_STATUS_CHANGE', `Admin changed user status to ${nextStatus}`, userId);
-    refreshAll();
-    if (selectedUserDetail?.id === userId) {
-      setSelectedUserDetail(dataService.getUserById(userId));
-    }
-    notify(`User account marked as ${nextStatus.toUpperCase()}`);
-  };
-
-  const handleDeleteUser = (userId: string) => {
-    if (window.confirm('Are you sure you want to delete this user and their saved outputs?')) {
-      dataService.deleteUser(userId);
+  const handleGrantBonus = async (userId: string, amount: number) => {
+    try {
+      const updated = await dataService.adminUserActionServer(userId, 'grant_bonus', amount);
       refreshAll();
-      setSelectedUserDetail(null);
-      notify('User deleted permanently.');
+      if (selectedUserDetail?.id === userId && updated) {
+        setSelectedUserDetail(updated);
+      }
+      notify(`Granted +${amount} bonus generations`);
+    } catch (err: any) {
+      notify(`Failed to grant bonus: ${err.message}`);
+    }
+  };
+
+  const handleResetUserUsage = async (userId: string) => {
+    try {
+      const updated = await dataService.adminUserActionServer(userId, 'reset_usage');
+      refreshAll();
+      if (selectedUserDetail?.id === userId && updated) {
+        setSelectedUserDetail(updated);
+      }
+      notify('Monthly generation usage reset to 0');
+    } catch (err: any) {
+      notify(`Failed to reset usage: ${err.message}`);
+    }
+  };
+
+  const handleToggleNonprofitDiscount = async (userId: string, current: boolean) => {
+    try {
+      const updated = await dataService.adminUserActionServer(userId, 'toggle_discount');
+      refreshAll();
+      if (selectedUserDetail?.id === userId && updated) {
+        setSelectedUserDetail(updated);
+      }
+      notify(`Nonprofit discount ${!current ? 'Approved (25% off)' : 'Revoked'}`);
+    } catch (err: any) {
+      notify(`Failed to toggle discount: ${err.message}`);
+    }
+  };
+
+  const handleToggleSuspend = async (userId: string, currentStatus: 'active' | 'suspended') => {
+    const nextStatus = currentStatus === 'active' ? 'suspended' : 'active';
+    try {
+      const updated = await dataService.adminUserActionServer(userId, 'toggle_status');
+      refreshAll();
+      if (selectedUserDetail?.id === userId && updated) {
+        setSelectedUserDetail(updated);
+      }
+      notify(`User account marked as ${nextStatus.toUpperCase()}`);
+    } catch (err: any) {
+      notify(`Failed to update status: ${err.message}`);
+    }
+  };
+
+  const handleDeleteUser = async (userId: string) => {
+    if (window.confirm('Are you sure you want to delete this user and their saved outputs?')) {
+      try {
+        await dataService.adminUserActionServer(userId, 'delete_user');
+        refreshAll();
+        setSelectedUserDetail(null);
+        notify('User deleted permanently.');
+      } catch (err: any) {
+        notify(`Failed to delete user: ${err.message}`);
+      }
     }
   };
 
@@ -346,31 +364,20 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
     notify('Access rule deleted.');
   };
 
-  const handleDirectInvite = (e: React.FormEvent) => {
+  const handleDirectInvite = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!inviteEmail || !inviteName) return;
 
-    dataService.createUser({
-      name: inviteName,
-      email: inviteEmail,
-      role: 'member',
-      planId: 'free',
-      organizationProfile: {
-        orgName: `${inviteName}'s Org`,
-        type: inviteOrgType,
-        whatTheyDo: 'Invited team member account',
-        targetAudience: 'Clients & partners',
-        goals: ['Complete initial marketing foundations'],
-        brandTone: ['Professional', 'Inspiring'],
-        budget: 'Under $500/month',
-      },
-    });
-
-    dataService.logAction('ADMIN_INVITE', `Admin directly invited ${inviteName} (${inviteEmail})`);
-    setInviteName('');
-    setInviteEmail('');
-    refreshAll();
-    notify(`Invited ${inviteEmail} to Launchpad`);
+    try {
+      await dataService.createInvite(inviteEmail, `Direct invite for ${inviteName} (${inviteOrgType})`);
+      setInviteName('');
+      setInviteEmail('');
+      await refreshInvites();
+      refreshAll();
+      notify(`Created complimentary invite for ${inviteEmail}`);
+    } catch (err: any) {
+      notify(`Failed to invite ${inviteEmail}: ${err.message}`);
+    }
   };
 
   /* =========================================================================

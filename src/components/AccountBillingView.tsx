@@ -329,11 +329,15 @@ export const AccountBillingView: React.FC<AccountBillingViewProps> = ({
 
   const handleCancelSubscription = async () => {
     if (window.confirm('Are you sure you want to cancel your subscription? You will be reverted to the Free plan at the end of your billing cycle.')) {
-      await billingService.cancelSubscription(user.id);
-      const fresh = dataService.getUserById(user.id);
-      if (fresh) onUserUpdated(fresh);
-      refreshActivities();
-      setFeedbackMsg('Subscription canceled. Your account has returned to the Free Starter tier.');
+      try {
+        await billingService.cancelSubscription(user.id);
+        const fresh = dataService.getUserById(user.id);
+        if (fresh) onUserUpdated(fresh);
+        refreshActivities();
+        setFeedbackMsg('Subscription canceled. Your account has returned to the Free Starter tier.');
+      } catch (err: any) {
+        setFeedbackMsg(err?.message || 'Unable to modify subscription from client.');
+      }
     }
   };
 
@@ -372,9 +376,13 @@ export const AccountBillingView: React.FC<AccountBillingViewProps> = ({
     refreshActivities();
   };
 
-  const handleDeleteAccount = () => {
-    dataService.deleteUser(user.id);
-    authService.signOut();
+  const handleDeleteAccount = async () => {
+    try {
+      await dataService.deleteOwnAccountServer();
+      await authService.signOut();
+    } catch (err: any) {
+      setFeedbackMsg(err?.message || 'Failed to delete account. Please try again.');
+    }
   };
 
   const renderActivityIcon = (iconType: ActivityClassification['iconType']) => {

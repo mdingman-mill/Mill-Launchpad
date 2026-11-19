@@ -3,6 +3,7 @@ process.env.SERVERLESS = 'true';
 import {
   handleHealthCheck,
   handleAuthSync,
+  handleDeleteOwnAccount,
   handleGetInvites,
   handleCreateInvite,
   handleRevokeInvite,
@@ -10,6 +11,7 @@ import {
   handleAcceptInvite,
   handleUpdateUserPlan,
   handleUpdateUserRole,
+  handleAdminUserAction,
   handleGeminiGenerate,
   getCorsHeaders,
 } from '../../server';
@@ -60,6 +62,15 @@ export default async (req: Request): Promise<Response> => {
       });
     }
 
+    // 2b. Self-service account deletion
+    if (method === 'POST' && pathname === '/api/account/delete') {
+      const result = await handleDeleteOwnAccount(authHeader);
+      return new Response(JSON.stringify(result.data), {
+        status: result.status,
+        headers: { 'Content-Type': 'application/json', ...corsHeaders },
+      });
+    }
+
     // 3. List invites (super admins only)
     if (method === 'GET' && pathname === '/api/invites') {
       const result = await handleGetInvites(authHeader);
@@ -82,7 +93,7 @@ export default async (req: Request): Promise<Response> => {
     // 5. Revoke invite: /api/invites/:id/revoke
     const revokeMatch = pathname.match(/^\/api\/invites\/([^/]+)\/revoke$/);
     if (method === 'POST' && revokeMatch) {
-      const inviteId = revokeMatch[1];
+      const inviteId = decodeURIComponent(revokeMatch[1]);
       const result = await handleRevokeInvite(authHeader, inviteId);
       return new Response(JSON.stringify(result.data), {
         status: result.status,
@@ -93,7 +104,7 @@ export default async (req: Request): Promise<Response> => {
     // 6. Accept invite: /api/invites/:id/accept
     const acceptMatch = pathname.match(/^\/api\/invites\/([^/]+)\/accept$/);
     if (method === 'POST' && acceptMatch) {
-      const inviteId = acceptMatch[1];
+      const inviteId = decodeURIComponent(acceptMatch[1]);
       const result = await handleAcceptInvite(authHeader, inviteId);
       return new Response(JSON.stringify(result.data), {
         status: result.status,
@@ -104,8 +115,8 @@ export default async (req: Request): Promise<Response> => {
     // 7. Get single invite: /api/invites/:id
     const getInviteMatch = pathname.match(/^\/api\/invites\/([^/]+)$/);
     if (method === 'GET' && getInviteMatch) {
-      const inviteId = getInviteMatch[1];
-      const result = await handleGetInvite(inviteId);
+      const inviteId = decodeURIComponent(getInviteMatch[1]);
+      const result = await handleGetInvite(inviteId, authHeader);
       return new Response(JSON.stringify(result.data), {
         status: result.status,
         headers: { 'Content-Type': 'application/json', ...corsHeaders },
@@ -115,7 +126,7 @@ export default async (req: Request): Promise<Response> => {
     // 8. Super admin update user plan: /api/admin/users/:userId/plan
     const userPlanMatch = pathname.match(/^\/api\/admin\/users\/([^/]+)\/plan$/);
     if (method === 'POST' && userPlanMatch) {
-      const userId = userPlanMatch[1];
+      const userId = decodeURIComponent(userPlanMatch[1]);
       const body = await req.json().catch(() => ({}));
       const result = await handleUpdateUserPlan(authHeader, userId, body?.planId);
       return new Response(JSON.stringify(result.data), {
@@ -127,9 +138,21 @@ export default async (req: Request): Promise<Response> => {
     // 9. Super admin update user role: /api/admin/users/:userId/role
     const userRoleMatch = pathname.match(/^\/api\/admin\/users\/([^/]+)\/role$/);
     if (method === 'POST' && userRoleMatch) {
-      const userId = userRoleMatch[1];
+      const userId = decodeURIComponent(userRoleMatch[1]);
       const body = await req.json().catch(() => ({}));
       const result = await handleUpdateUserRole(authHeader, userId, body?.role);
+      return new Response(JSON.stringify(result.data), {
+        status: result.status,
+        headers: { 'Content-Type': 'application/json', ...corsHeaders },
+      });
+    }
+
+    // 9b. Super admin privileged user action: /api/admin/users/:userId/action
+    const userActionMatch = pathname.match(/^\/api\/admin\/users\/([^/]+)\/action$/);
+    if (method === 'POST' && userActionMatch) {
+      const userId = decodeURIComponent(userActionMatch[1]);
+      const body = await req.json().catch(() => ({}));
+      const result = await handleAdminUserAction(authHeader, userId, body);
       return new Response(JSON.stringify(result.data), {
         status: result.status,
         headers: { 'Content-Type': 'application/json', ...corsHeaders },

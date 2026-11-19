@@ -1,6 +1,7 @@
 import { signInWithPopup, signOut as firebaseSignOut, onAuthStateChanged, User as FirebaseUser } from 'firebase/auth';
 import { auth, googleProvider } from '../firebase';
 import { User } from '../types';
+import { dataService } from './dataService';
 
 type AuthListener = (user: User | null) => void;
 
@@ -21,12 +22,15 @@ class AuthService {
         try {
           const user = await this.syncWithBackend(fbUser);
           this.currentUser = user;
+          dataService.setCachedUser(user);
+          dataService.refreshLocalCache().catch(() => {});
         } catch (error) {
           console.error('[Auth Service] Backend sync failed on state change:', error);
           this.currentUser = null;
         }
       } else {
         this.currentUser = null;
+        dataService.clearCache();
       }
 
       this.isAuthReady = true;
@@ -97,6 +101,8 @@ class AuthService {
     const userCredential = await signInWithPopup(auth, googleProvider);
     const user = await this.syncWithBackend(userCredential.user);
     this.currentUser = user;
+    dataService.setCachedUser(user);
+    dataService.refreshLocalCache().catch(() => {});
     this.notify();
     return user;
   }
@@ -107,6 +113,7 @@ class AuthService {
   public async signOut(): Promise<void> {
     await firebaseSignOut(auth);
     this.currentUser = null;
+    dataService.clearCache();
     this.notify();
   }
 

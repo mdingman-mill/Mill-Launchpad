@@ -82,22 +82,30 @@ export const ALLOWED_ORIGINS = [
   ...(process.env.APP_URL ? [process.env.APP_URL.trim().replace(/\/$/, '')] : []),
 ];
 
+function isLocalDevOrigin(originUrl: string): boolean {
+  if (process.env.NODE_ENV === 'production' || process.env.NETLIFY === 'true' || process.env.CONTEXT === 'production') {
+    return false;
+  }
+  try {
+    const parsed = new URL(originUrl);
+    return parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1';
+  } catch {
+    return false;
+  }
+}
+
 export function getCorsHeaders(requestOrigin?: string | null): Record<string, string> {
   let matchedOrigin = '';
   if (requestOrigin) {
     const cleaned = requestOrigin.trim().replace(/\/$/, '');
-    if (
-      ALLOWED_ORIGINS.includes(cleaned) ||
-      process.env.NODE_ENV !== 'production' ||
-      cleaned.includes('localhost') ||
-      cleaned.includes('127.0.0.1')
-    ) {
-      matchedOrigin = requestOrigin;
+    if (ALLOWED_ORIGINS.includes(cleaned) || isLocalDevOrigin(cleaned)) {
+      matchedOrigin = cleaned;
     }
   }
-  const allowOrigin = matchedOrigin || (ALLOWED_ORIGINS[0] || '*');
+  const allowOrigin = matchedOrigin || (ALLOWED_ORIGINS[0] || 'https://launchpad.mill.agency');
   return {
     'Access-Control-Allow-Origin': allowOrigin,
+    'Vary': 'Origin',
     'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Requested-With',
     'Access-Control-Allow-Credentials': 'true',
@@ -118,24 +126,77 @@ export function getNextMonthFirstDay(fromDate: Date = new Date()): string {
   return `${y}-${m}-01`;
 }
 
+class HttpError extends Error {
+  status: number;
+  constructor(status: number, message: string) {
+    super(message);
+    this.status = status;
+  }
+}
+
+function isValidFirestoreId(id: unknown): id is string {
+  return typeof id === 'string' && id.length > 0 && id.length <= 128 && /^[a-zA-Z0-9_\-.]+$/.test(id);
+}
+
+function maskEmailAddress(email: string): string {
+  const clean = (email || '').trim();
+  const atIdx = clean.indexOf('@');
+  if (atIdx <= 0) return '***';
+  const local = clean.slice(0, atIdx);
+  const domain = clean.slice(atIdx + 1);
+  const visible = local.length > 2 ? local.slice(0, 2) : local.slice(0, 1);
+  return `${visible}***@${domain}`;
+}
+
+function truncateString(val: unknown, maxLen: number): string {
+  if (val === null || val === undefined) return '';
+  return String(val).slice(0, maxLen);
+}
+
+const VALID_TOOL_IDS = new Set([
+  'brand-foundations',
+  'messaging-builder',
+  '90-day-plan',
+  'social-generator',
+  'email-writer',
+  'website-copy',
+  'donor-appeal',
+  'pitch-launch',
+  'keywords-content',
+]);
+
 // Token verification helper
 export async function verifyFirebaseTokenFromHeader(
   authHeader?: string | null
-): Promise<{ uid: string; email?: string; name?: string; picture?: string }> {
+): Promise<{ uid: string; email?: string; emailVerified: boolean; name?: string; picture?: string }> {
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    throw new Error('Missing or invalid Authorization header');
+    throw new HttpError(401, 'Unauthorized: Missing or invalid Authorization header');
   }
   const token = authHeader.split('Bearer ')[1]?.trim();
   if (!token) {
-    throw new Error('Empty bearer token');
+    throw new HttpError(401, 'Unauthorized: Empty bearer token');
   }
-  const decoded = await adminAuth.verifyIdToken(token);
-  return {
-    uid: decoded.uid,
-    email: decoded.email,
-    name: decoded.name,
-    picture: decoded.picture,
-  };
+  try {
+    const decoded = await adminAuth.verifyIdToken(token);
+    return {
+      uid: decoded.uid,
+      email: decoded.email,
+      emailVerified: decoded.email_verified === true,
+      name: decoded.name,
+      picture: decoded.picture,
+    };
+  } catch {
+    throw new HttpError(401, 'Unauthorized: Invalid or expired Firebase ID token');
+  }
+}
+
+async function requireSuperAdmin(authHeader?: string | null) {
+  const verified = await verifyFirebaseTokenFromHeader(authHeader);
+  const email = (verified.email || '').trim().toLowerCase();
+  if (!verified.emailVerified || !email || !SUPER_ADMIN_EMAILS.includes(email)) {
+    throw new HttpError(403, 'Forbidden: Super admin privileges required');
+  }
+  return verified;
 }
 
 // Server-side Gemini initialization
@@ -187,8 +248,8 @@ export async function handleHealthCheck(): Promise<{ status: number; data: any }
 export async function handleAuthSync(authHeader?: string | null): Promise<{ status: number; data: any }> {
   try {
     const verified = await verifyFirebaseTokenFromHeader(authHeader);
-    const email = (verified.email || '').toLowerCase();
-    const isSuperAdmin = SUPER_ADMIN_EMAILS.includes(email);
+    const email = (verified.email || '').trim().toLowerCase();
+    const isSuperAdmin = verified.emailVerified && !!email && SUPER_ADMIN_EMAILS.includes(email);
     const role = isSuperAdmin ? 'super_admin' : 'member';
 
     const now = new Date().toISOString();
@@ -199,12 +260,17 @@ export async function handleAuthSync(authHeader?: string | null): Promise<{ stat
       const snap = await userRef.get();
       if (snap.exists) {
         const existing = snap.data()!;
+        const resolvedRole = isSuperAdmin
+          ? 'super_admin'
+          : existing.role === 'super_admin'
+          ? 'member'
+          : existing.role || role;
         userData = {
           ...existing,
-          email: verified.email || existing.email,
+          email: email || (existing.email ? String(existing.email).trim().toLowerCase() : ''),
           name: verified.name || existing.name || email.split('@')[0],
           avatar: verified.picture || existing.avatar,
-          role: isSuperAdmin ? 'super_admin' : existing.role === 'super_admin' ? 'super_admin' : role,
+          role: resolvedRole,
           lastLogin: now,
         };
         await userRef.set(userData, { merge: true });
@@ -216,7 +282,7 @@ export async function handleAuthSync(authHeader?: string | null): Promise<{ stat
     if (!userData) {
       userData = {
         id: verified.uid,
-        email: verified.email || '',
+        email,
         name: verified.name || email.split('@')[0] || 'User',
         avatar:
           verified.picture ||
@@ -238,36 +304,48 @@ export async function handleAuthSync(authHeader?: string | null): Promise<{ stat
       }
     }
 
-    // Check for pending, unexpired invite matching user's exact email
-    try {
-      const inviteSnap = await adminDb
-        .collection('invites')
-        .where('email', '==', email)
-        .where('status', '==', 'pending')
-        .get();
+    // Check for pending, unexpired invite matching user's exact verified email
+    if (verified.emailVerified && email && userData.status !== 'suspended') {
+      try {
+        const inviteSnap = await adminDb
+          .collection('invites')
+          .where('email', '==', email)
+          .where('status', '==', 'pending')
+          .get();
 
-      if (!inviteSnap.empty) {
-        for (const doc of inviteSnap.docs) {
-          const inv = doc.data();
-          const expiresAt = inv.expiresAt;
-          if (expiresAt && new Date(expiresAt).getTime() <= Date.now()) {
-            await doc.ref.update({ status: 'expired' });
-          } else {
-            userData.planId = 'complimentary';
-            await userRef.set({ planId: 'complimentary', updatedAt: now }, { merge: true });
-            await doc.ref.update({
-              status: 'accepted',
-              acceptedAt: now,
-              acceptedBy: verified.uid,
-            });
-            await logServerAudit('INVITE_ACCEPTED', `Accepted complimentary access invite for ${email}`, verified, verified.uid);
-            await logServerAudit('PLAN_CHANGED', `Plan changed to complimentary for ${email} via invite`, verified, verified.uid);
-            break;
+        if (!inviteSnap.empty) {
+          for (const docSnap of inviteSnap.docs) {
+            const inv = docSnap.data();
+            const expiresAt = inv.expiresAt;
+            if (expiresAt && new Date(expiresAt).getTime() <= Date.now()) {
+              await docSnap.ref.update({ status: 'expired' });
+            } else {
+              const claimed = await adminDb.runTransaction(async (tx) => {
+                const freshInv = await tx.get(docSnap.ref);
+                if (!freshInv.exists || freshInv.data()?.status !== 'pending') {
+                  return false;
+                }
+                tx.set(userRef, { planId: 'complimentary', updatedAt: now }, { merge: true });
+                tx.update(docSnap.ref, {
+                  status: 'accepted',
+                  acceptedAt: now,
+                  acceptedBy: verified.uid,
+                });
+                return true;
+              });
+
+              if (claimed) {
+                userData.planId = 'complimentary';
+                await logServerAudit('INVITE_ACCEPTED', `Accepted complimentary access invite for ${email}`, verified, verified.uid);
+                await logServerAudit('PLAN_CHANGED', `Plan changed to complimentary for ${email} via invite`, verified, verified.uid);
+                break;
+              }
+            }
           }
         }
+      } catch (invErr: any) {
+        console.warn('[Invite Check Warning]:', invErr.message);
       }
-    } catch (invErr: any) {
-      console.warn('[Invite Check Warning]:', invErr.message);
     }
 
     if (isSuperAdmin) {
@@ -275,7 +353,7 @@ export async function handleAuthSync(authHeader?: string | null): Promise<{ stat
         await adminDb.collection('admins').doc(verified.uid).set(
           {
             id: verified.uid,
-            email: verified.email,
+            email,
             role: 'super_admin',
             createdAt: now,
           },
@@ -284,37 +362,35 @@ export async function handleAuthSync(authHeader?: string | null): Promise<{ stat
       } catch (e: any) {
         console.warn('[Firestore Admin Registry Write Warning]:', e.message);
       }
+    } else {
+      await adminDb.collection('admins').doc(verified.uid).delete().catch(() => {});
     }
 
     return { status: 200, data: { user: userData } };
   } catch (err: any) {
     console.error('[Auth Sync Error]', err.message);
-    return { status: 401, data: { error: 'Unauthorized: Firebase ID token verification failed' } };
+    return { status: err.status || 401, data: { error: err.message || 'Unauthorized: Firebase ID token verification failed' } };
   }
 }
 
 // 3. List invites (super admins only)
 export async function handleGetInvites(authHeader?: string | null): Promise<{ status: number; data: any }> {
   try {
-    const verified = await verifyFirebaseTokenFromHeader(authHeader);
-    const email = (verified.email || '').toLowerCase();
-    if (!SUPER_ADMIN_EMAILS.includes(email)) {
-      return { status: 403, data: { error: 'Forbidden: Super admin privileges required' } };
-    }
+    await requireSuperAdmin(authHeader);
 
     const snap = await adminDb.collection('invites').get();
     const invites: any[] = [];
     const now = Date.now();
 
-    for (const doc of snap.docs) {
-      const data = doc.data();
+    for (const docSnap of snap.docs) {
+      const data = docSnap.data();
       let status = data.status || 'pending';
       if (status === 'pending' && data.expiresAt && new Date(data.expiresAt).getTime() <= now) {
         status = 'expired';
-        await doc.ref.update({ status: 'expired' });
+        await docSnap.ref.update({ status: 'expired' });
       }
       invites.push({
-        id: doc.id,
+        id: docSnap.id,
         ...data,
         status,
       });
@@ -323,7 +399,7 @@ export async function handleGetInvites(authHeader?: string | null): Promise<{ st
     invites.sort((a, b) => new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime());
     return { status: 200, data: { invites } };
   } catch (err: any) {
-    return { status: 500, data: { error: err.message } };
+    return { status: err.status || 500, data: { error: err.message } };
   }
 }
 
@@ -333,18 +409,23 @@ export async function handleCreateInvite(
   body: any
 ): Promise<{ status: number; data: any }> {
   try {
-    const verified = await verifyFirebaseTokenFromHeader(authHeader);
-    const superAdminEmail = (verified.email || '').toLowerCase();
-    if (!SUPER_ADMIN_EMAILS.includes(superAdminEmail)) {
-      return { status: 403, data: { error: 'Forbidden: Super admin privileges required' } };
-    }
+    const verified = await requireSuperAdmin(authHeader);
 
     const { email, note, expiresAt } = body || {};
-    if (!email || typeof email !== 'string' || !email.includes('@')) {
+    const cleanEmail = typeof email === 'string' ? email.trim().toLowerCase() : '';
+    if (!cleanEmail || cleanEmail.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) {
       return { status: 400, data: { error: 'Valid email address is required' } };
     }
 
-    const cleanEmail = email.trim().toLowerCase();
+    let parsedExpiresAt: string | null = null;
+    if (expiresAt) {
+      const d = new Date(expiresAt);
+      if (isNaN(d.getTime())) {
+        return { status: 400, data: { error: 'Invalid expiration date' } };
+      }
+      parsedExpiresAt = d.toISOString();
+    }
+
     const now = new Date().toISOString();
     const inviteRef = adminDb.collection('invites').doc();
 
@@ -356,21 +437,21 @@ export async function handleCreateInvite(
       createdBy: verified.uid,
       createdByEmail: verified.email || '',
       createdAt: now,
-      expiresAt: expiresAt ? new Date(expiresAt).toISOString() : null,
-      note: note ? String(note).trim() : '',
+      expiresAt: parsedExpiresAt,
+      note: note ? String(note).trim().slice(0, 500) : '',
     };
 
     await inviteRef.set(inviteData);
 
     await logServerAudit(
       'INVITE_CREATED',
-      `Created complimentary access invite for ${cleanEmail}${expiresAt ? ` (expires ${expiresAt})` : ''}`,
+      `Created complimentary access invite for ${cleanEmail}${parsedExpiresAt ? ` (expires ${parsedExpiresAt})` : ''}`,
       verified
     );
 
     return { status: 200, data: { invite: inviteData } };
   } catch (err: any) {
-    return { status: 500, data: { error: err.message } };
+    return { status: err.status || 500, data: { error: err.message } };
   }
 }
 
@@ -380,13 +461,9 @@ export async function handleRevokeInvite(
   inviteId?: string
 ): Promise<{ status: number; data: any }> {
   try {
-    if (!inviteId) {
-      return { status: 400, data: { error: 'Invite ID is required' } };
-    }
-    const verified = await verifyFirebaseTokenFromHeader(authHeader);
-    const superAdminEmail = (verified.email || '').toLowerCase();
-    if (!SUPER_ADMIN_EMAILS.includes(superAdminEmail)) {
-      return { status: 403, data: { error: 'Forbidden: Super admin privileges required' } };
+    const verified = await requireSuperAdmin(authHeader);
+    if (!isValidFirestoreId(inviteId)) {
+      return { status: 400, data: { error: 'Valid Invite ID is required' } };
     }
 
     const inviteRef = adminDb.collection('invites').doc(inviteId);
@@ -405,24 +482,48 @@ export async function handleRevokeInvite(
     });
 
     // Revoking an invite moves an accepted user back to the free plan
-    const userQuery = await adminDb
-      .collection('users')
-      .where('email', '==', invData.email.toLowerCase())
-      .get();
+    const targetEmail = (invData.email || '').trim().toLowerCase();
+    const revertedUserIds = new Set<string>();
 
-    for (const uDoc of userQuery.docs) {
-      const uData = uDoc.data();
-      if (uData.planId === 'complimentary') {
-        await uDoc.ref.update({
+    if (invData.acceptedBy && isValidFirestoreId(invData.acceptedBy)) {
+      const acceptedUserRef = adminDb.collection('users').doc(invData.acceptedBy);
+      const acceptedSnap = await acceptedUserRef.get();
+      if (acceptedSnap.exists && acceptedSnap.data()?.planId === 'complimentary') {
+        await acceptedUserRef.update({
           planId: 'free',
           updatedAt: now,
         });
+        revertedUserIds.add(acceptedSnap.id);
         await logServerAudit(
           'PLAN_CHANGED',
-          `Plan reverted to free due to invite revocation for ${invData.email}`,
+          `Plan reverted to free due to invite revocation for ${targetEmail}`,
           verified,
-          uDoc.id
+          acceptedSnap.id
         );
+      }
+    }
+
+    if (targetEmail) {
+      const userQuery = await adminDb
+        .collection('users')
+        .where('email', '==', targetEmail)
+        .get();
+
+      for (const uDoc of userQuery.docs) {
+        if (revertedUserIds.has(uDoc.id)) continue;
+        const uData = uDoc.data();
+        if (uData.planId === 'complimentary') {
+          await uDoc.ref.update({
+            planId: 'free',
+            updatedAt: now,
+          });
+          await logServerAudit(
+            'PLAN_CHANGED',
+            `Plan reverted to free due to invite revocation for ${targetEmail}`,
+            verified,
+            uDoc.id
+          );
+        }
       }
     }
 
@@ -430,15 +531,18 @@ export async function handleRevokeInvite(
 
     return { status: 200, data: { success: true } };
   } catch (err: any) {
-    return { status: 500, data: { error: err.message } };
+    return { status: err.status || 500, data: { error: err.message } };
   }
 }
 
-// 6. Get single invite details
-export async function handleGetInvite(inviteId?: string): Promise<{ status: number; data: any }> {
+// 6. Get single invite details (masks email and hides note unless caller matches or is super admin)
+export async function handleGetInvite(
+  inviteId?: string,
+  authHeader?: string | null
+): Promise<{ status: number; data: any }> {
   try {
-    if (!inviteId) {
-      return { status: 400, data: { error: 'Invite ID is required' } };
+    if (!isValidFirestoreId(inviteId)) {
+      return { status: 400, data: { error: 'Valid Invite ID is required' } };
     }
     const inviteRef = adminDb.collection('invites').doc(inviteId);
     const snap = await inviteRef.get();
@@ -453,15 +557,28 @@ export async function handleGetInvite(inviteId?: string): Promise<{ status: numb
       status = 'expired';
     }
 
+    let canViewFullDetails = false;
+    if (authHeader && authHeader.startsWith('Bearer ')) {
+      try {
+        const caller = await verifyFirebaseTokenFromHeader(authHeader);
+        const callerEmail = (caller.email || '').trim().toLowerCase();
+        const isCallerAdmin = caller.emailVerified && !!callerEmail && SUPER_ADMIN_EMAILS.includes(callerEmail);
+        const isMatchingInvitee = caller.emailVerified && !!callerEmail && callerEmail === (data.email || '').trim().toLowerCase();
+        canViewFullDetails = isCallerAdmin || isMatchingInvitee;
+      } catch {
+        canViewFullDetails = false;
+      }
+    }
+
     return {
       status: 200,
       data: {
         invite: {
           id: snap.id,
-          email: data.email,
+          email: canViewFullDetails ? data.email : maskEmailAddress(data.email || ''),
           plan: data.plan,
           status,
-          note: data.note,
+          ...(canViewFullDetails && data.note ? { note: data.note } : {}),
           expiresAt: data.expiresAt,
           createdAt: data.createdAt,
         },
@@ -472,58 +589,74 @@ export async function handleGetInvite(inviteId?: string): Promise<{ status: numb
   }
 }
 
-// 7. Accept invite via link
+// 7. Accept invite via link (transactional, prevents replay on accepted/expired/revoked invites)
 export async function handleAcceptInvite(
   authHeader: string | null | undefined,
   inviteId?: string
 ): Promise<{ status: number; data: any }> {
   try {
-    if (!inviteId) {
-      return { status: 400, data: { error: 'Invite ID is required' } };
+    if (!isValidFirestoreId(inviteId)) {
+      return { status: 400, data: { error: 'Valid Invite ID is required' } };
     }
     const verified = await verifyFirebaseTokenFromHeader(authHeader);
-    const userEmail = (verified.email || '').toLowerCase();
+    const userEmail = (verified.email || '').trim().toLowerCase();
+    if (!verified.emailVerified || !userEmail) {
+      return { status: 403, data: { error: 'A verified email address is required to claim an invitation.' } };
+    }
 
     const inviteRef = adminDb.collection('invites').doc(inviteId);
-    const snap = await inviteRef.get();
-    if (!snap.exists) {
-      return { status: 404, data: { error: 'Invite not found' } };
-    }
-
-    const invData = snap.data()!;
-    if (invData.email.toLowerCase() !== userEmail) {
-      return {
-        status: 403,
-        data: {
-          error: `This invite was sent to ${invData.email}. You are signed in as ${userEmail}. Please sign in with the invited email address.`,
-        },
-      };
-    }
-
-    const now = new Date().toISOString();
-    if (invData.expiresAt && new Date(invData.expiresAt).getTime() <= Date.now()) {
-      await inviteRef.update({ status: 'expired' });
-      return { status: 400, data: { error: 'This invitation has expired.' } };
-    }
-
-    if (invData.status === 'revoked') {
-      return { status: 400, data: { error: 'This invitation has been revoked.' } };
-    }
-
-    // Set user's plan to complimentary
     const userRef = adminDb.collection('users').doc(verified.uid);
-    await userRef.set(
-      {
-        planId: 'complimentary',
-        updatedAt: now,
-      },
-      { merge: true }
-    );
+    const now = new Date().toISOString();
 
-    await inviteRef.update({
-      status: 'accepted',
-      acceptedAt: now,
-      acceptedBy: verified.uid,
+    await adminDb.runTransaction(async (tx) => {
+      const snap = await tx.get(inviteRef);
+      if (!snap.exists) {
+        throw new HttpError(404, 'Invite not found');
+      }
+
+      const invData = snap.data()!;
+      const invEmail = (invData.email || '').trim().toLowerCase();
+      if (invEmail !== userEmail) {
+        throw new HttpError(
+          403,
+          `This invite was sent to another email address. You are signed in as ${userEmail}. Please sign in with the invited email address.`
+        );
+      }
+
+      if (invData.status === 'revoked') {
+        throw new HttpError(400, 'This invitation has been revoked.');
+      }
+
+      if (invData.status === 'expired' || (invData.expiresAt && new Date(invData.expiresAt).getTime() <= Date.now())) {
+        if (invData.status !== 'expired') {
+          tx.update(inviteRef, { status: 'expired' });
+        }
+        throw new HttpError(400, 'This invitation has expired.');
+      }
+
+      if (invData.status !== 'pending') {
+        throw new HttpError(400, 'This invitation has already been used or is no longer pending.');
+      }
+
+      const userSnap = await tx.get(userRef);
+      if (userSnap.exists && userSnap.data()?.status === 'suspended') {
+        throw new HttpError(403, 'Your account is currently suspended. Please contact support.');
+      }
+
+      tx.set(
+        userRef,
+        {
+          planId: 'complimentary',
+          updatedAt: now,
+        },
+        { merge: true }
+      );
+
+      tx.update(inviteRef, {
+        status: 'accepted',
+        acceptedAt: now,
+        acceptedBy: verified.uid,
+      });
     });
 
     await logServerAudit('INVITE_ACCEPTED', `User ${userEmail} accepted complimentary access invite ${inviteId}`, verified, verified.uid);
@@ -532,7 +665,7 @@ export async function handleAcceptInvite(
     const userSnap = await userRef.get();
     return { status: 200, data: { success: true, user: userSnap.data() } };
   } catch (err: any) {
-    return { status: 500, data: { error: err.message } };
+    return { status: err.status || 500, data: { error: err.message } };
   }
 }
 
@@ -543,13 +676,9 @@ export async function handleUpdateUserPlan(
   planId?: string
 ): Promise<{ status: number; data: any }> {
   try {
-    if (!userId) {
-      return { status: 400, data: { error: 'User ID is required' } };
-    }
-    const verified = await verifyFirebaseTokenFromHeader(authHeader);
-    const email = (verified.email || '').toLowerCase();
-    if (!SUPER_ADMIN_EMAILS.includes(email)) {
-      return { status: 403, data: { error: 'Forbidden: Super admin privileges required' } };
+    const verified = await requireSuperAdmin(authHeader);
+    if (!isValidFirestoreId(userId)) {
+      return { status: 400, data: { error: 'Valid User ID is required' } };
     }
 
     if (!planId || !['free', 'pro', 'team', 'complimentary'].includes(planId)) {
@@ -579,7 +708,7 @@ export async function handleUpdateUserPlan(
 
     return { status: 200, data: { success: true } };
   } catch (err: any) {
-    return { status: 500, data: { error: err.message } };
+    return { status: err.status || 500, data: { error: err.message } };
   }
 }
 
@@ -590,13 +719,9 @@ export async function handleUpdateUserRole(
   role?: string
 ): Promise<{ status: number; data: any }> {
   try {
-    if (!userId) {
-      return { status: 400, data: { error: 'User ID is required' } };
-    }
-    const verified = await verifyFirebaseTokenFromHeader(authHeader);
-    const email = (verified.email || '').toLowerCase();
-    if (!SUPER_ADMIN_EMAILS.includes(email)) {
-      return { status: 403, data: { error: 'Forbidden: Super admin privileges required' } };
+    const verified = await requireSuperAdmin(authHeader);
+    if (!isValidFirestoreId(userId)) {
+      return { status: 400, data: { error: 'Valid User ID is required' } };
     }
 
     if (!role || !['super_admin', 'member', 'admin', 'support'].includes(role)) {
@@ -641,7 +766,133 @@ export async function handleUpdateUserRole(
 
     return { status: 200, data: { success: true } };
   } catch (err: any) {
-    return { status: 500, data: { error: err.message } };
+    return { status: err.status || 500, data: { error: err.message } };
+  }
+}
+
+// 9b. Super admin privileged user management actions
+export async function handleAdminUserAction(
+  authHeader: string | null | undefined,
+  userId?: string,
+  body?: { action?: string; amount?: number }
+): Promise<{ status: number; data: any }> {
+  try {
+    const verified = await requireSuperAdmin(authHeader);
+    if (!isValidFirestoreId(userId)) {
+      return { status: 400, data: { error: 'Valid User ID is required' } };
+    }
+
+    const action = body?.action;
+    if (!action || !['grant_bonus', 'reset_usage', 'toggle_discount', 'toggle_status', 'delete_user'].includes(action)) {
+      return { status: 400, data: { error: 'Invalid admin action' } };
+    }
+
+    const userRef = adminDb.collection('users').doc(userId);
+    const now = new Date().toISOString();
+
+    if (action === 'grant_bonus') {
+      const amount = Number(body?.amount);
+      if (!Number.isInteger(amount) || amount < 1 || amount > 10000) {
+        return { status: 400, data: { error: 'Bonus amount must be an integer between 1 and 10000' } };
+      }
+      const result = await adminDb.runTransaction(async (tx) => {
+        const snap = await tx.get(userRef);
+        if (!snap.exists) throw new HttpError(404, 'User not found');
+        const currentBonus = Number(snap.data()?.bonusGenerations || 0);
+        const updatedBonus = currentBonus + amount;
+        tx.update(userRef, { bonusGenerations: updatedBonus, updatedAt: now });
+        return { ...snap.data(), bonusGenerations: updatedBonus };
+      });
+      await logServerAudit('BONUS_GENERATIONS_GRANTED', `Granted +${amount} bonus generations`, verified, userId);
+      return { status: 200, data: { success: true, user: result } };
+    }
+
+    if (action === 'reset_usage') {
+      const resetDate = getNextMonthFirstDay();
+      const result = await adminDb.runTransaction(async (tx) => {
+        const snap = await tx.get(userRef);
+        if (!snap.exists) throw new HttpError(404, 'User not found');
+        tx.update(userRef, { generationsUsedThisMonth: 0, billingResetDate: resetDate, updatedAt: now });
+        return { ...snap.data(), generationsUsedThisMonth: 0, billingResetDate: resetDate };
+      });
+      await logServerAudit('USAGE_RESET', 'Monthly generation usage reset to 0', verified, userId);
+      return { status: 200, data: { success: true, user: result } };
+    }
+
+    if (action === 'toggle_discount') {
+      const result = await adminDb.runTransaction(async (tx) => {
+        const snap = await tx.get(userRef);
+        if (!snap.exists) throw new HttpError(404, 'User not found');
+        const nextVal = !snap.data()?.nonprofitDiscountApproved;
+        tx.update(userRef, { nonprofitDiscountApproved: nextVal, updatedAt: now });
+        return { ...snap.data(), nonprofitDiscountApproved: nextVal };
+      });
+      await logServerAudit(
+        'DISCOUNT_TOGGLED',
+        `Admin toggled nonprofit 25% discount to ${result.nonprofitDiscountApproved}`,
+        verified,
+        userId
+      );
+      return { status: 200, data: { success: true, user: result } };
+    }
+
+    if (action === 'toggle_status') {
+      if (userId === verified.uid) {
+        return { status: 400, data: { error: 'Cannot suspend your own super admin account' } };
+      }
+      const result = await adminDb.runTransaction(async (tx) => {
+        const snap = await tx.get(userRef);
+        if (!snap.exists) throw new HttpError(404, 'User not found');
+        const nextStatus = snap.data()?.status === 'suspended' ? 'active' : 'suspended';
+        tx.update(userRef, { status: nextStatus, updatedAt: now });
+        return { ...snap.data(), status: nextStatus };
+      });
+      await logServerAudit('USER_STATUS_CHANGE', `Admin changed user status to ${result.status}`, verified, userId);
+      return { status: 200, data: { success: true, user: result } };
+    }
+
+    if (action === 'delete_user') {
+      if (userId === verified.uid) {
+        return { status: 400, data: { error: 'Cannot delete your own super admin account' } };
+      }
+      const snap = await userRef.get();
+      if (!snap.exists) {
+        return { status: 404, data: { error: 'User not found' } };
+      }
+      await userRef.delete();
+      await adminDb.collection('admins').doc(userId).delete().catch(() => {});
+      await logServerAudit('USER_DELETED', `Super admin deleted user ${snap.data()?.email || userId}`, verified, userId);
+      return { status: 200, data: { success: true } };
+    }
+
+    return { status: 400, data: { error: 'Unsupported action' } };
+  } catch (err: any) {
+    return { status: err.status || 500, data: { error: err.message } };
+  }
+}
+
+// 9c. Self-service account deletion
+export async function handleDeleteOwnAccount(authHeader?: string | null): Promise<{ status: number; data: any }> {
+  try {
+    const verified = await verifyFirebaseTokenFromHeader(authHeader);
+    const userRef = adminDb.collection('users').doc(verified.uid);
+    const orgRef = adminDb.collection('organizations').doc(`org_${verified.uid}`);
+
+    const outputsSnap = await orgRef.collection('outputs').get().catch(() => null);
+    if (outputsSnap && !outputsSnap.empty) {
+      const batch = adminDb.batch();
+      outputsSnap.docs.forEach((d) => batch.delete(d.ref));
+      await batch.commit();
+    }
+
+    await orgRef.delete().catch(() => {});
+    await userRef.delete().catch(() => {});
+    await adminDb.collection('admins').doc(verified.uid).delete().catch(() => {});
+
+    await logServerAudit('ACCOUNT_DELETED', `User ${verified.email || verified.uid} deleted their account`, verified, verified.uid);
+    return { status: 200, data: { success: true } };
+  } catch (err: any) {
+    return { status: err.status || 500, data: { error: err.message } };
   }
 }
 
@@ -670,6 +921,14 @@ export async function handleGeminiGenerate(
   }
 
   const userId = verifiedUser.uid;
+  const { toolId, toolName, organizationProfile, userInputs } = body || {};
+
+  if (!toolId || typeof toolId !== 'string' || !VALID_TOOL_IDS.has(toolId)) {
+    return {
+      errorStatus: 400,
+      errorData: { error: 'Invalid or unsupported marketing tool identifier.' },
+    };
+  }
 
   // 2. Per-user Rate Limiting (10 generations per minute)
   const now = Date.now();
@@ -695,10 +954,17 @@ export async function handleGeminiGenerate(
         userData = {
           id: userId,
           planId: 'free',
+          status: 'active',
           generationsUsedThisMonth: 0,
           bonusGenerations: 0,
           billingResetDate: getNextMonthFirstDay(),
         };
+      }
+
+      if (userData.status === 'suspended') {
+        const suspendedErr = new Error('Your account is currently suspended. Please contact support.');
+        (suspendedErr as any).status = 403;
+        throw suspendedErr;
       }
 
       const planId = userData.planId || 'free';
@@ -733,7 +999,7 @@ export async function handleGeminiGenerate(
     });
   } catch (txErr: any) {
     if (txErr.status === 403 || txErr.message?.includes('Monthly generation quota reached')) {
-      console.warn(`[Quota Blocked] User ${userId} exceeded monthly generation limit.`);
+      console.warn(`[Access/Quota Blocked] User ${userId}: ${txErr.message}`);
       return {
         errorStatus: 403,
         errorData: { error: txErr.message },
@@ -750,16 +1016,29 @@ export async function handleGeminiGenerate(
   userTimestamps.push(now);
   rateLimitMap.set(userId, userTimestamps);
 
-  const { toolId, toolName, organizationProfile, userInputs } = body || {};
-  console.log(`[Gemini Request] Started generation for "${toolName}" (${toolId}) by user ${userId} at ${new Date().toISOString()}`);
+  const safeToolName = truncateString(toolName || toolId, 120);
+  console.log(`[Gemini Request] Started generation for "${safeToolName}" (${toolId}) by user ${userId} at ${new Date().toISOString()}`);
 
-  const orgName = organizationProfile?.orgName || 'Our Organization';
-  const orgType = organizationProfile?.type || 'Startup';
-  const whatTheyDo = organizationProfile?.whatTheyDo || '';
-  const audience = organizationProfile?.targetAudience || '';
-  const goals = organizationProfile?.goals || [];
-  const brandTone = organizationProfile?.brandTone?.join(', ') || 'Professional, Inspiring';
-  const budget = organizationProfile?.budget || 'Under $500/month';
+  const orgName = truncateString(organizationProfile?.orgName || 'Our Organization', 200);
+  const orgType = truncateString(organizationProfile?.type || 'Startup', 50);
+  const whatTheyDo = truncateString(organizationProfile?.whatTheyDo || '', 2000);
+  const audience = truncateString(organizationProfile?.targetAudience || '', 1000);
+  const goals = Array.isArray(organizationProfile?.goals)
+    ? organizationProfile.goals.slice(0, 20).map((g: unknown) => truncateString(g, 300))
+    : truncateString(organizationProfile?.goals || '', 1000);
+  const brandTone = Array.isArray(organizationProfile?.brandTone)
+    ? organizationProfile.brandTone.slice(0, 10).map((t: unknown) => truncateString(t, 60)).join(', ') || 'Professional, Inspiring'
+    : 'Professional, Inspiring';
+  const budget = truncateString(organizationProfile?.budget || 'Under $500/month', 200);
+  const sanitizedUserInputs =
+    userInputs && typeof userInputs === 'object'
+      ? Object.entries(userInputs)
+          .slice(0, 20)
+          .reduce<Record<string, string>>((acc, [k, v]) => {
+            acc[truncateString(k, 100)] = truncateString(v, 4000);
+            return acc;
+          }, {})
+      : {};
 
   const systemInstruction = `You are the Senior Marketing Strategist and Creative Director at Millennium Agency (mill.agency), an elite branding and growth agency.
 You are generating real, production-ready, custom marketing assets for "${orgName}", a ${orgType}.
@@ -848,7 +1127,7 @@ Include sender notes and preview text for each email.`,
   const guide = toolPromptGuides[toolId] || 'Please produce a thorough, high-impact marketing deliverable formatted in clean markdown.';
 
   const userPrompt = `
-DELIVERABLE REQUEST: "${toolName}" for ${orgName} (${orgType}).
+DELIVERABLE REQUEST: "${safeToolName}" for ${orgName} (${orgType}).
 
 ORGANIZATION DETAILS:
 - Organization Name: ${orgName}
@@ -860,7 +1139,7 @@ ORGANIZATION DETAILS:
 - Monthly Marketing Budget: ${budget}
 
 TOOL-SPECIFIC PARAMETERS PROVIDED BY USER:
-${Object.entries(userInputs || {})
+${Object.entries(sanitizedUserInputs)
   .map(([k, v]) => `- ${k}: ${v}`)
   .join('\n')}
 
@@ -1378,7 +1657,7 @@ if (process.env.SERVERLESS !== 'true') {
   const PORT = Number(process.env.PORT) || 3000;
   const isProduction = process.env.NODE_ENV === 'production';
 
-  app.use(express.json({ limit: '10mb' }));
+  app.use(express.json({ limit: '1mb' }));
 
   // CORS middleware for Express
   app.use((req, res, next) => {
@@ -1405,6 +1684,12 @@ if (process.env.SERVERLESS !== 'true') {
     res.status(result.status).json(result.data);
   });
 
+  // Self-service Account Deletion
+  app.post('/api/account/delete', async (req, res) => {
+    const result = await handleDeleteOwnAccount(req.headers.authorization);
+    res.status(result.status).json(result.data);
+  });
+
   // List all invites (super admins only)
   app.get('/api/invites', async (req, res) => {
     const result = await handleGetInvites(req.headers.authorization);
@@ -1425,7 +1710,7 @@ if (process.env.SERVERLESS !== 'true') {
 
   // Get single invite details
   app.get('/api/invites/:id', async (req, res) => {
-    const result = await handleGetInvite(req.params.id);
+    const result = await handleGetInvite(req.params.id, req.headers.authorization);
     res.status(result.status).json(result.data);
   });
 
@@ -1444,6 +1729,12 @@ if (process.env.SERVERLESS !== 'true') {
   // Super Admin Update User Role
   app.post('/api/admin/users/:userId/role', async (req, res) => {
     const result = await handleUpdateUserRole(req.headers.authorization, req.params.userId, req.body?.role);
+    res.status(result.status).json(result.data);
+  });
+
+  // Super Admin User Management Action
+  app.post('/api/admin/users/:userId/action', async (req, res) => {
+    const result = await handleAdminUserAction(req.headers.authorization, req.params.userId, req.body);
     res.status(result.status).json(result.data);
   });
 
