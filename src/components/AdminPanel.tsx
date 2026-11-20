@@ -51,6 +51,7 @@ import {
   Clock,
   Building2,
   UserMinus,
+  Save,
 } from 'lucide-react';
 
 interface AdminPanelProps {
@@ -126,6 +127,18 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
   const [savingSeatOrgId, setSavingSeatOrgId] = useState<string | null>(null);
   const [removingOrgMemberKey, setRemovingOrgMemberKey] = useState<string | null>(null);
 
+  // Dynamic Plan Limits & Pricing draft state
+  const [planDrafts, setPlanDrafts] = useState<Record<string, { price: string; generationLimit: string }>>(() =>
+    Object.fromEntries(
+      dataService.getPlans().map((p) => [
+        p.id,
+        { price: String(p.price), generationLimit: String(p.generationLimit) },
+      ])
+    )
+  );
+  const [isSavingPlans, setIsSavingPlans] = useState(false);
+  const [plansError, setPlansError] = useState<string | null>(null);
+
   const isSuperAdmin = currentUser.role === 'super_admin';
   const isReadOnlySupport = currentUser.role === 'support';
 
@@ -178,8 +191,26 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
     }
   };
 
+  const syncPlanDraftsFromPlans = (latestPlans: Plan[]) => {
+    setPlanDrafts(
+      Object.fromEntries(
+        latestPlans.map((p) => [
+          p.id,
+          { price: String(p.price), generationLimit: String(p.generationLimit) },
+        ])
+      )
+    );
+  };
+
   useEffect(() => {
     dataService.fetchAllUsersAsync().then((list) => setUsers(list));
+    dataService
+      .fetchPlansConfig()
+      .then((latestPlans) => {
+        setPlans(latestPlans);
+        syncPlanDraftsFromPlans(latestPlans);
+      })
+      .catch(() => {});
     if (isSuperAdmin) {
       refreshInvites();
       refreshPlatformSettings();
@@ -195,7 +226,12 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
     setAuditLogs(dataService.getAuditLogs());
     dataService.fetchAuditLogs().then(setAuditLogs).catch(() => {});
     setAccessRules(dataService.getAccessRules());
-    setPlans(dataService.getPlans());
+    dataService
+      .fetchPlansConfig()
+      .then((latestPlans) => {
+        setPlans(latestPlans);
+      })
+      .catch(() => setPlans(dataService.getPlans()));
     setTools(dataService.getTools());
     setSettings(dataService.getSettings());
     if (isSuperAdmin) {
@@ -574,19 +610,79 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
   /* =========================================================================
    * PLANS & TOOLS DYNAMIC CONFIG
    * ========================================================================= */
-  const handleUpdatePlanLimit = (planId: string, newLimit: number) => {
-    dataService.updatePlan(planId, { generationLimit: newLimit });
-    refreshAll();
-    notify(`Updated ${planId} limit to ${newLimit}/mo`);
+  const hasUnsavedPlanChanges = plans.some((p) => {
+    const draft = planDrafts[p.id];
+    if (!draft) return false;
+    return draft.price !== String(p.price) || draft.generationLimit !== String(p.generationLimit);
+  });
+
+  const handlePlanDraftChange = (planId: string, field: 'price' | 'generationLimit', value: string) => {
+    setPlansError(null);
+    setPlanDrafts((prev) => ({
+      ...prev,
+      [planId]: {
+        price: prev[planId]?.price ?? '0',
+        generationLimit: prev[planId]?.generationLimit ?? '50',
+        [field]: value,
+      },
+    }));
   };
 
-  const handleUpdatePlanPrice = (planId: string, newPrice: number) => {
-    dataService.updatePlan(planId, {
-      price: newPrice,
-      priceNonprofit: Math.round(newPrice * 0.75 * 100) / 100, // 25% discount automatic
-    });
-    refreshAll();
-    notify(`Updated ${planId} pricing`);
+  const handleResetPlanDrafts = () => {
+    setPlansError(null);
+    syncPlanDraftsFromPlans(plans);
+  };
+
+  const handleSavePlanSettings = async (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
+    if (!isSuperAdmin || isSavingPlans) return;
+    setPlansError(null);
+
+    const payload: Array<{ id: string; price: number; generationLimit: number }> = [];
+    for (const p of plans) {
+      const draft = planDrafts[p.id] || {
+        price: String(p.price),
+        generationLimit: String(p.generationLimit),
+      };
+      const parsedPrice = Number(draft.price);
+      const parsedLimit = Number(draft.generationLimit);
+
+      if (draft.price.trim() === '' || !Number.isFinite(parsedPrice) || parsedPrice < 0 || parsedPrice > 100000) {
+        setPlansError(`Invalid monthly price for "${p.name}". Enter a number between 0 and 100,000.`);
+        return;
+      }
+      if (
+        draft.generationLimit.trim() === '' ||
+        !Number.isFinite(parsedLimit) ||
+        !Number.isInteger(parsedLimit) ||
+        parsedLimit < 1 ||
+        parsedLimit > 1000000
+      ) {
+        setPlansError(`Invalid monthly generation limit for "${p.name}". Enter a whole number of at least 1.`);
+        return;
+      }
+
+      payload.push({
+        id: p.id,
+        price: Math.round(parsedPrice * 100) / 100,
+        generationLimit: parsedLimit,
+      });
+    }
+
+    try {
+      setIsSavingPlans(true);
+      const updatedPlans = await dataService.savePlansConfigServer(payload);
+      setPlans(updatedPlans);
+      syncPlanDraftsFromPlans(updatedPlans);
+      refreshAll();
+      notify('Plan limits and pricing saved successfully.');
+    } catch (err: any) {
+      const msg = err?.message || 'Failed to save plan limits and pricing.';
+      setPlansError(msg);
+      notify(`Failed to save plan settings: ${msg}`);
+    } finally {
+      setIsSavingPlans(false);
+    }
   };
 
   const handleToggleToolGlobal = (toolId: string, current: boolean) => {
@@ -2010,14 +2106,51 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
        * TAB 5: PLANS & LIMITS (DYNAMIC LIVE CONFIG)
        * ===================================================================== */}
       {activeTab === 'plans' && (
-        <div className="bg-white rounded-2xl p-6 border border-slate-200 shadow-sm space-y-6">
-          <div className="flex items-center justify-between pb-3 border-b border-slate-100">
+        <form
+          onSubmit={handleSavePlanSettings}
+          className="bg-white rounded-2xl p-6 border border-slate-200 shadow-sm space-y-6"
+        >
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-slate-100">
             <div>
-              <h3 className="text-sm font-bold text-slate-900">Dynamic Plan Limits & Pricing</h3>
+              <div className="flex items-center gap-2">
+                <h3 className="text-sm font-bold text-slate-900">Dynamic Plan Limits & Pricing</h3>
+                {hasUnsavedPlanChanges && (
+                  <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-amber-100 text-amber-900 border border-amber-200">
+                    Unsaved Changes
+                  </span>
+                )}
+              </div>
               <p className="text-xs text-slate-500">
-                Modify tier prices and monthly generation quotas on the fly without changing code.
+                Modify tier prices and monthly generation quotas on the fly, then save to persist across the platform.
               </p>
             </div>
+
+            {isSuperAdmin && (
+              <div className="flex items-center gap-2 shrink-0">
+                {hasUnsavedPlanChanges && (
+                  <button
+                    type="button"
+                    onClick={handleResetPlanDrafts}
+                    disabled={isSavingPlans}
+                    className="px-3 py-2 rounded-xl border border-slate-200 hover:bg-slate-50 text-slate-700 text-xs font-semibold cursor-pointer disabled:opacity-50"
+                  >
+                    Discard
+                  </button>
+                )}
+                <button
+                  type="submit"
+                  disabled={isSavingPlans || !hasUnsavedPlanChanges}
+                  className="px-4 py-2 rounded-xl bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold flex items-center gap-1.5 shadow-xs cursor-pointer disabled:opacity-50 transition-colors"
+                >
+                  {isSavingPlans ? (
+                    <div className="w-3.5 h-3.5 border-2 border-white border-t-transparent rounded-full animate-spin" />
+                  ) : (
+                    <Save className="w-3.5 h-3.5" />
+                  )}
+                  <span>{isSavingPlans ? 'Saving...' : 'Save Plan Settings'}</span>
+                </button>
+              </div>
+            )}
           </div>
 
           {platformSettings.inviteOnlyMode && (
@@ -2029,9 +2162,26 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
             </div>
           )}
 
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+          {plansError && (
+            <div className="p-3.5 rounded-xl bg-rose-50 border border-rose-200 text-xs text-rose-800 flex items-center gap-2">
+              <AlertCircle className="w-4 h-4 text-rose-600 shrink-0" />
+              <span>{plansError}</span>
+            </div>
+          )}
+
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-5">
             {plans.map((p) => {
               const isPaidPlanDisabled = platformSettings.inviteOnlyMode && (p.id === 'pro' || p.id === 'team');
+              const draft = planDrafts[p.id] || {
+                price: String(p.price),
+                generationLimit: String(p.generationLimit),
+              };
+              const draftPriceNum = Number(draft.price);
+              const previewNonprofitPrice =
+                Number.isFinite(draftPriceNum) && draftPriceNum >= 0
+                  ? Math.round(draftPriceNum * 0.75 * 100) / 100
+                  : p.priceNonprofit;
+
               return (
                 <div
                   key={p.id}
@@ -2061,13 +2211,15 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                     </label>
                     <input
                       type="number"
-                      disabled={isPaidPlanDisabled}
-                      value={p.price}
-                      onChange={(e) => handleUpdatePlanPrice(p.id, Number(e.target.value))}
-                      className="w-full px-3 py-1.5 text-xs font-mono font-bold rounded-lg border border-slate-300 bg-white disabled:bg-slate-100 disabled:text-slate-400"
+                      min="0"
+                      step="0.01"
+                      disabled={isPaidPlanDisabled || isReadOnlySupport}
+                      value={draft.price}
+                      onChange={(e) => handlePlanDraftChange(p.id, 'price', e.target.value)}
+                      className="w-full px-3 py-1.5 text-xs font-mono font-bold rounded-lg border border-slate-300 bg-white disabled:bg-slate-100 disabled:text-slate-400 focus:outline-none focus:ring-2 focus:ring-rose-500"
                     />
                     <span className="text-[10px] text-slate-400 mt-0.5 block">
-                      Nonprofit 25% discount price: ${p.priceNonprofit}
+                      Nonprofit 25% discount price: ${previewNonprofitPrice}
                     </span>
                   </div>
 
@@ -2077,10 +2229,12 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                     </label>
                     <input
                       type="number"
-                      disabled={isPaidPlanDisabled}
-                      value={p.generationLimit}
-                      onChange={(e) => handleUpdatePlanLimit(p.id, Number(e.target.value))}
-                      className="w-full px-3 py-1.5 text-xs font-mono font-bold rounded-lg border border-slate-300 bg-white disabled:bg-slate-100 disabled:text-slate-400"
+                      min="1"
+                      step="1"
+                      disabled={isPaidPlanDisabled || isReadOnlySupport}
+                      value={draft.generationLimit}
+                      onChange={(e) => handlePlanDraftChange(p.id, 'generationLimit', e.target.value)}
+                      className="w-full px-3 py-1.5 text-xs font-mono font-bold rounded-lg border border-slate-300 bg-white disabled:bg-slate-100 disabled:text-slate-400 focus:outline-none focus:ring-2 focus:ring-rose-500"
                     />
                   </div>
 
@@ -2096,7 +2250,37 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
               );
             })}
           </div>
-        </div>
+
+          {isSuperAdmin && (
+            <div className="pt-4 border-t border-slate-100 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+              <span className="text-xs text-slate-500">
+                {hasUnsavedPlanChanges
+                  ? 'You have unsaved changes to plan limits or pricing.'
+                  : 'All plan limits and pricing changes are saved.'}
+              </span>
+              <div className="flex items-center gap-2 justify-end">
+                {hasUnsavedPlanChanges && (
+                  <button
+                    type="button"
+                    onClick={handleResetPlanDrafts}
+                    disabled={isSavingPlans}
+                    className="px-4 py-2 rounded-xl border border-slate-200 hover:bg-slate-50 text-slate-700 text-xs font-semibold cursor-pointer disabled:opacity-50"
+                  >
+                    Discard Changes
+                  </button>
+                )}
+                <button
+                  type="submit"
+                  disabled={isSavingPlans || !hasUnsavedPlanChanges}
+                  className="px-5 py-2 rounded-xl bg-slate-900 hover:bg-slate-800 text-white text-xs font-bold flex items-center gap-1.5 shadow-xs cursor-pointer disabled:opacity-50 transition-colors"
+                >
+                  <Save className="w-3.5 h-3.5" />
+                  <span>{isSavingPlans ? 'Saving...' : 'Save Plan Settings'}</span>
+                </button>
+              </div>
+            </div>
+          )}
+        </form>
       )}
 
       {/* =====================================================================

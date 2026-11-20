@@ -87,6 +87,7 @@ export default function App() {
 
   useEffect(() => {
     dataService.fetchPlatformSettings().then(setPlatformSettings);
+    dataService.fetchPlansConfig().catch(() => {});
 
     const unsubscribe = authService.onAuthChange((user) => {
       setCurrentUser(user);

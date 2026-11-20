@@ -207,6 +207,16 @@ const VALID_TOOL_IDS = new Set([
   'keywords-content',
 ]);
 
+export const DEFAULT_PLAN_CONFIGS: Record<
+  'free' | 'pro' | 'team' | 'complimentary',
+  { price: number; priceNonprofit: number; generationLimit: number }
+> = {
+  free: { price: 0, priceNonprofit: 0, generationLimit: 50 },
+  pro: { price: 49, priceNonprofit: 36.75, generationLimit: 500 },
+  team: { price: 149, priceNonprofit: 111.75, generationLimit: 2000 },
+  complimentary: { price: 0, priceNonprofit: 0, generationLimit: 2000 },
+};
+
 export const PLAN_LIMITS: Record<string, number> = {
   free: 50,
   pro: 500,
@@ -227,6 +237,50 @@ function getDefaultSeatLimit(planId?: string): number {
 
 function getDefaultGenerationLimit(planId?: string): number {
   return PLAN_LIMITS[planId || 'free'] || 50;
+}
+
+export async function getPlanConfigs(): Promise<{
+  plans: Record<string, { price: number; priceNonprofit: number; generationLimit: number }>;
+  updatedAt?: string;
+}> {
+  const result: Record<string, { price: number; priceNonprofit: number; generationLimit: number }> = {
+    free: { ...DEFAULT_PLAN_CONFIGS.free },
+    pro: { ...DEFAULT_PLAN_CONFIGS.pro },
+    team: { ...DEFAULT_PLAN_CONFIGS.team },
+    complimentary: { ...DEFAULT_PLAN_CONFIGS.complimentary },
+  };
+  try {
+    const snap = await adminDb.collection('settings').doc('plans').get();
+    if (snap.exists) {
+      const data = snap.data() || {};
+      const storedPlans = data.plans && typeof data.plans === 'object' ? data.plans : {};
+      for (const planId of Object.keys(DEFAULT_PLAN_CONFIGS) as Array<keyof typeof DEFAULT_PLAN_CONFIGS>) {
+        const entry = storedPlans[planId];
+        if (entry && typeof entry === 'object') {
+          const price =
+            typeof entry.price === 'number' && Number.isFinite(entry.price) && entry.price >= 0
+              ? Math.round(entry.price * 100) / 100
+              : result[planId].price;
+          const priceNonprofit =
+            typeof entry.priceNonprofit === 'number' && Number.isFinite(entry.priceNonprofit) && entry.priceNonprofit >= 0
+              ? Math.round(entry.priceNonprofit * 100) / 100
+              : Math.round(price * 0.75 * 100) / 100;
+          const generationLimit =
+            typeof entry.generationLimit === 'number' && Number.isInteger(entry.generationLimit) && entry.generationLimit >= 1
+              ? entry.generationLimit
+              : result[planId].generationLimit;
+          result[planId] = { price, priceNonprofit, generationLimit };
+        }
+      }
+      return {
+        plans: result,
+        ...(typeof data.updatedAt === 'string' ? { updatedAt: data.updatedAt } : {}),
+      };
+    }
+  } catch (err: any) {
+    console.warn('[Get Plan Configs Warning]:', err?.message);
+  }
+  return { plans: result };
 }
 
 function buildOrgProfileFromOrgDoc(orgData: any): any | undefined {
@@ -633,6 +687,110 @@ export async function handleUpdatePlatformSettings(
           selfSignupDisabled: inviteOnlyMode,
           updatedAt: now,
         },
+      },
+    };
+  } catch (err: any) {
+    return { status: err.status || 500, data: { error: err.message } };
+  }
+}
+
+// 1d. Public plan limits & pricing configuration
+export async function handleGetPublicPlans(): Promise<{ status: number; data: any }> {
+  try {
+    const config = await getPlanConfigs();
+    return { status: 200, data: config };
+  } catch (err: any) {
+    console.error('[Get Public Plans Error]:', err.message);
+    return { status: 503, data: { error: 'Unable to load plan settings' } };
+  }
+}
+
+// 1e. Super admin update dynamic plan limits & pricing
+export async function handleUpdatePlanSettings(
+  authHeader: string | null | undefined,
+  body: any
+): Promise<{ status: number; data: any }> {
+  try {
+    const verified = await requireSuperAdmin(authHeader);
+    const rawPlans = body?.plans;
+    if (!rawPlans || (typeof rawPlans !== 'object' && !Array.isArray(rawPlans))) {
+      return { status: 400, data: { error: 'Plans payload is required.' } };
+    }
+
+    const existingConfig = await getPlanConfigs();
+    const updatedPlans: Record<string, { price: number; priceNonprofit: number; generationLimit: number }> = {
+      ...existingConfig.plans,
+    };
+
+    const entries: Array<{ id: string; price?: unknown; generationLimit?: unknown }> = Array.isArray(rawPlans)
+      ? rawPlans
+      : Object.entries(rawPlans).map(([id, val]: [string, any]) => ({ id, ...(val || {}) }));
+
+    const changedSummary: string[] = [];
+    const allowedPlanIds = new Set(['free', 'pro', 'team', 'complimentary']);
+
+    for (const entry of entries) {
+      if (!entry || typeof entry.id !== 'string' || !allowedPlanIds.has(entry.id)) {
+        return { status: 400, data: { error: `Invalid plan identifier: ${entry?.id || 'unknown'}` } };
+      }
+
+      const rawPrice = entry.price !== undefined ? Number(entry.price) : updatedPlans[entry.id].price;
+      const rawLimit =
+        entry.generationLimit !== undefined ? Number(entry.generationLimit) : updatedPlans[entry.id].generationLimit;
+
+      if (!Number.isFinite(rawPrice) || rawPrice < 0 || rawPrice > 100000) {
+        return {
+          status: 400,
+          data: { error: `Invalid price for "${entry.id}" plan. Must be between $0 and $100,000.` },
+        };
+      }
+      if (!Number.isFinite(rawLimit) || !Number.isInteger(rawLimit) || rawLimit < 1 || rawLimit > 1000000) {
+        return {
+          status: 400,
+          data: { error: `Invalid monthly generation limit for "${entry.id}" plan. Must be an integer between 1 and 1,000,000.` },
+        };
+      }
+
+      const cleanPrice = Math.round(rawPrice * 100) / 100;
+      const cleanNonprofitPrice = Math.round(cleanPrice * 0.75 * 100) / 100;
+
+      const prev = updatedPlans[entry.id];
+      if (prev.price !== cleanPrice || prev.generationLimit !== rawLimit) {
+        changedSummary.push(`${entry.id}: $${cleanPrice}/mo, ${rawLimit}/mo limit`);
+      }
+
+      updatedPlans[entry.id] = {
+        price: cleanPrice,
+        priceNonprofit: cleanNonprofitPrice,
+        generationLimit: rawLimit,
+      };
+    }
+
+    const now = new Date().toISOString();
+    await adminDb.collection('settings').doc('plans').set(
+      {
+        id: 'plans',
+        plans: updatedPlans,
+        updatedAt: now,
+        updatedBy: verified.uid,
+        updatedByEmail: verified.email || '',
+      },
+      { merge: true }
+    );
+
+    await logServerAudit(
+      'PLANS_UPDATED',
+      changedSummary.length > 0
+        ? `Updated dynamic plan limits & pricing (${changedSummary.join('; ')})`
+        : 'Saved dynamic plan limits & pricing configuration',
+      verified
+    );
+
+    return {
+      status: 200,
+      data: {
+        plans: updatedPlans,
+        updatedAt: now,
       },
     };
   } catch (err: any) {
@@ -2408,7 +2566,8 @@ export async function handleGeminiGenerate(
 
       const orgId = isValidFirestoreId(userData.organizationId) ? userData.organizationId : `org_${userId}`;
       const orgRef = adminDb.collection('organizations').doc(orgId);
-      const orgSnap = await transaction.get(orgRef);
+      const plansRef = adminDb.collection('settings').doc('plans');
+      const [orgSnap, plansSnap] = await Promise.all([transaction.get(orgRef), transaction.get(plansRef)]);
 
       if (!orgSnap.exists && orgId !== `org_${userId}`) {
         throw new HttpError(503, 'Organization record not found. Please refresh and try again.');
@@ -2416,7 +2575,11 @@ export async function handleGeminiGenerate(
 
       const orgData: any = orgSnap.exists ? orgSnap.data()! : null;
       const planId = orgData?.planId || userData.planId || 'free';
-      const baseLimit = getDefaultGenerationLimit(planId);
+      const storedPlanLimit = plansSnap.exists ? Number(plansSnap.data()?.plans?.[planId]?.generationLimit) : NaN;
+      const baseLimit =
+        Number.isInteger(storedPlanLimit) && storedPlanLimit >= 1
+          ? storedPlanLimit
+          : getDefaultGenerationLimit(planId);
       const bonus = Number(orgData?.bonusGenerations ?? userData.bonusGenerations ?? 0);
       const planLimit = baseLimit + bonus;
 
@@ -3222,6 +3385,18 @@ if (process.env.SERVERLESS !== 'true') {
   // Super Admin update platform settings
   app.post('/api/admin/settings', async (req, res) => {
     const result = await handleUpdatePlatformSettings(req.headers.authorization, req.body);
+    res.status(result.status).json(result.data);
+  });
+
+  // Public plan limits & pricing endpoint
+  app.get('/api/plans', async (_req, res) => {
+    const result = await handleGetPublicPlans();
+    res.status(result.status).json(result.data);
+  });
+
+  // Super Admin update dynamic plan limits & pricing
+  app.post('/api/admin/plans', async (req, res) => {
+    const result = await handleUpdatePlanSettings(req.headers.authorization, req.body);
     res.status(result.status).json(result.data);
   });
 

@@ -233,7 +233,8 @@ service cloud.firestore {
           'DISCOUNT_TOGGLED',
           'USER_STATUS_CHANGE',
           'USER_DELETED',
-          'SETTINGS_UPDATED'
+          'SETTINGS_UPDATED',
+          'PLANS_UPDATED'
         ]);
       allow update, delete: if false;
     }

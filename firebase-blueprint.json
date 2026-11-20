@@ -144,6 +144,19 @@
         "updatedByEmail": { "type": "string", "format": "email", "description": "Email of super admin who updated settings" }
       },
       "required": ["id", "inviteOnlyMode", "updatedAt"]
+    },
+    "PlanSettings": {
+      "title": "PlanSettings",
+      "description": "Dynamic plan pricing and monthly generation limit overrides stored at settings/plans",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "Document identifier (plans)" },
+        "plans": { "type": "object", "description": "Map of planId (free, pro, team, complimentary) to price, priceNonprofit, and generationLimit" },
+        "updatedAt": { "type": "string", "description": "Last updated timestamp" },
+        "updatedBy": { "type": "string", "description": "UID of super admin who updated plans" },
+        "updatedByEmail": { "type": "string", "format": "email", "description": "Email of super admin who updated plans" }
+      },
+      "required": ["id", "plans", "updatedAt"]
     }
   },
   "firestore": {

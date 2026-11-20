@@ -1293,7 +1293,71 @@ class DataService {
    * PLANS & TOOLS & SETTINGS (Client Configuration)
    * ========================================================================= */
   public getPlans(): Plan[] {
-    return INITIAL_PLANS;
+    return INITIAL_PLANS.map((p) => ({ ...p, features: [...p.features] }));
+  }
+
+  public applyPlanOverrides(
+    overrides?: Record<string, { price?: number; priceNonprofit?: number; generationLimit?: number }>
+  ): Plan[] {
+    if (overrides && typeof overrides === 'object') {
+      for (const plan of INITIAL_PLANS) {
+        const entry = overrides[plan.id];
+        if (!entry || typeof entry !== 'object') continue;
+        if (typeof entry.price === 'number' && Number.isFinite(entry.price) && entry.price >= 0) {
+          plan.price = Math.round(entry.price * 100) / 100;
+          plan.priceNonprofit =
+            typeof entry.priceNonprofit === 'number' && Number.isFinite(entry.priceNonprofit) && entry.priceNonprofit >= 0
+              ? Math.round(entry.priceNonprofit * 100) / 100
+              : Math.round(plan.price * 0.75 * 100) / 100;
+        }
+        if (
+          typeof entry.generationLimit === 'number' &&
+          Number.isInteger(entry.generationLimit) &&
+          entry.generationLimit >= 1
+        ) {
+          plan.generationLimit = entry.generationLimit;
+          if (plan.features.length > 0 && /AI generations per month$/i.test(plan.features[0])) {
+            plan.features[0] = `${entry.generationLimit.toLocaleString()} AI generations per month`;
+          }
+        }
+      }
+    }
+    return this.getPlans();
+  }
+
+  public async fetchPlansConfig(): Promise<Plan[]> {
+    try {
+      const res = await fetch('/api/plans');
+      const contentType = res.headers.get('content-type') || '';
+      if (!res.ok || !contentType.includes('application/json')) {
+        return this.getPlans();
+      }
+      const data = await res.json();
+      return this.applyPlanOverrides(data?.plans);
+    } catch {
+      return this.getPlans();
+    }
+  }
+
+  public async savePlansConfigServer(
+    plansPayload: Array<{ id: string; price: number; generationLimit: number }>
+  ): Promise<Plan[]> {
+    const token = await auth.currentUser?.getIdToken();
+    if (!token) throw new Error('Not authenticated');
+    const res = await fetch('/api/admin/plans', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({ plans: plansPayload }),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || 'Failed to save plan limits and pricing');
+    }
+    const data = await res.json();
+    return this.applyPlanOverrides(data?.plans);
   }
 
   public updatePlan(id: string, updates: Partial<Plan>): Plan | null {

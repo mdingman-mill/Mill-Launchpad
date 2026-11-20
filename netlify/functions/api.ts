@@ -4,6 +4,8 @@ import {
   handleHealthCheck,
   handleGetPublicSettings,
   handleUpdatePlatformSettings,
+  handleGetPublicPlans,
+  handleUpdatePlanSettings,
   handleAuthSync,
   handleDeleteOwnAccount,
   handleGetInvites,
@@ -77,6 +79,25 @@ export default async (req: Request): Promise<Response> => {
     if (method === 'POST' && pathname === '/api/admin/settings') {
       const body = await req.json().catch(() => ({}));
       const result = await handleUpdatePlatformSettings(authHeader, body);
+      return new Response(JSON.stringify(result.data), {
+        status: result.status,
+        headers: { 'Content-Type': 'application/json', ...corsHeaders },
+      });
+    }
+
+    // 1d. Public dynamic plan limits & pricing
+    if (method === 'GET' && pathname === '/api/plans') {
+      const result = await handleGetPublicPlans();
+      return new Response(JSON.stringify(result.data), {
+        status: result.status,
+        headers: { 'Content-Type': 'application/json', ...corsHeaders },
+      });
+    }
+
+    // 1e. Super admin update dynamic plan limits & pricing
+    if (method === 'POST' && pathname === '/api/admin/plans') {
+      const body = await req.json().catch(() => ({}));
+      const result = await handleUpdatePlanSettings(authHeader, body);
       return new Response(JSON.stringify(result.data), {
         status: result.status,
         headers: { 'Content-Type': 'application/json', ...corsHeaders },
