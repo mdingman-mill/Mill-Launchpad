@@ -1,8 +1,10 @@
-import React, { useState } from 'react';
-import { User, ToolDefinition, SavedOutput } from '../types';
+import React, { useState, useEffect } from 'react';
+import { User, Organization, ToolDefinition, SavedOutput } from '../types';
 import { dataService } from '../services/dataService';
 import { billingService } from '../services/billingService';
 import { authService } from '../services/authService';
+import { FormattedOutput } from './FormattedOutput';
+import { copyFormattedOutput, renderMarkdownToHtml } from '../utils/exportFormatting';
 import {
   Sparkles,
   Zap,
@@ -32,7 +34,11 @@ import {
 
 interface MarketingStudioProps {
   user: User;
-  onUsageUpdated: (newUsage: number) => void;
+  organization?: Organization | null;
+  inviteOnlyMode?: boolean;
+  initialToolLaunch?: { toolId: string; inputs: Record<string, string>; key: number } | null;
+  onClearInitialToolLaunch?: () => void;
+  onUsageUpdated: (newOrgUsage: number, newMemberUsage?: number) => void;
   onRequireUpgrade: () => void;
   onEditProfile: () => void;
   onSavedToLibrary: (output: SavedOutput) => void;
@@ -48,6 +54,10 @@ const CATEGORY_ICONS: Record<string, React.ReactNode> = {
 
 export const MarketingStudio: React.FC<MarketingStudioProps> = ({
   user,
+  organization,
+  inviteOnlyMode = false,
+  initialToolLaunch,
+  onClearInitialToolLaunch,
   onUsageUpdated,
   onRequireUpgrade,
   onEditProfile,
@@ -76,12 +86,37 @@ export const MarketingStudio: React.FC<MarketingStudioProps> = ({
   const [savedSuccess, setSavedSuccess] = useState(false);
   const [mobileTab, setMobileTab] = useState<'inputs' | 'deliverable'>('inputs');
 
-  const plan = billingService.getPlanById(user.planId);
-  const maxLimit = (plan?.generationLimit || 50) + (user.bonusGenerations || 0);
-  const currentUsage = user.generationsUsedThisMonth || 0;
+  const effectivePlanId = organization?.planId || user.planId;
+  const plan = billingService.getPlanById(effectivePlanId);
+  const bonusGenerations = organization?.bonusGenerations ?? user.bonusGenerations ?? 0;
+  const maxLimit = (plan?.generationLimit || 50) + bonusGenerations;
+  const currentUsage = organization?.generationsUsedThisMonth ?? user.generationsUsedThisMonth ?? 0;
+  const billingResetDate = organization?.billingResetDate || user.billingResetDate;
   const usagePercentage = Math.min(Math.round((currentUsage / maxLimit) * 100), 100);
   const isNearLimit = currentUsage >= maxLimit * 0.8 && currentUsage < maxLimit;
   const isLimitReached = currentUsage >= maxLimit;
+
+  useEffect(() => {
+    if (!initialToolLaunch) return;
+    const matchedTool = tools.find((t) => t.id === initialToolLaunch.toolId);
+    if (matchedTool) {
+      setActiveToolId(matchedTool.id);
+      const initial: Record<string, string> = {};
+      matchedTool.fields.forEach((f) => {
+        initial[f.key] = initialToolLaunch.inputs?.[f.key] ?? f.defaultValue ?? '';
+      });
+      setToolInputs(initial);
+      setOutput('');
+      setIsEditingOutput(false);
+      setOutputTitle(`${user.organizationProfile?.orgName || organization?.name || 'Org'} ${matchedTool.name}`);
+      setModelUsed(null);
+      setError(null);
+      setSavedSuccess(false);
+      setMobileTab('inputs');
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+    }
+    onClearInitialToolLaunch?.();
+  }, [initialToolLaunch]);
 
   // Select tool and prepare workspace
   const handleSelectTool = (tool: ToolDefinition) => {
@@ -92,6 +127,7 @@ export const MarketingStudio: React.FC<MarketingStudioProps> = ({
     });
     setToolInputs(initial);
     setOutput('');
+    setIsEditingOutput(false);
     setOutputTitle(`${user.organizationProfile?.orgName || 'Org'} ${tool.name}`);
     setModelUsed(null);
     setError(null);
@@ -114,6 +150,7 @@ export const MarketingStudio: React.FC<MarketingStudioProps> = ({
     setLoading(true);
     setError(null);
     setSavedSuccess(false);
+    setIsEditingOutput(false);
     setOutput('');
     setModelUsed('gemini-3.1-flash-lite');
     setMobileTab('deliverable');
@@ -148,6 +185,8 @@ export const MarketingStudio: React.FC<MarketingStudioProps> = ({
       const decoder = new TextDecoder();
       let accumulatedText = '';
       let buffer = '';
+      let serverOrgUsage: number | undefined;
+      let serverMemberUsage: number | undefined;
 
       while (true) {
         const { done, value } = await reader.read();
@@ -178,6 +217,12 @@ export const MarketingStudio: React.FC<MarketingStudioProps> = ({
             }
             if (parsed.done) {
               if (parsed.text) accumulatedText = parsed.text;
+              if (typeof parsed.orgGenerationsUsedThisMonth === 'number') {
+                serverOrgUsage = parsed.orgGenerationsUsedThisMonth;
+              }
+              if (typeof parsed.memberGenerationsUsedThisMonth === 'number') {
+                serverMemberUsage = parsed.memberGenerationsUsedThisMonth;
+              }
               setOutput(accumulatedText);
               setModelUsed(parsed.modelUsed || 'gemini-3.1-flash-lite');
             }
@@ -193,8 +238,8 @@ export const MarketingStudio: React.FC<MarketingStudioProps> = ({
         throw new Error('No content was returned. Please try again.');
       }
 
-      const newUsage = dataService.incrementUsage(user.id);
-      onUsageUpdated(newUsage);
+      const newUsage = dataService.incrementUsage(user.id, serverOrgUsage, serverMemberUsage);
+      onUsageUpdated(newUsage, serverMemberUsage);
       dataService.logAction('TOOL_GENERATION', `Generated output with ${activeTool.name}`, user.id);
       onToolCompleted();
     } catch (err: any) {
@@ -204,8 +249,8 @@ export const MarketingStudio: React.FC<MarketingStudioProps> = ({
     }
   };
 
-  const handleCopy = () => {
-    navigator.clipboard.writeText(output);
+  const handleCopy = async () => {
+    await copyFormattedOutput(output);
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
   };
@@ -214,7 +259,9 @@ export const MarketingStudio: React.FC<MarketingStudioProps> = ({
     if (!output.trim() || !activeTool) return;
 
     const saved = dataService.saveOutput({
+      orgId: organization?.id || user.organizationId,
       userId: user.id,
+      userName: user.name || user.email,
       toolId: activeTool.id,
       toolName: activeTool.name,
       title: outputTitle.trim() || `${activeTool.name} Output`,
@@ -252,7 +299,7 @@ export const MarketingStudio: React.FC<MarketingStudioProps> = ({
     const safeTitle = escapeHtml(outputTitle);
     const safeTool = escapeHtml(activeTool.name);
     const safeOrg = escapeHtml(user.organizationProfile?.orgName || 'Client');
-    const safeOutput = escapeHtml(output);
+    const formattedBodyHtml = renderMarkdownToHtml(output);
     const htmlContent = `
       <!DOCTYPE html>
       <html>
@@ -261,8 +308,17 @@ export const MarketingStudio: React.FC<MarketingStudioProps> = ({
         <title>${safeTitle}</title>
         <style>
           body { font-family: Calibri, Arial, sans-serif; line-height: 1.6; color: #0f172a; padding: 40px; }
-          h1, h2, h3 { color: #0f172a; margin-top: 24px; }
-          blockquote { border-left: 3px solid #e11d48; padding-left: 16px; margin-left: 0; color: #475569; }
+          h1 { font-size: 22pt; font-weight: bold; color: #0f172a; margin-top: 24px; margin-bottom: 10px; }
+          h2 { font-size: 16pt; font-weight: bold; color: #0f172a; margin-top: 22px; margin-bottom: 8px; }
+          h3 { font-size: 13pt; font-weight: bold; color: #0f172a; margin-top: 16px; margin-bottom: 6px; }
+          p { margin-top: 0; margin-bottom: 10px; }
+          ul, ol { margin-top: 8px; margin-bottom: 12px; padding-left: 24px; }
+          li { margin-bottom: 4px; }
+          blockquote { border-left: 3px solid #e11d48; padding-left: 14px; margin: 14px 0; color: #475569; font-style: italic; }
+          hr { border: none; border-top: 1px solid #cbd5e1; margin: 18px 0; }
+          table { width: 100%; border-collapse: collapse; margin: 14px 0; }
+          th, td { border: 1px solid #cbd5e1; padding: 8px 10px; text-align: left; vertical-align: top; }
+          th { background-color: #f8fafc; font-weight: bold; }
           .footer { margin-top: 40px; font-size: 11px; color: #94a3b8; border-top: 1px solid #e2e8f0; padding-top: 12px; }
         </style>
       </head>
@@ -270,7 +326,7 @@ export const MarketingStudio: React.FC<MarketingStudioProps> = ({
         <h1>${safeTitle}</h1>
         <p><em>Generated with Millennium Agency Launchpad (${safeTool}) for ${safeOrg}</em></p>
         <hr/>
-        <div style="white-space: pre-wrap;">${safeOutput}</div>
+        <div>${formattedBodyHtml}</div>
         <div class="footer">
           Generated for ${safeOrg} by Millennium Agency • https://mill.agency
         </div>
@@ -371,13 +427,17 @@ export const MarketingStudio: React.FC<MarketingStudioProps> = ({
             <div className="p-3.5 bg-rose-50 text-rose-900 border border-rose-200 rounded-2xl text-xs flex items-center justify-between">
               <div className="flex items-center gap-2 font-semibold">
                 <AlertTriangle className="w-4 h-4 text-rose-600 shrink-0" />
-                <span>You have reached your 100% monthly generation limit ({currentUsage}/{maxLimit}). Upgrade to generate more.</span>
+                <span>
+                  {inviteOnlyMode
+                    ? `You have reached your monthly generation limit (${currentUsage}/${maxLimit}). Paid plans are disabled in Invite-Only Mode.`
+                    : `You have reached your 100% monthly generation limit (${currentUsage}/${maxLimit}). Upgrade to generate more.`}
+                </span>
               </div>
               <button
                 onClick={onRequireUpgrade}
                 className="px-3.5 py-1.5 bg-rose-600 text-white font-bold rounded-xl hover:bg-rose-700 transition-colors"
               >
-                Upgrade Plan
+                {inviteOnlyMode ? 'View Plan' : 'Upgrade Plan'}
               </button>
             </div>
           )}
@@ -666,11 +726,11 @@ export const MarketingStudio: React.FC<MarketingStudioProps> = ({
                       className="w-full h-full p-4 font-mono text-xs text-slate-900 bg-slate-50 rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-rose-500"
                     />
                   ) : (
-                    <div className="prose prose-xs sm:prose-sm max-w-none text-slate-900 whitespace-pre-wrap leading-relaxed font-sans">
-                      {output}
+                    <div>
+                      <FormattedOutput content={output} />
                       {loading && (
                         <span
-                          className="inline-block w-1.5 h-4 ml-0.5 bg-rose-500 animate-pulse align-middle"
+                          className="inline-block w-1.5 h-4 mt-2 bg-rose-500 animate-pulse align-middle"
                           aria-label="Streaming text..."
                         />
                       )}
@@ -787,8 +847,13 @@ export const MarketingStudio: React.FC<MarketingStudioProps> = ({
               </div>
 
               <div className="flex items-center justify-between text-[11px] text-slate-500">
-                <span>Plan: <strong className="text-slate-700">{plan?.name}</strong></span>
-                <span>Resets on: {user.billingResetDate}</span>
+                <span>
+                  Plan: <strong className="text-slate-700">{plan?.name}</strong>
+                  {organization && organization.memberIds && organization.memberIds.length > 1 && (
+                    <span className="text-slate-400"> · Pooled team quota (your usage: {user.generationsUsedThisMonth || 0})</span>
+                  )}
+                </span>
+                <span>Resets on: {billingResetDate}</span>
               </div>
             </div>
 
@@ -796,7 +861,11 @@ export const MarketingStudio: React.FC<MarketingStudioProps> = ({
               onClick={onRequireUpgrade}
               className="px-4 py-2 bg-slate-900 hover:bg-slate-800 text-white rounded-xl text-xs font-bold transition-all shadow-xs"
             >
-              {user.planId === 'free' ? 'Upgrade to Pro' : 'Manage Subscription'}
+              {inviteOnlyMode
+                ? 'View Plan Details'
+                : effectivePlanId === 'free'
+                ? 'Upgrade to Pro'
+                : 'Manage Subscription'}
             </button>
           </div>
 

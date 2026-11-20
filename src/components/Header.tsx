@@ -10,6 +10,7 @@ import {
   Shield,
   Layers,
   Bookmark,
+  History,
   CreditCard,
   ChevronDown,
   ArrowRight,
@@ -18,8 +19,8 @@ import {
 
 interface HeaderProps {
   currentUser: User | null;
-  activeView: 'tools' | 'library' | 'account' | 'admin';
-  onChangeView: (view: 'tools' | 'library' | 'account' | 'admin') => void;
+  activeView: 'tools' | 'library' | 'history' | 'account' | 'admin';
+  onChangeView: (view: 'tools' | 'library' | 'history' | 'account' | 'admin') => void;
   onOpenSignIn: () => void;
   onOpenUpgrade: () => void;
 }
@@ -94,7 +95,19 @@ export const Header: React.FC<HeaderProps> = ({
               }`}
             >
               <Bookmark className="w-4 h-4 text-blue-600" />
-              <span>My Library</span>
+              <span>Library</span>
+            </button>
+
+            <button
+              onClick={() => onChangeView('history')}
+              className={`px-3 py-2 rounded-xl transition-colors flex items-center gap-1.5 ${
+                activeView === 'history'
+                  ? 'bg-slate-100 text-slate-900 font-extrabold'
+                  : 'text-slate-600 hover:text-slate-900 hover:bg-slate-50'
+              }`}
+            >
+              <History className="w-4 h-4 text-indigo-600" />
+              <span>History</span>
             </button>
 
             <button
@@ -270,6 +283,12 @@ export const Header: React.FC<HeaderProps> = ({
             className={`px-2 py-1 rounded-lg ${activeView === 'library' ? 'bg-white shadow-xs text-blue-600' : 'text-slate-600'}`}
           >
             Library
+          </button>
+          <button
+            onClick={() => onChangeView('history')}
+            className={`px-2 py-1 rounded-lg ${activeView === 'history' ? 'bg-white shadow-xs text-indigo-600' : 'text-slate-600'}`}
+          >
+            History
           </button>
           <button
             onClick={() => onChangeView('account')}

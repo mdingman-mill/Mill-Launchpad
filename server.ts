@@ -6,7 +6,7 @@ import { fileURLToPath } from 'url';
 import { GoogleGenAI, ThinkingLevel } from '@google/genai';
 import { initializeApp, getApps, cert } from 'firebase-admin/app';
 import { getAuth } from 'firebase-admin/auth';
-import { getFirestore } from 'firebase-admin/firestore';
+import { FieldValue, getFirestore, initializeFirestore } from 'firebase-admin/firestore';
 
 dotenv.config();
 
@@ -62,8 +62,22 @@ const firebaseApp = getApps().length
       ...(credentialOption ? { credential: credentialOption } : {}),
     });
 
+function initAdminFirestore() {
+  const dbId =
+    firebaseConfig.firestoreDatabaseId && firebaseConfig.firestoreDatabaseId !== '(default)'
+      ? firebaseConfig.firestoreDatabaseId
+      : undefined;
+  try {
+    return dbId
+      ? initializeFirestore(firebaseApp, { preferRest: true }, dbId)
+      : initializeFirestore(firebaseApp, { preferRest: true });
+  } catch {
+    return dbId ? getFirestore(firebaseApp, dbId) : getFirestore(firebaseApp);
+  }
+}
+
 export const adminAuth = getAuth(firebaseApp);
-export const adminDb = getFirestore(firebaseApp, firebaseConfig.firestoreDatabaseId);
+export const adminDb = initAdminFirestore();
 
 // Super admin emails from environment variable
 const rawSuperAdminEmails = process.env.SUPER_ADMIN_EMAILS;
@@ -128,10 +142,38 @@ export function getNextMonthFirstDay(fromDate: Date = new Date()): string {
 
 class HttpError extends Error {
   status: number;
-  constructor(status: number, message: string) {
+  code?: string;
+  constructor(status: number, message: string, code?: string) {
     super(message);
     this.status = status;
+    this.code = code;
   }
+}
+
+export interface PlatformSettingsRecord {
+  id: 'platform';
+  inviteOnlyMode: boolean;
+  updatedAt?: string;
+  updatedBy?: string;
+  updatedByEmail?: string;
+}
+
+export async function getPlatformSettings(): Promise<PlatformSettingsRecord> {
+  const snap = await adminDb.collection('settings').doc('platform').get();
+  if (!snap.exists) {
+    return {
+      id: 'platform',
+      inviteOnlyMode: false,
+    };
+  }
+  const data = snap.data() || {};
+  return {
+    id: 'platform',
+    inviteOnlyMode: data.inviteOnlyMode === true,
+    updatedAt: typeof data.updatedAt === 'string' ? data.updatedAt : undefined,
+    updatedBy: typeof data.updatedBy === 'string' ? data.updatedBy : undefined,
+    updatedByEmail: typeof data.updatedByEmail === 'string' ? data.updatedByEmail : undefined,
+  };
 }
 
 function isValidFirestoreId(id: unknown): id is string {
@@ -164,6 +206,287 @@ const VALID_TOOL_IDS = new Set([
   'pitch-launch',
   'keywords-content',
 ]);
+
+export const PLAN_LIMITS: Record<string, number> = {
+  free: 50,
+  pro: 500,
+  team: 2000,
+  complimentary: 2000,
+};
+
+export const SEAT_LIMITS: Record<string, number> = {
+  free: 1,
+  pro: 1,
+  team: 5,
+  complimentary: 5,
+};
+
+function getDefaultSeatLimit(planId?: string): number {
+  return SEAT_LIMITS[planId || 'free'] || 1;
+}
+
+function getDefaultGenerationLimit(planId?: string): number {
+  return PLAN_LIMITS[planId || 'free'] || 50;
+}
+
+function buildOrgProfileFromOrgDoc(orgData: any): any | undefined {
+  if (!orgData || (!orgData.name && !orgData.whatTheyDo)) return undefined;
+  return {
+    orgName: orgData.name || 'My Organization',
+    ...(orgData.website ? { website: orgData.website } : {}),
+    type: orgData.type === 'Nonprofit' ? 'Nonprofit' : 'Startup',
+    whatTheyDo: orgData.whatTheyDo || '',
+    targetAudience: orgData.targetAudience || '',
+    goals: Array.isArray(orgData.goals) ? orgData.goals : [],
+    brandTone: Array.isArray(orgData.brandTone) && orgData.brandTone.length > 0 ? orgData.brandTone : ['Professional', 'Inspiring'],
+    budget: orgData.budget || 'Under $500/month',
+  };
+}
+
+function normalizeOrganizationRecord(orgId: string, data: any): any {
+  const planId = data?.planId || 'free';
+  const rawMembers = Array.isArray(data?.memberIds) ? data.memberIds : [];
+  const memberIds = Array.from(new Set([...rawMembers, ...(data?.ownerId ? [data.ownerId] : [])]));
+  return {
+    id: orgId,
+    name: data?.name || 'Personal Workspace',
+    ownerId: data?.ownerId || memberIds[0] || '',
+    memberIds,
+    planId,
+    seatLimit: Number(data?.seatLimit || getDefaultSeatLimit(planId)),
+    generationsUsedThisMonth: Number(data?.generationsUsedThisMonth || 0),
+    bonusGenerations: Number(data?.bonusGenerations || 0),
+    billingResetDate: data?.billingResetDate || getNextMonthFirstDay(),
+    ...(data?.type ? { type: data.type } : {}),
+    ...(data?.whatTheyDo ? { whatTheyDo: data.whatTheyDo } : {}),
+    ...(data?.targetAudience ? { targetAudience: data.targetAudience } : {}),
+    ...(Array.isArray(data?.goals) ? { goals: data.goals } : {}),
+    ...(Array.isArray(data?.brandTone) ? { brandTone: data.brandTone } : {}),
+    ...(data?.budget ? { budget: data.budget } : {}),
+    ...(data?.website ? { website: data.website } : {}),
+    ...(data?.createdAt ? { createdAt: data.createdAt } : {}),
+    ...(data?.updatedAt ? { updatedAt: data.updatedAt } : {}),
+  };
+}
+
+async function ensureOrganizationForUser(userData: any, uid: string, now: string): Promise<any> {
+  const orgId = isValidFirestoreId(userData.organizationId) ? userData.organizationId : `org_${uid}`;
+  const orgRef = adminDb.collection('organizations').doc(orgId);
+  const orgSnap = await orgRef.get();
+
+  if (!orgSnap.exists) {
+    const planId = userData.planId || 'free';
+    const profile = userData.organizationProfile;
+    const newOrg = {
+      id: orgId,
+      name: profile?.orgName || `${userData.name || 'Personal'}'s Workspace`,
+      ownerId: uid,
+      memberIds: [uid],
+      planId,
+      seatLimit: getDefaultSeatLimit(planId),
+      generationsUsedThisMonth: Number(userData.generationsUsedThisMonth || 0),
+      bonusGenerations: Number(userData.bonusGenerations || 0),
+      billingResetDate: userData.billingResetDate || getNextMonthFirstDay(),
+      ...(profile
+        ? {
+            type: profile.type || 'Startup',
+            whatTheyDo: profile.whatTheyDo || '',
+            targetAudience: profile.targetAudience || '',
+            goals: Array.isArray(profile.goals) ? profile.goals : [],
+            brandTone: Array.isArray(profile.brandTone) ? profile.brandTone : ['Professional', 'Inspiring'],
+            budget: profile.budget || 'Under $500/month',
+            website: profile.website || '',
+          }
+        : {}),
+      createdAt: userData.signupDate || now,
+      updatedAt: now,
+    };
+    await orgRef.set(newOrg, { merge: true });
+    return normalizeOrganizationRecord(orgId, newOrg);
+  }
+
+  const rawOrg = orgSnap.data()!;
+  const patch: Record<string, any> = {};
+  const planId = rawOrg.planId || userData.planId || 'free';
+  if (!rawOrg.planId) patch.planId = planId;
+  if (typeof rawOrg.seatLimit !== 'number' || rawOrg.seatLimit < 1) {
+    patch.seatLimit = getDefaultSeatLimit(planId);
+  }
+  if (typeof rawOrg.generationsUsedThisMonth !== 'number') {
+    patch.generationsUsedThisMonth = Number(userData.generationsUsedThisMonth || 0);
+  }
+  if (typeof rawOrg.bonusGenerations !== 'number') {
+    patch.bonusGenerations = Number(userData.bonusGenerations || 0);
+  }
+  if (!rawOrg.billingResetDate) {
+    patch.billingResetDate = userData.billingResetDate || getNextMonthFirstDay();
+  }
+  const existingMembers = Array.isArray(rawOrg.memberIds) ? rawOrg.memberIds : [];
+  if (!existingMembers.includes(uid) && rawOrg.ownerId === uid) {
+    patch.memberIds = Array.from(new Set([...existingMembers, uid]));
+  }
+  const todayStr = new Date().toISOString().split('T')[0];
+  const resetDate = patch.billingResetDate || rawOrg.billingResetDate;
+  if (resetDate && todayStr >= resetDate) {
+    patch.generationsUsedThisMonth = 0;
+    patch.billingResetDate = getNextMonthFirstDay();
+  }
+  if (Object.keys(patch).length > 0) {
+    patch.updatedAt = now;
+    await orgRef.set(patch, { merge: true });
+  }
+  return normalizeOrganizationRecord(orgId, { ...rawOrg, ...patch });
+}
+
+async function syncPlanToOrgMembers(orgId: string, planId: string, now: string): Promise<void> {
+  const orgSnap = await adminDb.collection('organizations').doc(orgId).get();
+  if (!orgSnap.exists) return;
+  const orgData = orgSnap.data()!;
+  const memberIds = Array.from(
+    new Set([...(Array.isArray(orgData.memberIds) ? orgData.memberIds : []), ...(orgData.ownerId ? [orgData.ownerId] : [])])
+  );
+  if (memberIds.length === 0) return;
+
+  for (let i = 0; i < memberIds.length; i += 400) {
+    const batch = adminDb.batch();
+    for (const mId of memberIds.slice(i, i + 400)) {
+      if (isValidFirestoreId(mId)) {
+        batch.set(adminDb.collection('users').doc(mId), { planId, updatedAt: now }, { merge: true });
+      }
+    }
+    await batch.commit();
+  }
+}
+
+async function movePersonalOutputsToTeamOrg(uid: string, fromOrgId: string, toOrgId: string, now: string): Promise<number> {
+  if (!fromOrgId || !toOrgId || fromOrgId === toOrgId) return 0;
+
+  const fromOrgRef = adminDb.collection('organizations').doc(fromOrgId);
+  const fromOrgSnap = await fromOrgRef.get();
+  if (fromOrgSnap.exists) {
+    const fromData = fromOrgSnap.data()!;
+    const fromMembers = Array.from(
+      new Set([...(Array.isArray(fromData.memberIds) ? fromData.memberIds : []), ...(fromData.ownerId ? [fromData.ownerId] : [])])
+    );
+    if (fromData.ownerId !== uid || fromMembers.length > 1) {
+      // Do not move outputs out of a multi-member or non-owned organization
+      return 0;
+    }
+  } else if (fromOrgId !== `org_${uid}`) {
+    return 0;
+  }
+
+  const outputsSnap = await fromOrgRef.collection('outputs').get();
+  let movedCount = 0;
+
+  if (!outputsSnap.empty) {
+    const toOutputsCol = adminDb.collection('organizations').doc(toOrgId).collection('outputs');
+    const docs = outputsSnap.docs;
+    for (let i = 0; i < docs.length; i += 200) {
+      const batch = adminDb.batch();
+      const chunk = docs.slice(i, i + 200);
+      for (const docSnap of chunk) {
+        const data = docSnap.data();
+        batch.set(
+          toOutputsCol.doc(docSnap.id),
+          {
+            ...data,
+            id: docSnap.id,
+            userId: data.userId || uid,
+            orgId: toOrgId,
+            updatedAt: now,
+          },
+          { merge: true }
+        );
+        batch.delete(docSnap.ref);
+        movedCount++;
+      }
+      await batch.commit();
+    }
+  }
+
+  // Clean up empty solo personal org record if it had no other members
+  if (fromOrgSnap.exists) {
+    const fromData = fromOrgSnap.data()!;
+    const fromMembers = Array.from(
+      new Set([...(Array.isArray(fromData.memberIds) ? fromData.memberIds : []), ...(fromData.ownerId ? [fromData.ownerId] : [])])
+    );
+    if (fromData.ownerId === uid && fromMembers.length <= 1) {
+      await fromOrgRef.delete().catch(() => {});
+    }
+  }
+
+  return movedCount;
+}
+
+async function createPersonalFreeOrgForUser(
+  uid: string,
+  userData: any,
+  now: string
+): Promise<{ orgId: string; org: any }> {
+  const preferredId = `org_${uid}`;
+  const preferredSnap = await adminDb.collection('organizations').doc(preferredId).get();
+  const orgId =
+    !preferredSnap.exists || preferredSnap.data()?.ownerId === uid
+      ? preferredId
+      : `org_${uid}_${Date.now()}`;
+
+  const resetDate = getNextMonthFirstDay();
+  const personalOrg = {
+    id: orgId,
+    name: `${userData?.name || userData?.email?.split('@')[0] || 'Personal'}'s Workspace`,
+    ownerId: uid,
+    memberIds: [uid],
+    planId: 'free',
+    seatLimit: SEAT_LIMITS.free,
+    generationsUsedThisMonth: 0,
+    bonusGenerations: 0,
+    billingResetDate: resetDate,
+    createdAt: now,
+    updatedAt: now,
+  };
+
+  await adminDb.collection('organizations').doc(orgId).set(personalOrg, { merge: false });
+  return { orgId, org: personalOrg };
+}
+
+async function getOrgSeatStats(orgId: string, orgData: any): Promise<{
+  memberIds: string[];
+  pendingCount: number;
+  seatsUsed: number;
+  seatLimit: number;
+  invites: any[];
+}> {
+  const memberIds = Array.from(
+    new Set([...(Array.isArray(orgData.memberIds) ? orgData.memberIds : []), ...(orgData.ownerId ? [orgData.ownerId] : [])])
+  );
+  const invitesSnap = await adminDb.collection('organizations').doc(orgId).collection('invites').get();
+  const nowMs = Date.now();
+  const invites: any[] = [];
+  let pendingCount = 0;
+
+  for (const docSnap of invitesSnap.docs) {
+    const inv = docSnap.data();
+    let status = inv.status || 'pending';
+    if (status === 'pending' && inv.expiresAt && new Date(inv.expiresAt).getTime() <= nowMs) {
+      status = 'expired';
+      await docSnap.ref.update({ status: 'expired' }).catch(() => {});
+      await adminDb.collection('teamInvites').doc(docSnap.id).update({ status: 'expired' }).catch(() => {});
+    }
+    if (status === 'pending') pendingCount++;
+    invites.push({ id: docSnap.id, ...inv, status });
+  }
+
+  invites.sort((a, b) => new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime());
+  const seatLimit = Number(orgData.seatLimit || getDefaultSeatLimit(orgData.planId || 'free'));
+  return {
+    memberIds,
+    pendingCount,
+    seatsUsed: memberIds.length + pendingCount,
+    seatLimit,
+    invites,
+  };
+}
 
 // Token verification helper
 export async function verifyFirebaseTokenFromHeader(
@@ -233,15 +556,88 @@ export async function logServerAudit(
 
 // 1. Health check
 export async function handleHealthCheck(): Promise<{ status: number; data: any }> {
+  let inviteOnlyMode = false;
+  try {
+    const settings = await getPlatformSettings();
+    inviteOnlyMode = settings.inviteOnlyMode;
+  } catch {
+    // Keep health check resilient if Firestore is momentarily unreachable
+  }
+
   return {
     status: 200,
     data: {
       status: 'ok',
       geminiAvailable: !!(process.env.GEMINI_API_KEY || apiKey),
       firebaseConfigured: true,
+      inviteOnlyMode,
       timestamp: new Date().toISOString(),
     },
   };
+}
+
+// 1b. Public platform settings (non-PII flags only)
+export async function handleGetPublicSettings(): Promise<{ status: number; data: any }> {
+  try {
+    const settings = await getPlatformSettings();
+    return {
+      status: 200,
+      data: {
+        inviteOnlyMode: settings.inviteOnlyMode,
+        paidPlansDisabled: settings.inviteOnlyMode,
+        selfSignupDisabled: settings.inviteOnlyMode,
+        ...(settings.updatedAt ? { updatedAt: settings.updatedAt } : {}),
+      },
+    };
+  } catch (err: any) {
+    console.error('[Get Public Settings Error]:', err.message);
+    return { status: 503, data: { error: 'Unable to load platform settings' } };
+  }
+}
+
+// 1c. Super admin update platform settings
+export async function handleUpdatePlatformSettings(
+  authHeader: string | null | undefined,
+  body: any
+): Promise<{ status: number; data: any }> {
+  try {
+    const verified = await requireSuperAdmin(authHeader);
+    if (typeof body?.inviteOnlyMode !== 'boolean') {
+      return { status: 400, data: { error: 'inviteOnlyMode must be a boolean' } };
+    }
+
+    const inviteOnlyMode = body.inviteOnlyMode === true;
+    const now = new Date().toISOString();
+    const record: PlatformSettingsRecord = {
+      id: 'platform',
+      inviteOnlyMode,
+      updatedAt: now,
+      updatedBy: verified.uid,
+      updatedByEmail: verified.email || '',
+    };
+
+    await adminDb.collection('settings').doc('platform').set(record, { merge: true });
+
+    await logServerAudit(
+      'SETTINGS_UPDATED',
+      `Invite-Only Mode ${inviteOnlyMode ? 'ENABLED (self-account creation and paid plans disabled)' : 'DISABLED (self-account creation and paid plans enabled)'}`,
+      verified
+    );
+
+    return {
+      status: 200,
+      data: {
+        settings: {
+          inviteOnlyMode,
+          paidPlansDisabled: inviteOnlyMode,
+          selfSignupDisabled: inviteOnlyMode,
+          updatedAt: now,
+        },
+      },
+    };
+  } catch (err: any) {
+    return { status: err.status || 500, data: { error: err.message } };
+  }
 }
 
 // 2. Auth sync
@@ -255,31 +651,108 @@ export async function handleAuthSync(authHeader?: string | null): Promise<{ stat
     const now = new Date().toISOString();
     const userRef = adminDb.collection('users').doc(verified.uid);
 
-    let userData: any = null;
+    let snap;
+    let platformSettings: PlatformSettingsRecord;
     try {
-      const snap = await userRef.get();
-      if (snap.exists) {
-        const existing = snap.data()!;
-        const resolvedRole = isSuperAdmin
-          ? 'super_admin'
-          : existing.role === 'super_admin'
-          ? 'member'
-          : existing.role || role;
-        userData = {
-          ...existing,
-          email: email || (existing.email ? String(existing.email).trim().toLowerCase() : ''),
-          name: verified.name || existing.name || email.split('@')[0],
-          avatar: verified.picture || existing.avatar,
-          role: resolvedRole,
-          lastLogin: now,
-        };
-        await userRef.set(userData, { merge: true });
-      }
+      [snap, platformSettings] = await Promise.all([userRef.get(), getPlatformSettings()]);
     } catch (e: any) {
-      console.warn('[Firestore Sync Read Warning]:', e.message);
+      console.error('[Firestore Sync Read Error]:', e.message);
+      throw new HttpError(503, 'Service temporarily unavailable while verifying account access.');
     }
 
-    if (!userData) {
+    // Look up pending complimentary & team invites matching verified email up front (single-field queries, no composite index needed)
+    let pendingInviteDocs: FirebaseFirestore.QueryDocumentSnapshot[] = [];
+    let pendingTeamInviteDocs: FirebaseFirestore.QueryDocumentSnapshot[] = [];
+    if (verified.emailVerified && email) {
+      try {
+        const [compSnap, teamSnap] = await Promise.all([
+          adminDb.collection('invites').where('email', '==', email).get(),
+          adminDb.collection('teamInvites').where('email', '==', email).get(),
+        ]);
+
+        for (const docSnap of compSnap.docs) {
+          const inv = docSnap.data();
+          if (inv.status !== 'pending') continue;
+          const expiresAt = inv.expiresAt;
+          if (expiresAt && new Date(expiresAt).getTime() <= Date.now()) {
+            await docSnap.ref.update({ status: 'expired' }).catch(() => {});
+          } else {
+            pendingInviteDocs.push(docSnap);
+          }
+        }
+
+        for (const docSnap of teamSnap.docs) {
+          const inv = docSnap.data();
+          if (inv.status !== 'pending') continue;
+          const expiresAt = inv.expiresAt;
+          if (expiresAt && new Date(expiresAt).getTime() <= Date.now()) {
+            await docSnap.ref.update({ status: 'expired' }).catch(() => {});
+            if (isValidFirestoreId(inv.orgId)) {
+              await adminDb
+                .collection('organizations')
+                .doc(inv.orgId)
+                .collection('invites')
+                .doc(docSnap.id)
+                .update({ status: 'expired' })
+                .catch(() => {});
+            }
+          } else {
+            pendingTeamInviteDocs.push(docSnap);
+          }
+        }
+      } catch (invErr: any) {
+        if (!snap.exists && platformSettings.inviteOnlyMode && !isSuperAdmin) {
+          throw new HttpError(503, 'Unable to verify invitation status. Please try again.');
+        }
+        console.warn('[Invite Check Warning]:', invErr.message);
+      }
+    }
+
+    // Block self-account creation when Invite-Only Mode is active (unless super admin or valid complimentary/team invite)
+    if (
+      !snap.exists &&
+      platformSettings.inviteOnlyMode &&
+      !isSuperAdmin &&
+      pendingInviteDocs.length === 0 &&
+      pendingTeamInviteDocs.length === 0
+    ) {
+      throw new HttpError(
+        403,
+        'Invite-only mode is active. Self-account creation is disabled—an invitation from a Millennium Agency administrator is required.',
+        'INVITE_ONLY_REQUIRED'
+      );
+    }
+
+    let userData: any = null;
+    if (snap.exists) {
+      const existing = snap.data()!;
+      const resolvedRole = isSuperAdmin
+        ? 'super_admin'
+        : existing.role === 'super_admin'
+        ? 'member'
+        : existing.role || role;
+      const resolvedOrgId = isValidFirestoreId(existing.organizationId)
+        ? existing.organizationId
+        : `org_${verified.uid}`;
+      const resolvedOrgRole = existing.orgRole === 'member' || existing.orgRole === 'owner' ? existing.orgRole : 'owner';
+
+      userData = {
+        ...existing,
+        id: verified.uid,
+        email: email || (existing.email ? String(existing.email).trim().toLowerCase() : ''),
+        name: verified.name || existing.name || email.split('@')[0],
+        avatar: verified.picture || existing.avatar,
+        role: resolvedRole,
+        organizationId: resolvedOrgId,
+        orgRole: resolvedOrgRole,
+        lastLogin: now,
+      };
+      try {
+        await userRef.set(userData, { merge: true });
+      } catch (e: any) {
+        console.warn('[Firestore Sync Write Warning]:', e.message);
+      }
+    } else {
       userData = {
         id: verified.uid,
         email,
@@ -290,7 +763,10 @@ export async function handleAuthSync(authHeader?: string | null): Promise<{ stat
         role,
         planId: 'free',
         status: 'active',
+        organizationId: `org_${verified.uid}`,
+        orgRole: 'owner',
         generationsUsedThisMonth: 0,
+        totalGenerations: 0,
         bonusGenerations: 0,
         billingResetDate: getNextMonthFirstDay(),
         nonprofitDiscountApproved: false,
@@ -300,52 +776,201 @@ export async function handleAuthSync(authHeader?: string | null): Promise<{ stat
       try {
         await userRef.set(userData, { merge: true });
       } catch (e: any) {
-        console.warn('[Firestore Sync Write Warning]:', e.message);
+        console.error('[Firestore Sync Create Error]:', e.message);
+        throw new HttpError(503, 'Failed to initialize account record. Please try again.');
       }
     }
 
-    // Check for pending, unexpired invite matching user's exact verified email
-    if (verified.emailVerified && email && userData.status !== 'suspended') {
+    // Ensure user has an organization document
+    let orgData = await ensureOrganizationForUser(userData, verified.uid, now);
+
+    // Claim first valid pending complimentary invite matching user's exact verified email (updates organization planId)
+    if (pendingInviteDocs.length > 0 && userData.status !== 'suspended') {
       try {
-        const inviteSnap = await adminDb
-          .collection('invites')
-          .where('email', '==', email)
-          .where('status', '==', 'pending')
-          .get();
-
-        if (!inviteSnap.empty) {
-          for (const docSnap of inviteSnap.docs) {
-            const inv = docSnap.data();
-            const expiresAt = inv.expiresAt;
-            if (expiresAt && new Date(expiresAt).getTime() <= Date.now()) {
-              await docSnap.ref.update({ status: 'expired' });
-            } else {
-              const claimed = await adminDb.runTransaction(async (tx) => {
-                const freshInv = await tx.get(docSnap.ref);
-                if (!freshInv.exists || freshInv.data()?.status !== 'pending') {
-                  return false;
-                }
-                tx.set(userRef, { planId: 'complimentary', updatedAt: now }, { merge: true });
-                tx.update(docSnap.ref, {
-                  status: 'accepted',
-                  acceptedAt: now,
-                  acceptedBy: verified.uid,
-                });
-                return true;
-              });
-
-              if (claimed) {
-                userData.planId = 'complimentary';
-                await logServerAudit('INVITE_ACCEPTED', `Accepted complimentary access invite for ${email}`, verified, verified.uid);
-                await logServerAudit('PLAN_CHANGED', `Plan changed to complimentary for ${email} via invite`, verified, verified.uid);
-                break;
-              }
+        for (const docSnap of pendingInviteDocs) {
+          const targetOrgRef = adminDb.collection('organizations').doc(orgData.id);
+          const claimed = await adminDb.runTransaction(async (tx) => {
+            const [freshInv, freshOrg] = await Promise.all([tx.get(docSnap.ref), tx.get(targetOrgRef)]);
+            if (!freshInv.exists || freshInv.data()?.status !== 'pending') {
+              return false;
             }
+            const currentSeatLimit = Number(freshOrg.data()?.seatLimit || 1);
+            tx.set(
+              targetOrgRef,
+              {
+                planId: 'complimentary',
+                seatLimit: Math.max(currentSeatLimit, SEAT_LIMITS.complimentary),
+                updatedAt: now,
+              },
+              { merge: true }
+            );
+            tx.set(userRef, { planId: 'complimentary', updatedAt: now }, { merge: true });
+            tx.update(docSnap.ref, {
+              status: 'accepted',
+              acceptedAt: now,
+              acceptedBy: verified.uid,
+            });
+            return true;
+          });
+
+          if (claimed) {
+            userData.planId = 'complimentary';
+            orgData = {
+              ...orgData,
+              planId: 'complimentary',
+              seatLimit: Math.max(orgData.seatLimit || 1, SEAT_LIMITS.complimentary),
+            };
+            await syncPlanToOrgMembers(orgData.id, 'complimentary', now);
+            await logServerAudit('INVITE_ACCEPTED', `Accepted complimentary access invite for ${email}`, verified, verified.uid);
+            await logServerAudit('PLAN_CHANGED', `Organization ${orgData.id} plan changed to complimentary for ${email} via invite`, verified, verified.uid);
+            break;
           }
         }
       } catch (invErr: any) {
-        console.warn('[Invite Check Warning]:', invErr.message);
+        console.warn('[Invite Claim Warning]:', invErr.message);
       }
+    }
+
+    // Claim first valid pending unexpired team invite matching user's exact verified email
+    if (pendingTeamInviteDocs.length > 0 && userData.status !== 'suspended') {
+      for (const teamInvDoc of pendingTeamInviteDocs) {
+        try {
+          const teamInvData = teamInvDoc.data();
+          const targetOrgId = teamInvData.orgId;
+          if (!isValidFirestoreId(targetOrgId)) continue;
+
+          const targetOrgRef = adminDb.collection('organizations').doc(targetOrgId);
+          const orgInviteRef = targetOrgRef.collection('invites').doc(teamInvDoc.id);
+          const prevOrgId = userData.organizationId || `org_${verified.uid}`;
+
+          const joinResult = await adminDb.runTransaction(async (tx) => {
+            const [freshTeamInv, freshOrgInv, freshTargetOrg] = await Promise.all([
+              tx.get(teamInvDoc.ref),
+              tx.get(orgInviteRef),
+              tx.get(targetOrgRef),
+            ]);
+
+            if (!freshTeamInv.exists || freshTeamInv.data()?.status !== 'pending') {
+              return { joined: false, reason: 'not_pending' };
+            }
+            if (freshOrgInv.exists && freshOrgInv.data()?.status !== 'pending') {
+              return { joined: false, reason: 'not_pending' };
+            }
+            if (!freshTargetOrg.exists) {
+              return { joined: false, reason: 'org_missing' };
+            }
+
+            const tOrg = freshTargetOrg.data()!;
+            const existingMembers: string[] = Array.from(
+              new Set([
+                ...(Array.isArray(tOrg.memberIds) ? tOrg.memberIds : []),
+                ...(tOrg.ownerId ? [tOrg.ownerId] : []),
+              ])
+            );
+            const targetSeatLimit = Number(tOrg.seatLimit || getDefaultSeatLimit(tOrg.planId));
+
+            if (!existingMembers.includes(verified.uid) && existingMembers.length >= targetSeatLimit) {
+              return { joined: false, reason: 'seat_limit' };
+            }
+
+            const updatedMembers = Array.from(new Set([...existingMembers, verified.uid]));
+            const targetPlanId = tOrg.planId || 'free';
+            const nextOrgRole = tOrg.ownerId === verified.uid ? 'owner' : 'member';
+            const sharedProfile = buildOrgProfileFromOrgDoc(tOrg);
+
+            tx.set(
+              targetOrgRef,
+              {
+                memberIds: updatedMembers,
+                updatedAt: now,
+              },
+              { merge: true }
+            );
+            tx.set(
+              userRef,
+              {
+                organizationId: targetOrgId,
+                orgRole: nextOrgRole,
+                planId: targetPlanId,
+                ...(sharedProfile ? { organizationProfile: sharedProfile } : {}),
+                updatedAt: now,
+              },
+              { merge: true }
+            );
+            tx.set(
+              teamInvDoc.ref,
+              { status: 'accepted', acceptedAt: now, acceptedBy: verified.uid },
+              { merge: true }
+            );
+            if (freshOrgInv.exists) {
+              tx.set(
+                orgInviteRef,
+                { status: 'accepted', acceptedAt: now, acceptedBy: verified.uid },
+                { merge: true }
+              );
+            }
+
+            return {
+              joined: true,
+              targetPlanId,
+              nextOrgRole,
+              targetOrgData: normalizeOrganizationRecord(targetOrgId, { ...tOrg, memberIds: updatedMembers }),
+              sharedProfile,
+            };
+          });
+
+          if (joinResult.joined && joinResult.targetOrgData) {
+            if (prevOrgId && prevOrgId !== targetOrgId) {
+              const movedCount = await movePersonalOutputsToTeamOrg(verified.uid, prevOrgId, targetOrgId, now);
+              if (movedCount > 0) {
+                console.log(`[Team Join] Moved ${movedCount} personal library outputs from ${prevOrgId} to ${targetOrgId}`);
+              }
+            }
+            userData.organizationId = targetOrgId;
+            userData.orgRole = joinResult.nextOrgRole;
+            userData.planId = joinResult.targetPlanId;
+            if (joinResult.sharedProfile) {
+              userData.organizationProfile = joinResult.sharedProfile;
+            }
+            orgData = joinResult.targetOrgData;
+
+            await logServerAudit(
+              'TEAM_MEMBER_ADDED',
+              `Added ${email} as member to organization ${orgData.name} (${targetOrgId}) via team invite ${teamInvDoc.id}`,
+              verified,
+              verified.uid
+            );
+            break;
+          }
+        } catch (teamErr: any) {
+          console.warn('[Team Invite Claim Warning]:', teamErr.message);
+        }
+      }
+    }
+
+    // Ensure user reflects authoritative organization planId, orgRole, and profile
+    const authoritativeOrgSnap = await adminDb.collection('organizations').doc(orgData.id).get();
+    if (authoritativeOrgSnap.exists) {
+      orgData = normalizeOrganizationRecord(orgData.id, authoritativeOrgSnap.data());
+    }
+    const authoritativeOrgRole = orgData.ownerId === verified.uid ? 'owner' : 'member';
+    const orgSharedProfile = buildOrgProfileFromOrgDoc(orgData);
+    const syncPatch: Record<string, any> = {};
+    if (userData.planId !== orgData.planId) {
+      userData.planId = orgData.planId;
+      syncPatch.planId = orgData.planId;
+    }
+    if (userData.orgRole !== authoritativeOrgRole) {
+      userData.orgRole = authoritativeOrgRole;
+      syncPatch.orgRole = authoritativeOrgRole;
+    }
+    if (orgSharedProfile && JSON.stringify(userData.organizationProfile || {}) !== JSON.stringify(orgSharedProfile)) {
+      userData.organizationProfile = orgSharedProfile;
+      syncPatch.organizationProfile = orgSharedProfile;
+    }
+    if (Object.keys(syncPatch).length > 0) {
+      syncPatch.updatedAt = now;
+      await userRef.set(syncPatch, { merge: true }).catch(() => {});
     }
 
     if (isSuperAdmin) {
@@ -366,10 +991,28 @@ export async function handleAuthSync(authHeader?: string | null): Promise<{ stat
       await adminDb.collection('admins').doc(verified.uid).delete().catch(() => {});
     }
 
-    return { status: 200, data: { user: userData } };
+    return {
+      status: 200,
+      data: {
+        user: userData,
+        organization: orgData,
+        platformSettings: {
+          inviteOnlyMode: platformSettings.inviteOnlyMode,
+          paidPlansDisabled: platformSettings.inviteOnlyMode,
+          selfSignupDisabled: platformSettings.inviteOnlyMode,
+          ...(platformSettings.updatedAt ? { updatedAt: platformSettings.updatedAt } : {}),
+        },
+      },
+    };
   } catch (err: any) {
     console.error('[Auth Sync Error]', err.message);
-    return { status: err.status || 401, data: { error: err.message || 'Unauthorized: Firebase ID token verification failed' } };
+    return {
+      status: err.status || 401,
+      data: {
+        error: err.message || 'Unauthorized: Firebase ID token verification failed',
+        ...(err.code ? { code: err.code } : {}),
+      },
+    };
   }
 }
 
@@ -481,25 +1124,45 @@ export async function handleRevokeInvite(
       revokedBy: verified.uid,
     });
 
-    // Revoking an invite moves an accepted user back to the free plan
+    // Revoking an invite moves an accepted invitee's organization back to the free plan
     const targetEmail = (invData.email || '').trim().toLowerCase();
+    const revertedOrgIds = new Set<string>();
     const revertedUserIds = new Set<string>();
 
-    if (invData.acceptedBy && isValidFirestoreId(invData.acceptedBy)) {
-      const acceptedUserRef = adminDb.collection('users').doc(invData.acceptedBy);
-      const acceptedSnap = await acceptedUserRef.get();
-      if (acceptedSnap.exists && acceptedSnap.data()?.planId === 'complimentary') {
-        await acceptedUserRef.update({
+    const revertUserAndOrg = async (uDocId: string, uData: any) => {
+      const orgId = isValidFirestoreId(uData?.organizationId) ? uData.organizationId : `org_${uDocId}`;
+      if (!revertedOrgIds.has(orgId)) {
+        const orgRef = adminDb.collection('organizations').doc(orgId);
+        const orgSnap = await orgRef.get();
+        if (orgSnap.exists && orgSnap.data()?.planId === 'complimentary') {
+          await orgRef.update({
+            planId: 'free',
+            seatLimit: SEAT_LIMITS.free,
+            updatedAt: now,
+          });
+          await syncPlanToOrgMembers(orgId, 'free', now);
+          revertedOrgIds.add(orgId);
+          await logServerAudit(
+            'PLAN_CHANGED',
+            `Organization ${orgId} plan reverted to free due to invite revocation for ${targetEmail}`,
+            verified,
+            uDocId
+          );
+        }
+      }
+      if (!revertedUserIds.has(uDocId) && uData?.planId === 'complimentary') {
+        await adminDb.collection('users').doc(uDocId).update({
           planId: 'free',
           updatedAt: now,
         });
-        revertedUserIds.add(acceptedSnap.id);
-        await logServerAudit(
-          'PLAN_CHANGED',
-          `Plan reverted to free due to invite revocation for ${targetEmail}`,
-          verified,
-          acceptedSnap.id
-        );
+        revertedUserIds.add(uDocId);
+      }
+    };
+
+    if (invData.acceptedBy && isValidFirestoreId(invData.acceptedBy)) {
+      const acceptedSnap = await adminDb.collection('users').doc(invData.acceptedBy).get();
+      if (acceptedSnap.exists) {
+        await revertUserAndOrg(acceptedSnap.id, acceptedSnap.data());
       }
     }
 
@@ -511,19 +1174,7 @@ export async function handleRevokeInvite(
 
       for (const uDoc of userQuery.docs) {
         if (revertedUserIds.has(uDoc.id)) continue;
-        const uData = uDoc.data();
-        if (uData.planId === 'complimentary') {
-          await uDoc.ref.update({
-            planId: 'free',
-            updatedAt: now,
-          });
-          await logServerAudit(
-            'PLAN_CHANGED',
-            `Plan reverted to free due to invite revocation for ${targetEmail}`,
-            verified,
-            uDoc.id
-          );
-        }
+        await revertUserAndOrg(uDoc.id, uDoc.data());
       }
     }
 
@@ -608,8 +1259,19 @@ export async function handleAcceptInvite(
     const userRef = adminDb.collection('users').doc(verified.uid);
     const now = new Date().toISOString();
 
+    const preUserSnap = await userRef.get();
+    const targetOrgId = isValidFirestoreId(preUserSnap.data()?.organizationId)
+      ? preUserSnap.data()!.organizationId
+      : `org_${verified.uid}`;
+    const orgRef = adminDb.collection('organizations').doc(targetOrgId);
+
     await adminDb.runTransaction(async (tx) => {
-      const snap = await tx.get(inviteRef);
+      const [snap, userSnap, orgSnap] = await Promise.all([
+        tx.get(inviteRef),
+        tx.get(userRef),
+        tx.get(orgRef),
+      ]);
+
       if (!snap.exists) {
         throw new HttpError(404, 'Invite not found');
       }
@@ -638,19 +1300,76 @@ export async function handleAcceptInvite(
         throw new HttpError(400, 'This invitation has already been used or is no longer pending.');
       }
 
-      const userSnap = await tx.get(userRef);
       if (userSnap.exists && userSnap.data()?.status === 'suspended') {
         throw new HttpError(403, 'Your account is currently suspended. Please contact support.');
       }
 
-      tx.set(
-        userRef,
-        {
+      const nextSeatLimit = orgSnap.exists
+        ? Math.max(Number(orgSnap.data()?.seatLimit || 1), SEAT_LIMITS.complimentary)
+        : SEAT_LIMITS.complimentary;
+
+      if (!orgSnap.exists) {
+        tx.set(orgRef, {
+          id: targetOrgId,
+          name:
+            userSnap.data()?.organizationProfile?.orgName ||
+            `${verified.name || userEmail.split('@')[0] || 'Personal'}'s Workspace`,
+          ownerId: verified.uid,
+          memberIds: [verified.uid],
           planId: 'complimentary',
+          seatLimit: nextSeatLimit,
+          generationsUsedThisMonth: Number(userSnap.data()?.generationsUsedThisMonth || 0),
+          bonusGenerations: Number(userSnap.data()?.bonusGenerations || 0),
+          billingResetDate: userSnap.data()?.billingResetDate || getNextMonthFirstDay(),
+          createdAt: now,
           updatedAt: now,
-        },
-        { merge: true }
-      );
+        });
+      } else {
+        tx.set(
+          orgRef,
+          {
+            planId: 'complimentary',
+            seatLimit: nextSeatLimit,
+            updatedAt: now,
+          },
+          { merge: true }
+        );
+      }
+
+      if (!userSnap.exists) {
+        tx.set(userRef, {
+          id: verified.uid,
+          email: userEmail,
+          name: verified.name || userEmail.split('@')[0] || 'User',
+          avatar:
+            verified.picture ||
+            `https://api.dicebear.com/7.x/initials/svg?seed=${encodeURIComponent(verified.name || userEmail)}`,
+          role: 'member',
+          planId: 'complimentary',
+          status: 'active',
+          organizationId: targetOrgId,
+          orgRole: 'owner',
+          generationsUsedThisMonth: 0,
+          totalGenerations: 0,
+          bonusGenerations: 0,
+          billingResetDate: getNextMonthFirstDay(),
+          nonprofitDiscountApproved: false,
+          signupDate: now,
+          lastLogin: now,
+          updatedAt: now,
+        });
+      } else {
+        tx.set(
+          userRef,
+          {
+            planId: 'complimentary',
+            organizationId: targetOrgId,
+            orgRole: userSnap.data()?.orgRole || 'owner',
+            updatedAt: now,
+          },
+          { merge: true }
+        );
+      }
 
       tx.update(inviteRef, {
         status: 'accepted',
@@ -659,17 +1378,19 @@ export async function handleAcceptInvite(
       });
     });
 
+    await syncPlanToOrgMembers(targetOrgId, 'complimentary', now);
     await logServerAudit('INVITE_ACCEPTED', `User ${userEmail} accepted complimentary access invite ${inviteId}`, verified, verified.uid);
-    await logServerAudit('PLAN_CHANGED', `Plan changed to complimentary for ${userEmail} via invite ${inviteId}`, verified, verified.uid);
+    await logServerAudit('PLAN_CHANGED', `Organization ${targetOrgId} plan changed to complimentary for ${userEmail} via invite ${inviteId}`, verified, verified.uid);
 
-    const userSnap = await userRef.get();
-    return { status: 200, data: { success: true, user: userSnap.data() } };
+    const [finalUserSnap, finalOrgSnap] = await Promise.all([userRef.get(), orgRef.get()]);
+    const finalOrg = finalOrgSnap.exists ? normalizeOrganizationRecord(targetOrgId, finalOrgSnap.data()) : null;
+    return { status: 200, data: { success: true, user: finalUserSnap.data(), organization: finalOrg } };
   } catch (err: any) {
     return { status: err.status || 500, data: { error: err.message } };
   }
 }
 
-// 8. Super admin update user plan
+// 8. Super admin update user / organization plan
 export async function handleUpdateUserPlan(
   authHeader: string | null | undefined,
   userId?: string,
@@ -685,23 +1406,50 @@ export async function handleUpdateUserPlan(
       return { status: 400, data: { error: 'Invalid planId' } };
     }
 
+    const platformSettings = await getPlatformSettings();
+    if (platformSettings.inviteOnlyMode && (planId === 'pro' || planId === 'team')) {
+      return {
+        status: 403,
+        data: { error: 'Paid plans (Pro and Team) are disabled while Invite-Only Mode is active.' },
+      };
+    }
+
     const userRef = adminDb.collection('users').doc(userId);
     const snap = await userRef.get();
     if (!snap.exists) {
       return { status: 404, data: { error: 'User not found' } };
     }
 
-    const prevPlan = snap.data()?.planId || 'free';
-    const targetEmail = snap.data()?.email || userId;
+    const uData = snap.data()!;
+    const prevPlan = uData.planId || 'free';
+    const targetEmail = uData.email || userId;
+    const now = new Date().toISOString();
+    const orgId = isValidFirestoreId(uData.organizationId) ? uData.organizationId : `org_${userId}`;
+
+    const orgRef = adminDb.collection('organizations').doc(orgId);
+    const orgSnap = await orgRef.get();
+    const newSeatLimit = getDefaultSeatLimit(planId);
+
+    if (orgSnap.exists) {
+      await orgRef.update({
+        planId,
+        seatLimit: newSeatLimit,
+        updatedAt: now,
+      });
+    } else {
+      await ensureOrganizationForUser({ ...uData, planId, organizationId: orgId }, userId, now);
+    }
 
     await userRef.update({
       planId,
-      updatedAt: new Date().toISOString(),
+      organizationId: orgId,
+      updatedAt: now,
     });
+    await syncPlanToOrgMembers(orgId, planId, now);
 
     await logServerAudit(
       'PLAN_CHANGED',
-      `Super admin changed plan for ${targetEmail} from ${prevPlan} to ${planId}`,
+      `Super admin changed plan for ${targetEmail} (org ${orgId}) from ${prevPlan} to ${planId}`,
       verified,
       userId
     );
@@ -795,27 +1543,49 @@ export async function handleAdminUserAction(
       if (!Number.isInteger(amount) || amount < 1 || amount > 10000) {
         return { status: 400, data: { error: 'Bonus amount must be an integer between 1 and 10000' } };
       }
+      const preSnap = await userRef.get();
+      if (!preSnap.exists) return { status: 404, data: { error: 'User not found' } };
+      const orgId = isValidFirestoreId(preSnap.data()?.organizationId)
+        ? preSnap.data()!.organizationId
+        : `org_${userId}`;
+      const orgRef = adminDb.collection('organizations').doc(orgId);
+
       const result = await adminDb.runTransaction(async (tx) => {
-        const snap = await tx.get(userRef);
+        const [snap, orgSnap] = await Promise.all([tx.get(userRef), tx.get(orgRef)]);
         if (!snap.exists) throw new HttpError(404, 'User not found');
-        const currentBonus = Number(snap.data()?.bonusGenerations || 0);
-        const updatedBonus = currentBonus + amount;
+        const currentOrgBonus = orgSnap.exists
+          ? Number(orgSnap.data()?.bonusGenerations || 0)
+          : Number(snap.data()?.bonusGenerations || 0);
+        const updatedBonus = currentOrgBonus + amount;
+        if (orgSnap.exists) {
+          tx.update(orgRef, { bonusGenerations: updatedBonus, updatedAt: now });
+        }
         tx.update(userRef, { bonusGenerations: updatedBonus, updatedAt: now });
         return { ...snap.data(), bonusGenerations: updatedBonus };
       });
-      await logServerAudit('BONUS_GENERATIONS_GRANTED', `Granted +${amount} bonus generations`, verified, userId);
+      await logServerAudit('BONUS_GENERATIONS_GRANTED', `Granted +${amount} bonus generations to org ${orgId}`, verified, userId);
       return { status: 200, data: { success: true, user: result } };
     }
 
     if (action === 'reset_usage') {
       const resetDate = getNextMonthFirstDay();
+      const preSnap = await userRef.get();
+      if (!preSnap.exists) return { status: 404, data: { error: 'User not found' } };
+      const orgId = isValidFirestoreId(preSnap.data()?.organizationId)
+        ? preSnap.data()!.organizationId
+        : `org_${userId}`;
+      const orgRef = adminDb.collection('organizations').doc(orgId);
+
       const result = await adminDb.runTransaction(async (tx) => {
-        const snap = await tx.get(userRef);
+        const [snap, orgSnap] = await Promise.all([tx.get(userRef), tx.get(orgRef)]);
         if (!snap.exists) throw new HttpError(404, 'User not found');
+        if (orgSnap.exists) {
+          tx.update(orgRef, { generationsUsedThisMonth: 0, billingResetDate: resetDate, updatedAt: now });
+        }
         tx.update(userRef, { generationsUsedThisMonth: 0, billingResetDate: resetDate, updatedAt: now });
         return { ...snap.data(), generationsUsedThisMonth: 0, billingResetDate: resetDate };
       });
-      await logServerAudit('USAGE_RESET', 'Monthly generation usage reset to 0', verified, userId);
+      await logServerAudit('USAGE_RESET', `Monthly generation usage reset to 0 for org ${orgId}`, verified, userId);
       return { status: 200, data: { success: true, user: result } };
     }
 
@@ -859,9 +1629,47 @@ export async function handleAdminUserAction(
       if (!snap.exists) {
         return { status: 404, data: { error: 'User not found' } };
       }
+      const uData = snap.data()!;
+      const orgId = isValidFirestoreId(uData.organizationId) ? uData.organizationId : `org_${userId}`;
+      const orgRef = adminDb.collection('organizations').doc(orgId);
+      const orgSnap = await orgRef.get();
+      if (orgSnap.exists) {
+        const orgData = orgSnap.data()!;
+        const members = Array.from(new Set(Array.isArray(orgData.memberIds) ? orgData.memberIds : []));
+        if (orgData.ownerId === userId && members.filter((id) => id !== userId).length > 0) {
+          return {
+            status: 400,
+            data: {
+              error: 'Cannot delete an organization owner while other team members exist. Remove members or transfer ownership first.',
+            },
+          };
+        }
+        if (orgData.ownerId === userId) {
+          const [outputsSnap, historySnap] = await Promise.all([
+            orgRef.collection('outputs').get().catch(() => null),
+            orgRef.collection('history').get().catch(() => null),
+          ]);
+          if (outputsSnap && !outputsSnap.empty) {
+            const batch = adminDb.batch();
+            outputsSnap.docs.forEach((d) => batch.delete(d.ref));
+            await batch.commit();
+          }
+          if (historySnap && !historySnap.empty) {
+            for (let i = 0; i < historySnap.docs.length; i += 400) {
+              const batch = adminDb.batch();
+              historySnap.docs.slice(i, i + 400).forEach((d) => batch.delete(d.ref));
+              await batch.commit();
+            }
+          }
+          await orgRef.delete().catch(() => {});
+        } else {
+          await orgRef.update({ memberIds: FieldValue.arrayRemove(userId), updatedAt: now }).catch(() => {});
+        }
+      }
+
       await userRef.delete();
       await adminDb.collection('admins').doc(userId).delete().catch(() => {});
-      await logServerAudit('USER_DELETED', `Super admin deleted user ${snap.data()?.email || userId}`, verified, userId);
+      await logServerAudit('USER_DELETED', `Super admin deleted user ${uData.email || userId}`, verified, userId);
       return { status: 200, data: { success: true } };
     }
 
@@ -876,20 +1684,655 @@ export async function handleDeleteOwnAccount(authHeader?: string | null): Promis
   try {
     const verified = await verifyFirebaseTokenFromHeader(authHeader);
     const userRef = adminDb.collection('users').doc(verified.uid);
-    const orgRef = adminDb.collection('organizations').doc(`org_${verified.uid}`);
+    const userSnap = await userRef.get();
+    const userData = userSnap.exists ? userSnap.data()! : {};
+    const orgId = isValidFirestoreId(userData.organizationId) ? userData.organizationId : `org_${verified.uid}`;
+    const orgRef = adminDb.collection('organizations').doc(orgId);
+    const orgSnap = await orgRef.get();
+    const now = new Date().toISOString();
 
-    const outputsSnap = await orgRef.collection('outputs').get().catch(() => null);
-    if (outputsSnap && !outputsSnap.empty) {
-      const batch = adminDb.batch();
-      outputsSnap.docs.forEach((d) => batch.delete(d.ref));
-      await batch.commit();
+    if (orgSnap.exists) {
+      const orgData = orgSnap.data()!;
+      const otherMembers = (Array.isArray(orgData.memberIds) ? orgData.memberIds : []).filter(
+        (id: string) => id !== verified.uid
+      );
+      if (orgData.ownerId === verified.uid) {
+        if (otherMembers.length > 0) {
+          return {
+            status: 400,
+            data: {
+              error: 'You are the organization owner. Transfer ownership to another member before deleting your account.',
+            },
+          };
+        }
+        const [outputsSnap, invitesSnap, historySnap] = await Promise.all([
+          orgRef.collection('outputs').get().catch(() => null),
+          orgRef.collection('invites').get().catch(() => null),
+          orgRef.collection('history').get().catch(() => null),
+        ]);
+        if (outputsSnap && !outputsSnap.empty) {
+          const batch = adminDb.batch();
+          outputsSnap.docs.forEach((d) => batch.delete(d.ref));
+          await batch.commit();
+        }
+        if (invitesSnap && !invitesSnap.empty) {
+          const batch = adminDb.batch();
+          invitesSnap.docs.forEach((d) => {
+            batch.delete(d.ref);
+            batch.delete(adminDb.collection('teamInvites').doc(d.id));
+          });
+          await batch.commit();
+        }
+        if (historySnap && !historySnap.empty) {
+          for (let i = 0; i < historySnap.docs.length; i += 400) {
+            const batch = adminDb.batch();
+            historySnap.docs.slice(i, i + 400).forEach((d) => batch.delete(d.ref));
+            await batch.commit();
+          }
+        }
+        await orgRef.delete().catch(() => {});
+      } else {
+        await orgRef.update({ memberIds: FieldValue.arrayRemove(verified.uid), updatedAt: now }).catch(() => {});
+      }
     }
 
-    await orgRef.delete().catch(() => {});
     await userRef.delete().catch(() => {});
     await adminDb.collection('admins').doc(verified.uid).delete().catch(() => {});
 
     await logServerAudit('ACCOUNT_DELETED', `User ${verified.email || verified.uid} deleted their account`, verified, verified.uid);
+    return { status: 200, data: { success: true } };
+  } catch (err: any) {
+    return { status: err.status || 500, data: { error: err.message } };
+  }
+}
+
+// =========================================================================
+// TEAM MANAGEMENT HANDLERS (ADMIN SDK ONLY)
+// =========================================================================
+
+// T1. Get current user's organization team state
+export async function handleGetTeam(authHeader?: string | null): Promise<{ status: number; data: any }> {
+  try {
+    const verified = await verifyFirebaseTokenFromHeader(authHeader);
+    const now = new Date().toISOString();
+    const userRef = adminDb.collection('users').doc(verified.uid);
+    const userSnap = await userRef.get();
+    if (!userSnap.exists) {
+      return { status: 404, data: { error: 'Account not found. Please sign in again.' } };
+    }
+    const userData = userSnap.data()!;
+    const org = await ensureOrganizationForUser(userData, verified.uid, now);
+    const seatStats = await getOrgSeatStats(org.id, org);
+
+    const members: any[] = [];
+    for (const memberId of seatStats.memberIds) {
+      if (!isValidFirestoreId(memberId)) continue;
+      const mSnap = await adminDb.collection('users').doc(memberId).get();
+      if (!mSnap.exists) continue;
+      const mData = mSnap.data()!;
+      members.push({
+        id: mSnap.id,
+        name: mData.name || mData.email || 'Member',
+        email: mData.email || '',
+        avatar: mData.avatar || '',
+        orgRole: org.ownerId === mSnap.id ? 'owner' : 'member',
+        generationsUsedThisMonth: Number(mData.generationsUsedThisMonth || 0),
+        totalGenerations: Number(mData.totalGenerations || mData.generationsUsedThisMonth || 0),
+        signupDate: mData.signupDate || '',
+        lastLogin: mData.lastLogin || '',
+      });
+    }
+
+    members.sort((a, b) => {
+      if (a.orgRole === 'owner' && b.orgRole !== 'owner') return -1;
+      if (a.orgRole !== 'owner' && b.orgRole === 'owner') return 1;
+      return (a.name || '').localeCompare(b.name || '');
+    });
+
+    return {
+      status: 200,
+      data: {
+        organization: org,
+        members,
+        invites: seatStats.invites,
+      },
+    };
+  } catch (err: any) {
+    return { status: err.status || 500, data: { error: err.message } };
+  }
+}
+
+// T2. Invite a team member by email (organization owner only)
+export async function handleCreateTeamInvite(
+  authHeader: string | null | undefined,
+  body: any
+): Promise<{ status: number; data: any }> {
+  try {
+    const verified = await verifyFirebaseTokenFromHeader(authHeader);
+    const cleanEmail = typeof body?.email === 'string' ? body.email.trim().toLowerCase() : '';
+    if (!cleanEmail || cleanEmail.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) {
+      return { status: 400, data: { error: 'Valid email address is required' } };
+    }
+
+    if (verified.email && verified.email.trim().toLowerCase() === cleanEmail) {
+      return { status: 400, data: { error: 'You cannot invite your own email address.' } };
+    }
+
+    const now = new Date().toISOString();
+    const userSnap = await adminDb.collection('users').doc(verified.uid).get();
+    if (!userSnap.exists) {
+      return { status: 404, data: { error: 'User account not found.' } };
+    }
+
+    const userData = userSnap.data()!;
+    const org = await ensureOrganizationForUser(userData, verified.uid, now);
+    if (org.ownerId !== verified.uid) {
+      return { status: 403, data: { error: 'Only the organization owner can invite team members.' } };
+    }
+
+    const seatStats = await getOrgSeatStats(org.id, org);
+
+    // Check if email already belongs to an active member of this organization
+    for (const mId of seatStats.memberIds) {
+      const mSnap = await adminDb.collection('users').doc(mId).get();
+      if (mSnap.exists && (mSnap.data()?.email || '').trim().toLowerCase() === cleanEmail) {
+        return { status: 400, data: { error: `${cleanEmail} is already a member of this organization.` } };
+      }
+    }
+
+    // Check for duplicate active pending invite
+    const existingPending = seatStats.invites.find(
+      (i) => i.status === 'pending' && (i.email || '').trim().toLowerCase() === cleanEmail
+    );
+    if (existingPending) {
+      return { status: 400, data: { error: `A pending invitation already exists for ${cleanEmail}.` } };
+    }
+
+    // Enforce seat limit
+    if (seatStats.seatsUsed >= seatStats.seatLimit) {
+      return {
+        status: 403,
+        data: {
+          error: `Seat limit reached (${seatStats.seatsUsed}/${seatStats.seatLimit} seats in use). Upgrade your plan or contact a super admin to increase seats.`,
+        },
+      };
+    }
+
+    const inviteRef = adminDb.collection('organizations').doc(org.id).collection('invites').doc();
+    const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
+    const inviteData = {
+      id: inviteRef.id,
+      orgId: org.id,
+      orgName: org.name,
+      email: cleanEmail,
+      role: 'member' as const,
+      invitedBy: verified.uid,
+      invitedByEmail: verified.email || userData.email || '',
+      status: 'pending' as const,
+      createdAt: now,
+      expiresAt,
+    };
+
+    const batch = adminDb.batch();
+    batch.set(inviteRef, inviteData);
+    batch.set(adminDb.collection('teamInvites').doc(inviteRef.id), inviteData);
+    await batch.commit();
+
+    await logServerAudit(
+      'TEAM_INVITE_CREATED',
+      `Invited ${cleanEmail} to join ${org.name} (${org.id})`,
+      verified,
+      verified.uid
+    );
+
+    return { status: 200, data: { invite: inviteData } };
+  } catch (err: any) {
+    return { status: err.status || 500, data: { error: err.message } };
+  }
+}
+
+// T3. Revoke a pending team invite (organization owner only)
+export async function handleRevokeTeamInvite(
+  authHeader: string | null | undefined,
+  inviteId?: string
+): Promise<{ status: number; data: any }> {
+  try {
+    const verified = await verifyFirebaseTokenFromHeader(authHeader);
+    if (!isValidFirestoreId(inviteId)) {
+      return { status: 400, data: { error: 'Valid Invite ID is required' } };
+    }
+
+    const userSnap = await adminDb.collection('users').doc(verified.uid).get();
+    if (!userSnap.exists) {
+      return { status: 404, data: { error: 'Account not found.' } };
+    }
+    const orgId = isValidFirestoreId(userSnap.data()?.organizationId)
+      ? userSnap.data()!.organizationId
+      : `org_${verified.uid}`;
+
+    const orgRef = adminDb.collection('organizations').doc(orgId);
+    const orgSnap = await orgRef.get();
+    if (!orgSnap.exists) {
+      return { status: 404, data: { error: 'Organization not found.' } };
+    }
+    if (orgSnap.data()?.ownerId !== verified.uid) {
+      return { status: 403, data: { error: 'Only the organization owner can revoke team invitations.' } };
+    }
+
+    const inviteRef = orgRef.collection('invites').doc(inviteId);
+    const inviteSnap = await inviteRef.get();
+    if (!inviteSnap.exists) {
+      return { status: 404, data: { error: 'Team invitation not found.' } };
+    }
+
+    const invData = inviteSnap.data()!;
+    const now = new Date().toISOString();
+    const batch = adminDb.batch();
+    batch.update(inviteRef, { status: 'revoked', revokedAt: now, revokedBy: verified.uid });
+    batch.set(
+      adminDb.collection('teamInvites').doc(inviteId),
+      { status: 'revoked', revokedAt: now, revokedBy: verified.uid },
+      { merge: true }
+    );
+    await batch.commit();
+
+    await logServerAudit(
+      'TEAM_INVITE_REVOKED',
+      `Revoked team invitation for ${invData.email} in organization ${orgId}`,
+      verified,
+      verified.uid
+    );
+
+    return { status: 200, data: { success: true } };
+  } catch (err: any) {
+    return { status: err.status || 500, data: { error: err.message } };
+  }
+}
+
+// T4. Remove a member from the organization (organization owner only)
+export async function handleRemoveTeamMember(
+  authHeader: string | null | undefined,
+  memberId?: string
+): Promise<{ status: number; data: any }> {
+  try {
+    const verified = await verifyFirebaseTokenFromHeader(authHeader);
+    if (!isValidFirestoreId(memberId)) {
+      return { status: 400, data: { error: 'Valid Member ID is required' } };
+    }
+    if (memberId === verified.uid) {
+      return { status: 400, data: { error: 'Owners cannot remove themselves. Transfer ownership first.' } };
+    }
+
+    const now = new Date().toISOString();
+    const ownerSnap = await adminDb.collection('users').doc(verified.uid).get();
+    if (!ownerSnap.exists) {
+      return { status: 404, data: { error: 'Account not found.' } };
+    }
+    const orgId = isValidFirestoreId(ownerSnap.data()?.organizationId)
+      ? ownerSnap.data()!.organizationId
+      : `org_${verified.uid}`;
+
+    const orgRef = adminDb.collection('organizations').doc(orgId);
+    const orgSnap = await orgRef.get();
+    if (!orgSnap.exists) {
+      return { status: 404, data: { error: 'Organization not found.' } };
+    }
+    const orgData = orgSnap.data()!;
+    if (orgData.ownerId !== verified.uid) {
+      return { status: 403, data: { error: 'Only the organization owner can remove members.' } };
+    }
+
+    const memberIds: string[] = Array.isArray(orgData.memberIds) ? orgData.memberIds : [];
+    if (!memberIds.includes(memberId)) {
+      return { status: 404, data: { error: 'User is not a member of this organization.' } };
+    }
+
+    const memberRef = adminDb.collection('users').doc(memberId);
+    const memberSnap = await memberRef.get();
+    const memberData = memberSnap.exists ? memberSnap.data()! : { id: memberId };
+
+    const { orgId: newOrgId } = await createPersonalFreeOrgForUser(memberId, memberData, now);
+
+    await orgRef.update({
+      memberIds: FieldValue.arrayRemove(memberId),
+      updatedAt: now,
+    });
+
+    if (memberSnap.exists) {
+      await memberRef.update({
+        organizationId: newOrgId,
+        orgRole: 'owner',
+        planId: 'free',
+        generationsUsedThisMonth: 0,
+        updatedAt: now,
+      });
+    }
+
+    await logServerAudit(
+      'TEAM_MEMBER_REMOVED',
+      `Removed ${memberData.email || memberId} from organization ${orgData.name || orgId} (${orgId})`,
+      verified,
+      memberId
+    );
+
+    return { status: 200, data: { success: true } };
+  } catch (err: any) {
+    return { status: err.status || 500, data: { error: err.message } };
+  }
+}
+
+// T5. Transfer organization ownership to another active member (owner only)
+export async function handleTransferOwnership(
+  authHeader: string | null | undefined,
+  body: any
+): Promise<{ status: number; data: any }> {
+  try {
+    const verified = await verifyFirebaseTokenFromHeader(authHeader);
+    const newOwnerId = body?.newOwnerId;
+    if (!isValidFirestoreId(newOwnerId)) {
+      return { status: 400, data: { error: 'Valid target member ID is required' } };
+    }
+    if (newOwnerId === verified.uid) {
+      return { status: 400, data: { error: 'You are already the owner of this organization.' } };
+    }
+
+    const now = new Date().toISOString();
+    const currentUserRef = adminDb.collection('users').doc(verified.uid);
+    const currentUserSnap = await currentUserRef.get();
+    if (!currentUserSnap.exists) {
+      return { status: 404, data: { error: 'Account not found.' } };
+    }
+    const orgId = isValidFirestoreId(currentUserSnap.data()?.organizationId)
+      ? currentUserSnap.data()!.organizationId
+      : `org_${verified.uid}`;
+
+    const orgRef = adminDb.collection('organizations').doc(orgId);
+    const newOwnerRef = adminDb.collection('users').doc(newOwnerId);
+
+    const newOwnerEmail = await adminDb.runTransaction(async (tx) => {
+      const [orgSnap, newOwnerSnap] = await Promise.all([tx.get(orgRef), tx.get(newOwnerRef)]);
+      if (!orgSnap.exists) throw new HttpError(404, 'Organization not found.');
+      const orgData = orgSnap.data()!;
+      if (orgData.ownerId !== verified.uid) {
+        throw new HttpError(403, 'Only the organization owner can transfer ownership.');
+      }
+      const memberIds: string[] = Array.isArray(orgData.memberIds) ? orgData.memberIds : [];
+      if (!memberIds.includes(newOwnerId) || !newOwnerSnap.exists) {
+        throw new HttpError(400, 'Selected user must be an active member of the organization.');
+      }
+
+      tx.update(orgRef, { ownerId: newOwnerId, updatedAt: now });
+      tx.update(currentUserRef, { orgRole: 'member', updatedAt: now });
+      tx.update(newOwnerRef, { orgRole: 'owner', updatedAt: now });
+      return newOwnerSnap.data()?.email || newOwnerId;
+    });
+
+    await logServerAudit(
+      'OWNERSHIP_TRANSFERRED',
+      `Transferred ownership of organization ${orgId} from ${verified.email || verified.uid} to ${newOwnerEmail}`,
+      verified,
+      newOwnerId
+    );
+
+    return { status: 200, data: { success: true } };
+  } catch (err: any) {
+    return { status: err.status || 500, data: { error: err.message } };
+  }
+}
+
+// T6. Leave team organization (non-owner members only; provisions a new personal free org)
+export async function handleLeaveTeam(authHeader?: string | null): Promise<{ status: number; data: any }> {
+  try {
+    const verified = await verifyFirebaseTokenFromHeader(authHeader);
+    const now = new Date().toISOString();
+    const userRef = adminDb.collection('users').doc(verified.uid);
+    const userSnap = await userRef.get();
+    if (!userSnap.exists) {
+      return { status: 404, data: { error: 'Account not found.' } };
+    }
+    const userData = userSnap.data()!;
+    const orgId = isValidFirestoreId(userData.organizationId) ? userData.organizationId : `org_${verified.uid}`;
+    const orgRef = adminDb.collection('organizations').doc(orgId);
+    const orgSnap = await orgRef.get();
+
+    if (!orgSnap.exists) {
+      return { status: 404, data: { error: 'Organization not found.' } };
+    }
+    const orgData = orgSnap.data()!;
+    if (orgData.ownerId === verified.uid) {
+      return {
+        status: 400,
+        data: { error: 'Organization owners cannot leave directly. Transfer ownership to another member first.' },
+      };
+    }
+
+    const { orgId: newOrgId, org: newOrg } = await createPersonalFreeOrgForUser(verified.uid, userData, now);
+
+    await orgRef.update({
+      memberIds: FieldValue.arrayRemove(verified.uid),
+      updatedAt: now,
+    });
+
+    const userUpdate = {
+      organizationId: newOrgId,
+      orgRole: 'owner',
+      planId: 'free',
+      generationsUsedThisMonth: 0,
+      updatedAt: now,
+    };
+    await userRef.update(userUpdate);
+
+    await logServerAudit(
+      'TEAM_MEMBER_LEFT',
+      `${userData.email || verified.uid} left organization ${orgData.name || orgId} (${orgId})`,
+      verified,
+      verified.uid
+    );
+
+    const updatedUserSnap = await userRef.get();
+    return {
+      status: 200,
+      data: {
+        success: true,
+        user: updatedUserSnap.data(),
+        organization: newOrg,
+      },
+    };
+  } catch (err: any) {
+    return { status: err.status || 500, data: { error: err.message } };
+  }
+}
+
+// =========================================================================
+// SUPER ADMIN ORGANIZATION MANAGEMENT HANDLERS
+// =========================================================================
+
+// A1. List all organizations with members & seat usage
+export async function handleAdminGetOrganizations(authHeader?: string | null): Promise<{ status: number; data: any }> {
+  try {
+    await requireSuperAdmin(authHeader);
+
+    const [orgsSnap, usersSnap, pendingInvitesSnap] = await Promise.all([
+      adminDb.collection('organizations').get(),
+      adminDb.collection('users').get(),
+      adminDb.collection('teamInvites').where('status', '==', 'pending').get(),
+    ]);
+
+    const userMap = new Map<string, any>();
+    usersSnap.forEach((docSnap) => {
+      userMap.set(docSnap.id, docSnap.data());
+    });
+
+    const pendingCountsByOrg = new Map<string, number>();
+    const nowMs = Date.now();
+    for (const invDoc of pendingInvitesSnap.docs) {
+      const inv = invDoc.data();
+      if (inv.expiresAt && new Date(inv.expiresAt).getTime() <= nowMs) {
+        continue;
+      }
+      if (inv.orgId) {
+        pendingCountsByOrg.set(inv.orgId, (pendingCountsByOrg.get(inv.orgId) || 0) + 1);
+      }
+    }
+
+    const organizations: any[] = [];
+    orgsSnap.forEach((orgDoc) => {
+      const normalized = normalizeOrganizationRecord(orgDoc.id, orgDoc.data());
+      const members = normalized.memberIds
+        .map((mId: string) => {
+          const mData = userMap.get(mId);
+          if (!mData) return null;
+          return {
+            id: mId,
+            name: mData.name || mData.email || mId,
+            email: mData.email || '',
+            avatar: mData.avatar || '',
+            orgRole: normalized.ownerId === mId ? 'owner' : 'member',
+            generationsUsedThisMonth: Number(mData.generationsUsedThisMonth || 0),
+            totalGenerations: Number(mData.totalGenerations || mData.generationsUsedThisMonth || 0),
+            signupDate: mData.signupDate || '',
+            lastLogin: mData.lastLogin || '',
+          };
+        })
+        .filter(Boolean);
+
+      members.sort((a: any, b: any) => {
+        if (a.orgRole === 'owner' && b.orgRole !== 'owner') return -1;
+        if (a.orgRole !== 'owner' && b.orgRole === 'owner') return 1;
+        return (a.name || '').localeCompare(b.name || '');
+      });
+
+      const pendingInvitesCount = pendingCountsByOrg.get(orgDoc.id) || 0;
+      organizations.push({
+        ...normalized,
+        members,
+        pendingInvitesCount,
+        seatsUsed: members.length + pendingInvitesCount,
+      });
+    });
+
+    organizations.sort((a, b) => new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime());
+    return { status: 200, data: { organizations } };
+  } catch (err: any) {
+    return { status: err.status || 500, data: { error: err.message } };
+  }
+}
+
+// A2. Super admin override organization seat limit
+export async function handleAdminUpdateOrgSeatLimit(
+  authHeader: string | null | undefined,
+  orgId?: string,
+  body?: { seatLimit?: number }
+): Promise<{ status: number; data: any }> {
+  try {
+    const verified = await requireSuperAdmin(authHeader);
+    if (!isValidFirestoreId(orgId)) {
+      return { status: 400, data: { error: 'Valid Organization ID is required' } };
+    }
+
+    const seatLimit = Number(body?.seatLimit);
+    if (!Number.isInteger(seatLimit) || seatLimit < 1 || seatLimit > 500) {
+      return { status: 400, data: { error: 'Seat limit must be an integer between 1 and 500.' } };
+    }
+
+    const orgRef = adminDb.collection('organizations').doc(orgId);
+    const now = new Date().toISOString();
+
+    const txResult = await adminDb.runTransaction(async (tx) => {
+      const orgSnap = await tx.get(orgRef);
+      if (!orgSnap.exists) {
+        throw new HttpError(404, 'Organization not found.');
+      }
+      const orgData = orgSnap.data()!;
+      const memberIds = Array.from(
+        new Set([...(Array.isArray(orgData.memberIds) ? orgData.memberIds : []), ...(orgData.ownerId ? [orgData.ownerId] : [])])
+      );
+      if (seatLimit < memberIds.length) {
+        throw new HttpError(
+          400,
+          `Seat limit (${seatLimit}) cannot be lower than current active members (${memberIds.length}). Remove members first.`
+        );
+      }
+      const prevLimit = Number(orgData.seatLimit || getDefaultSeatLimit(orgData.planId));
+      tx.update(orgRef, { seatLimit, updatedAt: now });
+      return {
+        prevLimit,
+        org: normalizeOrganizationRecord(orgId, { ...orgData, seatLimit, updatedAt: now }),
+      };
+    });
+
+    await logServerAudit(
+      'SEAT_LIMIT_CHANGED',
+      `Super admin changed seat limit for ${txResult.org.name} (${orgId}) from ${txResult.prevLimit} to ${seatLimit}`,
+      verified,
+      txResult.org.ownerId
+    );
+
+    return { status: 200, data: { success: true, organization: txResult.org } };
+  } catch (err: any) {
+    return { status: err.status || 500, data: { error: err.message } };
+  }
+}
+
+// A3. Super admin remove member from any organization
+export async function handleAdminRemoveOrgMember(
+  authHeader: string | null | undefined,
+  orgId?: string,
+  memberId?: string
+): Promise<{ status: number; data: any }> {
+  try {
+    const verified = await requireSuperAdmin(authHeader);
+    if (!isValidFirestoreId(orgId) || !isValidFirestoreId(memberId)) {
+      return { status: 400, data: { error: 'Valid Organization ID and Member ID are required.' } };
+    }
+
+    const now = new Date().toISOString();
+    const orgRef = adminDb.collection('organizations').doc(orgId);
+    const orgSnap = await orgRef.get();
+    if (!orgSnap.exists) {
+      return { status: 404, data: { error: 'Organization not found.' } };
+    }
+    const orgData = orgSnap.data()!;
+    if (orgData.ownerId === memberId) {
+      return {
+        status: 400,
+        data: { error: 'Cannot remove the organization owner directly. Transfer ownership first or delete the user.' },
+      };
+    }
+
+    const memberIds: string[] = Array.isArray(orgData.memberIds) ? orgData.memberIds : [];
+    if (!memberIds.includes(memberId)) {
+      return { status: 404, data: { error: 'User is not a member of this organization.' } };
+    }
+
+    const memberRef = adminDb.collection('users').doc(memberId);
+    const memberSnap = await memberRef.get();
+    const memberData = memberSnap.exists ? memberSnap.data()! : { id: memberId };
+
+    const { orgId: newOrgId } = await createPersonalFreeOrgForUser(memberId, memberData, now);
+
+    await orgRef.update({
+      memberIds: FieldValue.arrayRemove(memberId),
+      updatedAt: now,
+    });
+
+    if (memberSnap.exists) {
+      await memberRef.update({
+        organizationId: newOrgId,
+        orgRole: 'owner',
+        planId: 'free',
+        generationsUsedThisMonth: 0,
+        updatedAt: now,
+      });
+    }
+
+    await logServerAudit(
+      'TEAM_MEMBER_REMOVED',
+      `Super admin removed ${memberData.email || memberId} from organization ${orgData.name || orgId} (${orgId})`,
+      verified,
+      memberId
+    );
+
     return { status: 200, data: { success: true } };
   } catch (err: any) {
     return { status: err.status || 500, data: { error: err.message } };
@@ -908,7 +2351,7 @@ export async function handleGeminiGenerate(
   body: any
 ): Promise<GeminiGenerateResult> {
   const requestStartTime = Date.now();
-  let verifiedUser: { uid: string; email?: string } | null = null;
+  let verifiedUser: { uid: string; email?: string; name?: string } | null = null;
 
   // 1. Verify Firebase ID Token
   try {
@@ -942,24 +2385,20 @@ export async function handleGeminiGenerate(
     };
   }
 
-  // 3. Check and increment monthly usage in a Firestore transaction
+  // 3. Check and increment pooled organization usage + per-member usage in a Firestore transaction
   const userRef = adminDb.collection('users').doc(userId);
+  let orgGenerationsUsedThisMonth = 0;
+  let memberGenerationsUsedThisMonth = 0;
+  let resolvedOrgId = `org_${userId}`;
+  let resolvedUserName = verifiedUser.name || verifiedUser.email?.split('@')[0] || 'Member';
+
   try {
     await adminDb.runTransaction(async (transaction) => {
-      const snap = await transaction.get(userRef);
-      let userData: any = null;
-      if (snap.exists) {
-        userData = snap.data();
-      } else {
-        userData = {
-          id: userId,
-          planId: 'free',
-          status: 'active',
-          generationsUsedThisMonth: 0,
-          bonusGenerations: 0,
-          billingResetDate: getNextMonthFirstDay(),
-        };
+      const userSnap = await transaction.get(userRef);
+      if (!userSnap.exists) {
+        throw new HttpError(403, 'Account not found. Please sign in through the application.');
       }
+      const userData: any = userSnap.data()!;
 
       if (userData.status === 'suspended') {
         const suspendedErr = new Error('Your account is currently suspended. Please contact support.');
@@ -967,38 +2406,99 @@ export async function handleGeminiGenerate(
         throw suspendedErr;
       }
 
-      const planId = userData.planId || 'free';
-      const limits: Record<string, number> = { free: 50, pro: 500, team: 2000, complimentary: 2000 };
-      const planLimit = (limits[planId] || 50) + (userData.bonusGenerations || 0);
+      const orgId = isValidFirestoreId(userData.organizationId) ? userData.organizationId : `org_${userId}`;
+      const orgRef = adminDb.collection('organizations').doc(orgId);
+      const orgSnap = await transaction.get(orgRef);
 
-      // Check billing cycle reset
-      let used = userData.generationsUsedThisMonth || 0;
-      const todayStr = new Date().toISOString().split('T')[0];
-      let resetDate = userData.billingResetDate;
-      if (resetDate && todayStr >= resetDate) {
-        used = 0;
-        resetDate = getNextMonthFirstDay();
+      if (!orgSnap.exists && orgId !== `org_${userId}`) {
+        throw new HttpError(503, 'Organization record not found. Please refresh and try again.');
       }
 
-      if (used >= planLimit) {
-        const quotaErr = new Error(`Monthly generation quota reached (${used}/${planLimit} used). Upgrade to continue generating.`);
+      const orgData: any = orgSnap.exists ? orgSnap.data()! : null;
+      const planId = orgData?.planId || userData.planId || 'free';
+      const baseLimit = getDefaultGenerationLimit(planId);
+      const bonus = Number(orgData?.bonusGenerations ?? userData.bonusGenerations ?? 0);
+      const planLimit = baseLimit + bonus;
+
+      const todayStr = new Date().toISOString().split('T')[0];
+      const nextResetDefault = getNextMonthFirstDay();
+
+      let orgUsed = orgData ? Number(orgData.generationsUsedThisMonth || 0) : Number(userData.generationsUsedThisMonth || 0);
+      let orgResetDate = orgData?.billingResetDate || userData.billingResetDate || nextResetDefault;
+      const orgCycleReset = Boolean(orgResetDate && todayStr >= orgResetDate);
+      if (orgCycleReset) {
+        orgUsed = 0;
+        orgResetDate = nextResetDefault;
+      }
+
+      if (orgUsed >= planLimit) {
+        const quotaErr = new Error(
+          `Monthly organization generation quota reached (${orgUsed}/${planLimit} used). Upgrade to continue generating.`
+        );
         (quotaErr as any).status = 403;
         throw quotaErr;
       }
 
-      const newUsage = used + 1;
+      let memberUsed = Number(userData.generationsUsedThisMonth || 0);
+      const memberResetDate = userData.billingResetDate || orgResetDate;
+      if (orgCycleReset || (memberResetDate && todayStr >= memberResetDate)) {
+        memberUsed = 0;
+      }
+
+      const newOrgUsage = orgUsed + 1;
+      const newMemberUsage = memberUsed + 1;
+      const previousTotal =
+        typeof userData.totalGenerations === 'number'
+          ? userData.totalGenerations
+          : memberUsed;
+      const newTotal = previousTotal + 1;
+      const nowIso = new Date().toISOString();
+
+      if (orgSnap.exists) {
+        transaction.update(orgRef, {
+          generationsUsedThisMonth: newOrgUsage,
+          billingResetDate: orgResetDate,
+          updatedAt: nowIso,
+        });
+      } else {
+        transaction.set(orgRef, {
+          id: orgId,
+          name: userData.organizationProfile?.orgName || `${userData.name || 'Personal'}'s Workspace`,
+          ownerId: userId,
+          memberIds: [userId],
+          planId,
+          seatLimit: getDefaultSeatLimit(planId),
+          generationsUsedThisMonth: newOrgUsage,
+          bonusGenerations: bonus,
+          billingResetDate: orgResetDate,
+          createdAt: userData.signupDate || nowIso,
+          updatedAt: nowIso,
+        });
+      }
+
       transaction.set(
         userRef,
         {
-          generationsUsedThisMonth: newUsage,
-          billingResetDate: resetDate || getNextMonthFirstDay(),
-          updatedAt: new Date().toISOString(),
+          organizationId: orgId,
+          orgRole: userData.orgRole || (orgData?.ownerId && orgData.ownerId !== userId ? 'member' : 'owner'),
+          generationsUsedThisMonth: newMemberUsage,
+          totalGenerations: newTotal,
+          billingResetDate: orgResetDate,
+          updatedAt: nowIso,
         },
         { merge: true }
       );
+
+      resolvedOrgId = orgId;
+      resolvedUserName = truncateString(
+        userData.name || verifiedUser?.name || userData.email?.split('@')[0] || verifiedUser?.email?.split('@')[0] || 'Member',
+        150
+      );
+      orgGenerationsUsedThisMonth = newOrgUsage;
+      memberGenerationsUsedThisMonth = newMemberUsage;
     });
   } catch (txErr: any) {
-    if (txErr.status === 403 || txErr.message?.includes('Monthly generation quota reached')) {
+    if (txErr.status === 403 || txErr.message?.includes('generation quota reached')) {
       console.warn(`[Access/Quota Blocked] User ${userId}: ${txErr.message}`);
       return {
         errorStatus: 403,
@@ -1047,7 +2547,7 @@ AGENCY QUALITY STANDARDS:
 1. CUSTOM & SPECIFIC: Write REAL, compelling, finished copy tailored to this specific organization. Do NOT use generic placeholder templates (such as "[Pillar 1 Title]" or "[Insert problem here]")—write the actual thoughtful copy based on what this organization does!
 2. GROUNDED & AUTHENTIC: Never invent fake awards, fake statistical studies, or fake client testimonials. Where a specific internal date, metric, or donor name will be required, use clear brackets such as [Insert Launch Date] or [$X Target].
 3. BRAND VOICE: Match the requested brand tone: ${brandTone}. Be clear, punchy, persuasive, and encouraging.
-4. STRUCTURE: Use clean Markdown with headers (##, ###), bullet points, and blockquotes so the deliverable is immediately usable.`;
+4. STRUCTURE: Use clean Markdown with headers (##, ###), bullet points, and blockquotes so the deliverable is immediately usable. Start directly with the deliverable's title as a # heading. No introduction or closing remarks to the user (for example, never start with 'Here are...'). Use --- only between major sections.`;
 
   const toolPromptGuides: Record<string, string> = {
     'brand-foundations': `Deliver a complete Brand Foundations Blueprint:
@@ -1295,11 +2795,46 @@ Write the complete deliverable now in full, ready to be reviewed by the marketin
         const totalRequestTime = Date.now() - requestStartTime;
         console.log(`[Gemini Request] Total request time for "${toolName}": ${totalRequestTime}ms (${(totalRequestTime / 1000).toFixed(2)}s)`);
 
-        if (callSucceeded && fullText) {
+        if (callSucceeded && fullText && fullText.trim().length > 0) {
+          const historyCreatedAt = new Date().toISOString();
+          const historyId = `hist_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
+          try {
+            const historyCol = adminDb.collection('organizations').doc(resolvedOrgId).collection('history');
+            await historyCol.doc(historyId).set({
+              id: historyId,
+              orgId: resolvedOrgId,
+              userId,
+              userName: resolvedUserName,
+              toolId,
+              toolName: safeToolName,
+              inputs: sanitizedUserInputs,
+              output: fullText,
+              model: MODEL_NAME,
+              durationMs: totalRequestTime,
+              createdAt: historyCreatedAt,
+            });
+
+            // Enforce 12-month history retention: delete older records when new ones are written
+            const cutoffDate = new Date();
+            cutoffDate.setFullYear(cutoffDate.getFullYear() - 1);
+            const cutoffIso = cutoffDate.toISOString();
+            const expiredSnap = await historyCol.where('createdAt', '<', cutoffIso).limit(200).get();
+            if (!expiredSnap.empty) {
+              const deleteBatch = adminDb.batch();
+              expiredSnap.docs.forEach((d) => deleteBatch.delete(d.ref));
+              await deleteBatch.commit();
+            }
+          } catch (historyErr: any) {
+            console.warn(`[Generation History Warning] Failed to save or prune history for org ${resolvedOrgId}:`, historyErr?.message);
+          }
+
           sendEvent({
             done: true,
             modelUsed: MODEL_NAME,
             text: fullText,
+            historyId,
+            orgGenerationsUsedThisMonth,
+            memberGenerationsUsedThisMonth,
           });
         } else {
           const errorMessage =
@@ -1678,6 +3213,18 @@ if (process.env.SERVERLESS !== 'true') {
     res.status(result.status).json(result.data);
   });
 
+  // Public platform settings endpoint
+  app.get('/api/settings', async (_req, res) => {
+    const result = await handleGetPublicSettings();
+    res.status(result.status).json(result.data);
+  });
+
+  // Super Admin update platform settings
+  app.post('/api/admin/settings', async (req, res) => {
+    const result = await handleUpdatePlatformSettings(req.headers.authorization, req.body);
+    res.status(result.status).json(result.data);
+  });
+
   // Authentication Synchronization Endpoint
   app.post('/api/auth/sync', async (req, res) => {
     const result = await handleAuthSync(req.headers.authorization);
@@ -1738,6 +3285,57 @@ if (process.env.SERVERLESS !== 'true') {
     res.status(result.status).json(result.data);
   });
 
+  // Team Management Endpoints (Admin SDK)
+  app.get('/api/team', async (req, res) => {
+    const result = await handleGetTeam(req.headers.authorization);
+    res.status(result.status).json(result.data);
+  });
+
+  app.post('/api/team/invites', async (req, res) => {
+    const result = await handleCreateTeamInvite(req.headers.authorization, req.body);
+    res.status(result.status).json(result.data);
+  });
+
+  app.post('/api/team/invites/:inviteId/revoke', async (req, res) => {
+    const result = await handleRevokeTeamInvite(req.headers.authorization, req.params.inviteId);
+    res.status(result.status).json(result.data);
+  });
+
+  app.post('/api/team/members/:memberId/remove', async (req, res) => {
+    const result = await handleRemoveTeamMember(req.headers.authorization, req.params.memberId);
+    res.status(result.status).json(result.data);
+  });
+
+  app.post('/api/team/transfer-ownership', async (req, res) => {
+    const result = await handleTransferOwnership(req.headers.authorization, req.body);
+    res.status(result.status).json(result.data);
+  });
+
+  app.post('/api/team/leave', async (req, res) => {
+    const result = await handleLeaveTeam(req.headers.authorization);
+    res.status(result.status).json(result.data);
+  });
+
+  // Super Admin Organization Management Endpoints
+  app.get('/api/admin/organizations', async (req, res) => {
+    const result = await handleAdminGetOrganizations(req.headers.authorization);
+    res.status(result.status).json(result.data);
+  });
+
+  app.post('/api/admin/organizations/:orgId/seat-limit', async (req, res) => {
+    const result = await handleAdminUpdateOrgSeatLimit(req.headers.authorization, req.params.orgId, req.body);
+    res.status(result.status).json(result.data);
+  });
+
+  app.post('/api/admin/organizations/:orgId/members/:memberId/remove', async (req, res) => {
+    const result = await handleAdminRemoveOrgMember(
+      req.headers.authorization,
+      req.params.orgId,
+      req.params.memberId
+    );
+    res.status(result.status).json(result.data);
+  });
+
   // Marketing Tool Generation Endpoint
   app.post('/api/gemini/generate', async (req, res) => {
     const result = await handleGeminiGenerate(req.headers.authorization, req.body);
@@ -1766,6 +3364,11 @@ if (process.env.SERVERLESS !== 'true') {
     } finally {
       res.end();
     }
+  });
+
+  // Ensure unmatched /api/* requests never fall through to Vite/SPA HTML fallback
+  app.use('/api', (_req, res) => {
+    res.status(404).json({ error: 'API endpoint not found' });
   });
 
   // Vite or Static Serving

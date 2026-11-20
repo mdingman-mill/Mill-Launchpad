@@ -1,10 +1,11 @@
 import React from 'react';
 import { User, Plan, PlanId } from '../types';
 import { billingService } from '../services/billingService';
-import { Check, Sparkles, X, ShieldCheck, Zap, HeartHandshake } from 'lucide-react';
+import { Check, Sparkles, X, ShieldCheck, Zap, HeartHandshake, Lock } from 'lucide-react';
 
 interface UpgradeModalProps {
   user: User;
+  inviteOnlyMode?: boolean;
   isOpen: boolean;
   onClose: () => void;
   onSelectPlan: (planId: PlanId) => void;
@@ -13,6 +14,7 @@ interface UpgradeModalProps {
 
 export const UpgradeModal: React.FC<UpgradeModalProps> = ({
   user,
+  inviteOnlyMode = false,
   isOpen,
   onClose,
   onSelectPlan,
@@ -55,7 +57,12 @@ export const UpgradeModal: React.FC<UpgradeModalProps> = ({
             Unlock high-volume AI generations, unlimited library storage, and collaborative team seats tailored for mission-driven leaders.
           </p>
 
-          {isNonprofit && (
+          {inviteOnlyMode ? (
+            <div className="mt-4 inline-flex items-center gap-2 px-3.5 py-1.5 bg-amber-50 text-amber-900 border border-amber-200 rounded-full text-xs font-semibold">
+              <Lock className="w-4 h-4 text-amber-600" />
+              <span>Invite-Only Mode is active — Paid plans are currently disabled.</span>
+            </div>
+          ) : isNonprofit ? (
             <div className="mt-4 inline-flex items-center gap-2 px-3.5 py-1.5 bg-emerald-50 text-emerald-800 border border-emerald-200 rounded-full text-xs font-semibold">
               <HeartHandshake className="w-4 h-4 text-emerald-600" />
               <span>
@@ -64,7 +71,7 @@ export const UpgradeModal: React.FC<UpgradeModalProps> = ({
                   : 'Nonprofit organization detected. Admin approval enables 25% off paid plans.'}
               </span>
             </div>
-          )}
+          ) : null}
         </div>
 
         {/* Plans Grid */}
@@ -138,7 +145,7 @@ export const UpgradeModal: React.FC<UpgradeModalProps> = ({
                       disabled
                       className="w-full py-2.5 px-4 rounded-xl bg-slate-100 text-slate-500 text-xs font-bold cursor-not-allowed border border-slate-200"
                     >
-                      Paid plans coming soon
+                      {inviteOnlyMode ? 'Disabled in Invite-Only Mode' : 'Paid plans coming soon'}
                     </button>
                   ) : (
                     <button
@@ -158,10 +165,12 @@ export const UpgradeModal: React.FC<UpgradeModalProps> = ({
         <div className="p-4 bg-slate-50 border-t border-slate-100 text-center flex items-center justify-center gap-4 text-xs text-slate-500">
           <span className="flex items-center gap-1.5">
             <ShieldCheck className="w-4 h-4 text-slate-400" />
-            All accounts start on the Free Starter plan (50 generations/month)
+            {inviteOnlyMode
+              ? 'Access is managed via complimentary invitations from Millennium Agency'
+              : 'All accounts start on the Free Starter plan (50 generations/month)'}
           </span>
           <span>•</span>
-          <span>Contact Millennium Agency for custom team tiers</span>
+          <span>Contact Millennium Agency for custom access requests</span>
         </div>
       </div>
     </div>

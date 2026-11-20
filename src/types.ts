@@ -19,6 +19,69 @@ export interface OrganizationProfile {
 
 export type PlanId = 'free' | 'pro' | 'team' | 'complimentary';
 
+export type OrgRole = 'owner' | 'member';
+
+export interface Organization {
+  id: string;
+  name: string;
+  ownerId: string;
+  memberIds: string[];
+  planId: PlanId;
+  seatLimit: number;
+  generationsUsedThisMonth: number;
+  bonusGenerations?: number;
+  billingResetDate: string;
+  type?: OrganizationType;
+  whatTheyDo?: string;
+  targetAudience?: string;
+  goals?: string[];
+  brandTone?: BrandTone[];
+  budget?: MarketingBudget;
+  website?: string;
+  createdAt?: string;
+  updatedAt?: string;
+}
+
+export interface TeamMember {
+  id: string;
+  name: string;
+  email: string;
+  avatar: string;
+  orgRole: OrgRole;
+  generationsUsedThisMonth: number;
+  totalGenerations?: number;
+  signupDate: string;
+  lastLogin: string;
+}
+
+export interface TeamInvite {
+  id: string;
+  orgId: string;
+  orgName?: string;
+  email: string;
+  role: 'member';
+  invitedBy: string;
+  invitedByEmail?: string;
+  status: 'pending' | 'accepted' | 'revoked' | 'expired';
+  createdAt: string;
+  expiresAt?: string | null;
+  acceptedAt?: string | null;
+  acceptedBy?: string | null;
+  revokedAt?: string | null;
+}
+
+export interface TeamState {
+  organization: Organization;
+  members: TeamMember[];
+  invites: TeamInvite[];
+}
+
+export interface AdminOrganizationSummary extends Organization {
+  members: TeamMember[];
+  pendingInvitesCount: number;
+  seatsUsed: number;
+}
+
 export interface User {
   id: string;
   name: string;
@@ -31,6 +94,7 @@ export interface User {
   signupDate: string;
   lastLogin: string;
   generationsUsedThisMonth: number;
+  totalGenerations?: number;
   bonusGenerations: number;
   billingResetDate: string;
   nonprofitDiscountApproved: boolean;
@@ -41,6 +105,7 @@ export interface User {
     expYear: string;
   };
   organizationId?: string;
+  orgRole?: OrgRole;
   teamMembers?: Array<{
     email: string;
     name: string;
@@ -95,15 +160,34 @@ export interface Invite {
 
 export interface SavedOutput {
   id: string;
+  orgId?: string;
   userId: string;
+  userName?: string;
   toolId: string;
   toolName: string;
   title: string;
   content: string;
   createdAt: string;
   updatedAt: string;
+  updatedBy?: string;
+  updatedByName?: string;
+  copiedFromId?: string;
   tags?: string[];
   userInputs?: Record<string, string>;
+}
+
+export interface GenerationHistoryItem {
+  id: string;
+  orgId: string;
+  userId: string;
+  userName: string;
+  toolId: string;
+  toolName: string;
+  inputs: Record<string, string>;
+  output: string;
+  model: string;
+  durationMs: number;
+  createdAt: string;
 }
 
 export interface AuditLogEntry {
@@ -154,3 +238,11 @@ export interface AgencySettings {
   openSignup: boolean;
   contactEmail: string;
 }
+
+export interface PlatformSettings {
+  inviteOnlyMode: boolean;
+  paidPlansDisabled?: boolean;
+  selfSignupDisabled?: boolean;
+  updatedAt?: string;
+}
+

@@ -9,10 +9,12 @@
         "email": { "type": "string", "format": "email", "description": "User email address" },
         "name": { "type": "string", "description": "Display name" },
         "avatar": { "type": "string", "description": "Avatar URL" },
-        "role": { "type": "string", "enum": ["super_admin", "member"], "description": "System role" },
+        "role": { "type": "string", "enum": ["super_admin", "admin", "support", "member"], "description": "System role" },
         "organizationId": { "type": "string", "description": "Associated organization ID" },
+        "orgRole": { "type": "string", "enum": ["owner", "member"], "description": "Role within the organization" },
         "planId": { "type": "string", "enum": ["free", "pro", "team", "complimentary"], "description": "Subscription plan tier" },
-        "generationsUsedThisMonth": { "type": "number", "description": "AI generation count used in billing cycle" },
+        "generationsUsedThisMonth": { "type": "number", "description": "Per-member AI generation count used in billing cycle" },
+        "totalGenerations": { "type": "number", "description": "Cumulative total AI tool generations across all billing cycles" },
         "billingResetDate": { "type": "string", "description": "ISO date for next monthly reset" },
         "createdAt": { "type": "string", "description": "Timestamp when account was created" },
         "updatedAt": { "type": "string", "description": "Timestamp when account was last updated" }
@@ -33,7 +35,7 @@
     },
     "Organization": {
       "title": "Organization",
-      "description": "Organization and brand profile containing marketing foundations",
+      "description": "Organization and brand profile containing marketing foundations, pooled quota, and team seats",
       "type": "object",
       "properties": {
         "id": { "type": "string", "description": "Organization unique identifier" },
@@ -47,33 +49,61 @@
         "brandTone": { "type": "array", "description": "Selected brand voice traits" },
         "budget": { "type": "string", "description": "Estimated monthly marketing budget" },
         "website": { "type": "string", "description": "Official website URL" },
-        "planId": { "type": "string", "enum": ["free", "pro", "team"], "description": "Current plan tier" },
+        "planId": { "type": "string", "enum": ["free", "pro", "team", "complimentary"], "description": "Current plan tier" },
+        "seatLimit": { "type": "number", "description": "Maximum allowed seats for the organization" },
+        "generationsUsedThisMonth": { "type": "number", "description": "Pooled monthly AI generations used by organization" },
+        "bonusGenerations": { "type": "number", "description": "Pooled bonus monthly generations for organization" },
+        "billingResetDate": { "type": "string", "description": "ISO date for next monthly pooled reset" },
         "createdAt": { "type": "string", "description": "Created timestamp" },
         "updatedAt": { "type": "string", "description": "Last updated timestamp" }
       },
-      "required": ["id", "name", "ownerId", "memberIds", "type", "createdAt"]
+      "required": ["id", "name", "ownerId", "memberIds", "planId", "seatLimit", "createdAt"]
     },
     "OutputItem": {
       "title": "OutputItem",
-      "description": "Saved AI-generated marketing deliverable saved in library",
+      "description": "Saved AI-generated marketing deliverable saved in shared organization library",
       "type": "object",
       "properties": {
         "id": { "type": "string", "description": "Unique deliverable ID" },
         "orgId": { "type": "string", "description": "Owning organization ID" },
         "userId": { "type": "string", "description": "Author user ID" },
+        "userName": { "type": "string", "description": "Author display name" },
         "toolId": { "type": "string", "description": "ID of marketing tool used" },
         "toolName": { "type": "string", "description": "Human readable tool name" },
         "title": { "type": "string", "description": "Deliverable title" },
         "content": { "type": "string", "description": "Full markdown output content" },
         "tags": { "type": "array", "description": "Categorization and search tags" },
         "userInputs": { "type": "object", "description": "Input parameters provided to tool" },
-        "createdAt": { "type": "string", "description": "Creation timestamp" }
+        "copiedFromId": { "type": "string", "description": "Original output ID when saved as a copy" },
+        "createdAt": { "type": "string", "description": "Creation timestamp" },
+        "updatedAt": { "type": "string", "description": "Last updated timestamp" },
+        "updatedBy": { "type": "string", "description": "UID of user who last edited the item" },
+        "updatedByName": { "type": "string", "description": "Name of user who last edited the item" }
       },
       "required": ["id", "orgId", "userId", "toolId", "toolName", "title", "content", "createdAt"]
     },
+    "GenerationHistoryItem": {
+      "title": "GenerationHistoryItem",
+      "description": "Server-recorded AI tool generation history record with 12-month retention",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "Unique history record ID" },
+        "orgId": { "type": "string", "description": "Owning organization ID" },
+        "userId": { "type": "string", "description": "User ID who ran the generation" },
+        "userName": { "type": "string", "description": "User display name at generation time" },
+        "toolId": { "type": "string", "description": "Marketing tool ID" },
+        "toolName": { "type": "string", "description": "Marketing tool human-readable name" },
+        "inputs": { "type": "object", "description": "Form inputs submitted for the generation" },
+        "output": { "type": "string", "description": "Generated markdown deliverable text" },
+        "model": { "type": "string", "description": "AI model identifier used" },
+        "durationMs": { "type": "number", "description": "Total generation duration in milliseconds" },
+        "createdAt": { "type": "string", "description": "ISO timestamp when generation completed" }
+      },
+      "required": ["id", "orgId", "userId", "userName", "toolId", "toolName", "inputs", "output", "model", "durationMs", "createdAt"]
+    },
     "Invite": {
       "title": "Invite",
-      "description": "Team member invitation for multi-user collaboration",
+      "description": "Team member or complimentary access invitation",
       "type": "object",
       "properties": {
         "id": { "type": "string", "description": "Invite ID" },
@@ -81,10 +111,11 @@
         "email": { "type": "string", "format": "email", "description": "Invited user email" },
         "role": { "type": "string", "description": "Assigned role" },
         "invitedBy": { "type": "string", "description": "User ID of inviter" },
-        "status": { "type": "string", "enum": ["pending", "accepted", "declined"], "description": "Invite status" },
+        "status": { "type": "string", "enum": ["pending", "accepted", "revoked", "expired", "declined"], "description": "Invite status" },
+        "expiresAt": { "type": "string", "description": "Optional expiration timestamp" },
         "createdAt": { "type": "string", "description": "Invite creation timestamp" }
       },
-      "required": ["id", "orgId", "email", "invitedBy", "status", "createdAt"]
+      "required": ["id", "email", "status", "createdAt"]
     },
     "AuditLog": {
       "title": "AuditLog",
@@ -100,6 +131,19 @@
         "createdAt": { "type": "string", "description": "Timestamp of action" }
       },
       "required": ["id", "userId", "action", "createdAt"]
+    },
+    "PlatformSettings": {
+      "title": "PlatformSettings",
+      "description": "Global platform configuration including Invite-Only Mode",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "Setting document identifier" },
+        "inviteOnlyMode": { "type": "boolean", "description": "Disables self-account creation and paid plans when true" },
+        "updatedAt": { "type": "string", "description": "Last updated timestamp" },
+        "updatedBy": { "type": "string", "description": "UID of super admin who updated settings" },
+        "updatedByEmail": { "type": "string", "format": "email", "description": "Email of super admin who updated settings" }
+      },
+      "required": ["id", "inviteOnlyMode", "updatedAt"]
     }
   },
   "firestore": {
@@ -113,15 +157,23 @@
     },
     "/organizations/{orgId}": {
       "schema": "Organization",
-      "description": "Organizations and saved brand foundations"
+      "description": "Organizations, pooled quota, seat limits, and saved brand foundations"
     },
     "/organizations/{orgId}/outputs/{outputId}": {
       "schema": "OutputItem",
       "description": "Deliverables saved to organization library"
     },
+    "/organizations/{orgId}/history/{historyId}": {
+      "schema": "GenerationHistoryItem",
+      "description": "Server-written AI tool generation history records (12-month retention)"
+    },
     "/organizations/{orgId}/invites/{inviteId}": {
       "schema": "Invite",
       "description": "Pending and accepted team invitations"
+    },
+    "/teamInvites/{inviteId}": {
+      "schema": "Invite",
+      "description": "Server-managed team invite index"
     },
     "/auditLogs/{logId}": {
       "schema": "AuditLog",
@@ -130,6 +182,10 @@
     "/invites/{inviteId}": {
       "schema": "Invite",
       "description": "Top-level complimentary access invites"
+    },
+    "/settings/{settingId}": {
+      "schema": "PlatformSettings",
+      "description": "Global platform settings managed by super admins"
     }
   }
 }

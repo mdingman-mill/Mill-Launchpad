@@ -7,10 +7,12 @@ import {
   Plan,
   ToolDefinition,
   AgencySettings,
+  PlatformSettings,
   UserRole,
   Invite,
   PlanId,
   OrganizationType,
+  AdminOrganizationSummary,
 } from '../types';
 import { dataService } from '../services/dataService';
 import { billingService } from '../services/billingService';
@@ -47,10 +49,14 @@ import {
   Copy,
   Check,
   Clock,
+  Building2,
+  UserMinus,
 } from 'lucide-react';
 
 interface AdminPanelProps {
   currentUser: User;
+  inviteOnlyMode?: boolean;
+  onPlatformSettingsChanged?: (settings: PlatformSettings) => void;
   onImpersonateUser: (user: User) => void;
   onViewReceipt: (invoice: Invoice) => void;
   onDataReset: () => void;
@@ -58,12 +64,14 @@ interface AdminPanelProps {
 
 export const AdminPanel: React.FC<AdminPanelProps> = ({
   currentUser,
+  inviteOnlyMode = false,
+  onPlatformSettingsChanged,
   onImpersonateUser,
   onViewReceipt,
   onDataReset,
 }) => {
   const [activeTab, setActiveTab] = useState<
-    'dashboard' | 'users' | 'invites' | 'billing' | 'access' | 'plans' | 'tools' | 'audit' | 'settings'
+    'dashboard' | 'users' | 'organizations' | 'invites' | 'billing' | 'access' | 'plans' | 'tools' | 'audit' | 'settings'
   >('dashboard');
 
   const [users, setUsers] = useState<User[]>(() => dataService.getUsers());
@@ -104,9 +112,26 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
 
   // Notification feedback
   const [adminNotification, setAdminNotification] = useState<string | null>(null);
+  const [platformSettings, setPlatformSettings] = useState<PlatformSettings>(() => ({
+    inviteOnlyMode: inviteOnlyMode ?? dataService.getPlatformSettings().inviteOnlyMode,
+  }));
+  const [isUpdatingPlatformSettings, setIsUpdatingPlatformSettings] = useState(false);
+  const [isExportingUsersCsv, setIsExportingUsersCsv] = useState(false);
+
+  // Organizations & Teams state (Super Admin)
+  const [adminOrganizations, setAdminOrganizations] = useState<AdminOrganizationSummary[]>([]);
+  const [isLoadingOrgs, setIsLoadingOrgs] = useState(false);
+  const [orgSearch, setOrgSearch] = useState('');
+  const [seatLimitEdits, setSeatLimitEdits] = useState<Record<string, string>>({});
+  const [savingSeatOrgId, setSavingSeatOrgId] = useState<string | null>(null);
+  const [removingOrgMemberKey, setRemovingOrgMemberKey] = useState<string | null>(null);
 
   const isSuperAdmin = currentUser.role === 'super_admin';
   const isReadOnlySupport = currentUser.role === 'support';
+
+  useEffect(() => {
+    setPlatformSettings((prev) => ({ ...prev, inviteOnlyMode }));
+  }, [inviteOnlyMode]);
 
   const notify = (msg: string) => {
     setAdminNotification(msg);
@@ -125,22 +150,122 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
     }
   };
 
+  const refreshPlatformSettings = async () => {
+    const fresh = await dataService.fetchPlatformSettings();
+    setPlatformSettings(fresh);
+    onPlatformSettingsChanged?.(fresh);
+  };
+
+  const refreshOrganizations = async () => {
+    if (!isSuperAdmin) return;
+    try {
+      setIsLoadingOrgs(true);
+      const list = await dataService.fetchAdminOrganizations();
+      setAdminOrganizations(list);
+      setSeatLimitEdits((prev) => {
+        const next: Record<string, string> = { ...prev };
+        list.forEach((org) => {
+          if (next[org.id] === undefined) {
+            next[org.id] = String(org.seatLimit);
+          }
+        });
+        return next;
+      });
+    } catch (err: any) {
+      console.error('Failed to load organizations:', err);
+    } finally {
+      setIsLoadingOrgs(false);
+    }
+  };
+
   useEffect(() => {
+    dataService.fetchAllUsersAsync().then((list) => setUsers(list));
     if (isSuperAdmin) {
       refreshInvites();
+      refreshPlatformSettings();
+      refreshOrganizations();
+      dataService.fetchAuditLogs().then(setAuditLogs).catch(() => {});
     }
   }, [isSuperAdmin]);
 
   const refreshAll = () => {
     setUsers(dataService.getUsers());
+    dataService.fetchAllUsersAsync().then((list) => setUsers(list));
     setInvoices(dataService.getInvoices());
     setAuditLogs(dataService.getAuditLogs());
+    dataService.fetchAuditLogs().then(setAuditLogs).catch(() => {});
     setAccessRules(dataService.getAccessRules());
     setPlans(dataService.getPlans());
     setTools(dataService.getTools());
     setSettings(dataService.getSettings());
     if (isSuperAdmin) {
       refreshInvites();
+      refreshPlatformSettings();
+      refreshOrganizations();
+    }
+  };
+
+  const handleSaveOrgSeatLimit = async (org: AdminOrganizationSummary) => {
+    const raw = seatLimitEdits[org.id] ?? String(org.seatLimit);
+    const parsed = Math.floor(Number(raw));
+    if (!Number.isFinite(parsed) || parsed < 1) {
+      notify('Seat limit must be a positive integer.');
+      return;
+    }
+    try {
+      setSavingSeatOrgId(org.id);
+      const updated = await dataService.updateOrgSeatLimitServer(org.id, parsed);
+      setSeatLimitEdits((prev) => ({ ...prev, [org.id]: String(updated.seatLimit) }));
+      await refreshOrganizations();
+      refreshAll();
+      notify(`Updated seat limit for ${org.name} to ${updated.seatLimit}`);
+    } catch (err: any) {
+      notify(`Failed to update seat limit: ${err?.message || 'Unknown error'}`);
+    } finally {
+      setSavingSeatOrgId(null);
+    }
+  };
+
+  const handleAdminRemoveOrgMember = async (org: AdminOrganizationSummary, memberId: string, memberName: string) => {
+    if (
+      !window.confirm(
+        `Remove ${memberName} from ${org.name}? They will be reassigned to a new personal Free Starter organization.`
+      )
+    ) {
+      return;
+    }
+    const actionKey = `${org.id}:${memberId}`;
+    try {
+      setRemovingOrgMemberKey(actionKey);
+      await dataService.removeOrgMemberServer(org.id, memberId);
+      await refreshOrganizations();
+      refreshAll();
+      notify(`Removed ${memberName} from ${org.name}`);
+    } catch (err: any) {
+      notify(`Failed to remove member: ${err?.message || 'Unknown error'}`);
+    } finally {
+      setRemovingOrgMemberKey(null);
+    }
+  };
+
+  const handleToggleInviteOnlyMode = async () => {
+    if (!isSuperAdmin || isUpdatingPlatformSettings) return;
+    const nextValue = !platformSettings.inviteOnlyMode;
+    try {
+      setIsUpdatingPlatformSettings(true);
+      const updated = await dataService.updatePlatformSettingsServer(nextValue);
+      setPlatformSettings(updated);
+      onPlatformSettingsChanged?.(updated);
+      refreshAll();
+      notify(
+        nextValue
+          ? 'Invite-Only Mode ENABLED: self-account creation and paid plans are disabled.'
+          : 'Invite-Only Mode DISABLED: open sign-ups and paid plans are enabled.'
+      );
+    } catch (err: any) {
+      notify(`Failed to update Invite-Only Mode: ${err.message}`);
+    } finally {
+      setIsUpdatingPlatformSettings(false);
     }
   };
 
@@ -341,6 +466,72 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
     notify('Invoices exported to CSV');
   };
 
+  const escapeCsvCell = (value: unknown): string => {
+    const raw = value === null || value === undefined ? '' : String(value);
+    const safe = /^[=+\-@\t\r]/.test(raw) ? `'${raw}` : raw;
+    return `"${safe.replace(/"/g, '""')}"`;
+  };
+
+  const handleExportUsersCSV = async () => {
+    if (!isSuperAdmin || isExportingUsersCsv) return;
+    try {
+      setIsExportingUsersCsv(true);
+      const latestUsers = await dataService.fetchAllUsersAsync();
+      const exportList = latestUsers.length > 0 ? latestUsers : users;
+      if (latestUsers.length > 0) {
+        setUsers(latestUsers);
+      }
+
+      const headers = [
+        'User ID',
+        'Name',
+        'Email',
+        'Organization Name',
+        'Organization Type',
+        'Plan',
+        'Role',
+        'Status',
+        'Sign-Up Date',
+        'Last Active',
+        'Monthly Generations Used',
+        'Total Tool Generations',
+      ];
+
+      const rows = exportList.map((u) => {
+        const signupDate = u.signupDate || (u as User & { createdAt?: string }).createdAt || '';
+        const totalToolGenerations = u.totalGenerations ?? u.generationsUsedThisMonth ?? 0;
+        return [
+          escapeCsvCell(u.id),
+          escapeCsvCell(u.name || ''),
+          escapeCsvCell(u.email || ''),
+          escapeCsvCell(u.organizationProfile?.orgName || ''),
+          escapeCsvCell(u.organizationProfile?.type || ''),
+          escapeCsvCell(u.planId || 'free'),
+          escapeCsvCell(u.role || 'member'),
+          escapeCsvCell(u.status || 'active'),
+          escapeCsvCell(signupDate),
+          escapeCsvCell(u.lastLogin || ''),
+          escapeCsvCell(u.generationsUsedThisMonth || 0),
+          escapeCsvCell(totalToolGenerations),
+        ].join(',');
+      });
+
+      const csvContent = [headers.map(escapeCsvCell).join(','), ...rows].join('\n');
+      const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `millennium_users_report_${new Date().toISOString().split('T')[0]}.csv`;
+      a.click();
+      URL.revokeObjectURL(url);
+      notify(`Exported ${exportList.length} users to CSV`);
+    } catch (err: any) {
+      notify(`Failed to export users CSV: ${err?.message || 'Unknown error'}`);
+    } finally {
+      setIsExportingUsersCsv(false);
+    }
+  };
+
   /* =========================================================================
    * ACCESS RULES & INVITE
    * ========================================================================= */
@@ -405,16 +596,16 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
   };
 
 
-  // Filter users list
+  // Filter users list in real-time by email, organization name, or name
   const filteredUsers = users.filter((u) => {
     if (userPlanFilter !== 'all' && u.planId !== userPlanFilter) return false;
     if (userOrgFilter !== 'all' && u.organizationProfile?.type !== userOrgFilter) return false;
-    if (userSearch.trim()) {
-      const q = userSearch.toLowerCase();
-      const matchName = u.name.toLowerCase().includes(q);
-      const matchEmail = u.email.toLowerCase().includes(q);
+    const q = userSearch.trim().toLowerCase();
+    if (q) {
+      const matchEmail = (u.email || '').toLowerCase().includes(q);
       const matchOrg = (u.organizationProfile?.orgName || '').toLowerCase().includes(q);
-      return matchName || matchEmail || matchOrg;
+      const matchName = (u.name || '').toLowerCase().includes(q);
+      return matchEmail || matchOrg || matchName;
     }
     return true;
   });
@@ -424,10 +615,16 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
       {/* Admin Top Header */}
       <div className="bg-slate-900 text-white rounded-3xl p-6 sm:p-8 shadow-xl border border-slate-800 flex flex-col md:flex-row md:items-center justify-between gap-4">
         <div>
-          <div className="flex items-center gap-2 mb-1">
+          <div className="flex flex-wrap items-center gap-2 mb-1">
             <span className="px-2.5 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-wider bg-rose-500/20 text-rose-300 border border-rose-400/30">
               Agency Operations
             </span>
+            {platformSettings.inviteOnlyMode && (
+              <span className="px-2.5 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-wider bg-amber-500/20 text-amber-300 border border-amber-400/40 inline-flex items-center gap-1">
+                <Lock className="w-3 h-3" />
+                <span>Invite-Only Mode Active</span>
+              </span>
+            )}
             <span className="text-xs text-slate-400">
               Logged in as <strong className="text-white">{currentUser.name}</strong> ({currentUser.role.replace('_', ' ')})
             </span>
@@ -441,6 +638,18 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
         </div>
 
         <div className="flex items-center gap-2.5">
+          {isSuperAdmin && (
+            <button
+              type="button"
+              onClick={handleExportUsersCSV}
+              disabled={isExportingUsersCsv}
+              className="px-3.5 py-2 rounded-xl bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold flex items-center gap-1.5 transition-colors shadow-xs cursor-pointer disabled:opacity-50"
+              title="Export CSV report of all users, sign-up dates, and total tool generation counts"
+            >
+              <Download className="w-3.5 h-3.5" />
+              <span>{isExportingUsersCsv ? 'Exporting...' : 'Download CSV'}</span>
+            </button>
+          )}
           <button
             onClick={refreshAll}
             className="p-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-semibold flex items-center gap-1.5 transition-colors border border-slate-700"
@@ -466,7 +675,8 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
       <div className="flex items-center gap-1 border-b border-slate-200 pb-px overflow-x-auto text-xs font-bold">
         {[
           { key: 'dashboard', label: 'Executive Dashboard', icon: LayoutDashboard },
-          { key: 'users', label: `Users & Organizations (${users.length})`, icon: UsersIcon },
+          { key: 'users', label: `Users (${users.length})`, icon: UsersIcon },
+          { key: 'organizations', label: `Teams & Orgs (${adminOrganizations.length})`, icon: Building2 },
           { key: 'invites', label: `Invites (${invites.length})`, icon: Mail },
           { key: 'billing', label: 'Billing & Invoices', icon: CreditCard },
           { key: 'access', label: 'Access Control', icon: ShieldCheck },
@@ -661,15 +871,31 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
         <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
           {/* Table Search & Filters Header */}
           <div className="p-4 border-b border-slate-200 flex flex-col sm:flex-row items-center justify-between gap-3">
-            <div className="relative w-full sm:w-80">
-              <Search className="w-4 h-4 text-slate-400 absolute left-3 top-2.5" />
-              <input
-                type="text"
-                value={userSearch}
-                onChange={(e) => setUserSearch(e.target.value)}
-                placeholder="Search by name, email, or org..."
-                className="w-full pl-9 pr-3 py-1.5 text-xs rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-rose-500"
-              />
+            <div className="flex items-center gap-3 w-full sm:w-auto flex-1">
+              <div className="relative w-full sm:w-80">
+                <Search className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
+                <input
+                  type="text"
+                  aria-label="Filter users by email or organization name"
+                  value={userSearch}
+                  onChange={(e) => setUserSearch(e.target.value)}
+                  placeholder="Filter by email or organization name..."
+                  className="w-full pl-9 pr-8 py-1.5 text-xs rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-rose-500"
+                />
+                {userSearch && (
+                  <button
+                    type="button"
+                    aria-label="Clear user search"
+                    onClick={() => setUserSearch('')}
+                    className="absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600 p-0.5 cursor-pointer"
+                  >
+                    <X className="w-3.5 h-3.5" />
+                  </button>
+                )}
+              </div>
+              <span className="text-[11px] font-medium text-slate-500 whitespace-nowrap hidden md:inline">
+                {filteredUsers.length} of {users.length} users
+              </span>
             </div>
 
             <div className="flex items-center gap-2 w-full sm:w-auto justify-end overflow-x-auto text-xs">
@@ -786,7 +1012,8 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                       </td>
 
                       <td className="py-3 px-4 font-mono text-[11px] text-slate-600">
-                        {u.role}
+                        <div>{u.role}</div>
+                        <div className="text-[10px] text-slate-400">org: {u.orgRole || 'owner'}</div>
                       </td>
 
                       <td className="py-3 px-4 font-mono text-[11px] text-slate-500 whitespace-nowrap">
@@ -815,9 +1042,236 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                     </tr>
                   );
                 })}
+                {filteredUsers.length === 0 && (
+                  <tr>
+                    <td colSpan={8} className="py-10 px-4 text-center text-xs text-slate-500">
+                      <p className="font-semibold text-slate-700">No matching users found</p>
+                      <p className="text-[11px] text-slate-400 mt-1">
+                        Try adjusting your email or organization filter.
+                      </p>
+                      {(userSearch || userPlanFilter !== 'all' || userOrgFilter !== 'all') && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setUserSearch('');
+                            setUserPlanFilter('all');
+                            setUserOrgFilter('all');
+                          }}
+                          className="mt-3 px-3 py-1.5 rounded-lg border border-slate-200 text-slate-700 hover:bg-slate-50 font-semibold cursor-pointer"
+                        >
+                          Clear Filters
+                        </button>
+                      )}
+                    </td>
+                  </tr>
+                )}
               </tbody>
             </table>
           </div>
+        </div>
+      )}
+
+      {/* =====================================================================
+       * TAB: TEAMS & ORGANIZATIONS MANAGEMENT (SUPER ADMIN)
+       * ===================================================================== */}
+      {activeTab === 'organizations' && (
+        <div className="space-y-5">
+          <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+            <div className="relative w-full sm:w-80">
+              <Search className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
+              <input
+                type="text"
+                value={orgSearch}
+                onChange={(e) => setOrgSearch(e.target.value)}
+                placeholder="Search organizations or member emails..."
+                className="w-full pl-9 pr-8 py-1.5 text-xs rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-rose-500"
+              />
+              {orgSearch && (
+                <button
+                  type="button"
+                  onClick={() => setOrgSearch('')}
+                  className="absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600 p-0.5 cursor-pointer"
+                >
+                  <X className="w-3.5 h-3.5" />
+                </button>
+              )}
+            </div>
+
+            <div className="flex items-center gap-3">
+              <span className="text-xs text-slate-500 font-medium">
+                {adminOrganizations.length} organizations
+              </span>
+              <button
+                type="button"
+                onClick={refreshOrganizations}
+                disabled={isLoadingOrgs}
+                className="px-3 py-1.5 rounded-xl border border-slate-200 hover:bg-slate-50 text-xs font-semibold text-slate-700 flex items-center gap-1.5 cursor-pointer"
+              >
+                <RefreshCw className={`w-3.5 h-3.5 ${isLoadingOrgs ? 'animate-spin' : ''}`} />
+                <span>Refresh Orgs</span>
+              </button>
+            </div>
+          </div>
+
+          {adminOrganizations
+            .filter((org) => {
+              const q = orgSearch.trim().toLowerCase();
+              if (!q) return true;
+              const matchOrg =
+                (org.name || '').toLowerCase().includes(q) ||
+                (org.id || '').toLowerCase().includes(q) ||
+                (org.planId || '').toLowerCase().includes(q);
+              const matchMember = org.members.some(
+                (m) =>
+                  (m.email || '').toLowerCase().includes(q) ||
+                  (m.name || '').toLowerCase().includes(q)
+              );
+              return matchOrg || matchMember;
+            })
+            .map((org) => {
+              const orgPlan = plans.find((p) => p.id === org.planId);
+              const orgQuotaLimit = (orgPlan?.generationLimit || 50) + (org.bonusGenerations || 0);
+              const editValue = seatLimitEdits[org.id] ?? String(org.seatLimit);
+              const isSavingSeat = savingSeatOrgId === org.id;
+
+              return (
+                <div
+                  key={org.id}
+                  className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden"
+                >
+                  <div className="p-5 border-b border-slate-100 flex flex-col lg:flex-row lg:items-center justify-between gap-4 bg-slate-50/50">
+                    <div className="space-y-1">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <h3 className="text-sm font-bold text-slate-900">{org.name}</h3>
+                        <span className="px-2 py-0.5 rounded-md text-[10px] font-bold uppercase bg-rose-50 text-rose-800 border border-rose-200">
+                          {orgPlan?.name || org.planId}
+                        </span>
+                        {org.type && (
+                          <span className="px-2 py-0.5 rounded-md text-[10px] font-bold bg-slate-100 text-slate-700 border border-slate-200">
+                            {org.type}
+                          </span>
+                        )}
+                      </div>
+                      <div className="flex flex-wrap items-center gap-3 text-[11px] text-slate-500 font-mono">
+                        <span>ID: {org.id}</span>
+                        <span>·</span>
+                        <span>
+                          Quota: {org.generationsUsedThisMonth} / {orgQuotaLimit}
+                        </span>
+                        <span>·</span>
+                        <span>
+                          Seats: {org.seatsUsed} / {org.seatLimit} ({org.members.length} active,{' '}
+                          {org.pendingInvitesCount} pending)
+                        </span>
+                      </div>
+                    </div>
+
+                    {/* Seat Limit Override */}
+                    <div className="flex items-center gap-2">
+                      <label className="text-[11px] font-bold text-slate-600 whitespace-nowrap">
+                        Seat Limit:
+                      </label>
+                      <input
+                        type="number"
+                        min={Math.max(1, org.members.length)}
+                        max={500}
+                        value={editValue}
+                        onChange={(e) =>
+                          setSeatLimitEdits((prev) => ({ ...prev, [org.id]: e.target.value }))
+                        }
+                        className="w-20 px-2.5 py-1.5 text-xs font-mono font-bold rounded-xl border border-slate-300 bg-white focus:outline-none focus:ring-2 focus:ring-rose-500"
+                      />
+                      <button
+                        type="button"
+                        disabled={isSavingSeat || Number(editValue) === org.seatLimit}
+                        onClick={() => handleSaveOrgSeatLimit(org)}
+                        className="px-3 py-1.5 rounded-xl bg-slate-900 hover:bg-slate-800 disabled:opacity-40 text-white text-xs font-bold cursor-pointer"
+                      >
+                        {isSavingSeat ? 'Saving...' : 'Save Limit'}
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Organization Members Table */}
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-left text-xs">
+                      <thead className="bg-white text-slate-400 uppercase text-[10px] font-bold border-b border-slate-100">
+                        <tr>
+                          <th className="py-2 px-5">Member</th>
+                          <th className="py-2 px-4">Org Role</th>
+                          <th className="py-2 px-4">Usage (Month)</th>
+                          <th className="py-2 px-4">Total Gens</th>
+                          <th className="py-2 px-4">Last Active</th>
+                          <th className="py-2 px-5 text-right">Actions</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-100">
+                        {org.members.map((m) => {
+                          const isOrgOwner = m.orgRole === 'owner' || org.ownerId === m.id;
+                          const isRemoving = removingOrgMemberKey === `${org.id}:${m.id}`;
+                          return (
+                            <tr key={m.id} className="hover:bg-slate-50/70">
+                              <td className="py-2.5 px-5">
+                                <div className="font-semibold text-slate-900">{m.name}</div>
+                                <div className="text-[11px] text-slate-500 font-mono">{m.email}</div>
+                              </td>
+                              <td className="py-2.5 px-4">
+                                <span
+                                  className={`px-2 py-0.5 rounded-md text-[10px] font-bold uppercase ${
+                                    isOrgOwner
+                                      ? 'bg-rose-50 text-rose-800 border border-rose-200'
+                                      : 'bg-slate-100 text-slate-700'
+                                  }`}
+                                >
+                                  {isOrgOwner ? 'Owner' : 'Member'}
+                                </span>
+                              </td>
+                              <td className="py-2.5 px-4 font-mono font-bold text-slate-800">
+                                {m.generationsUsedThisMonth || 0}
+                              </td>
+                              <td className="py-2.5 px-4 font-mono text-slate-600">
+                                {m.totalGenerations ?? m.generationsUsedThisMonth ?? 0}
+                              </td>
+                              <td className="py-2.5 px-4 font-mono text-[11px] text-slate-500">
+                                {m.lastLogin ? new Date(m.lastLogin).toLocaleDateString() : '—'}
+                              </td>
+                              <td className="py-2.5 px-5 text-right">
+                                {isOrgOwner ? (
+                                  <span className="text-[11px] text-slate-400">Owner</span>
+                                ) : (
+                                  <button
+                                    type="button"
+                                    disabled={isRemoving}
+                                    onClick={() => handleAdminRemoveOrgMember(org, m.id, m.name)}
+                                    className="px-2.5 py-1 rounded-lg bg-rose-50 hover:bg-rose-100 text-rose-700 border border-rose-200 text-[11px] font-semibold inline-flex items-center gap-1 cursor-pointer disabled:opacity-50"
+                                  >
+                                    <UserMinus className="w-3 h-3" />
+                                    <span>{isRemoving ? 'Removing...' : 'Remove'}</span>
+                                  </button>
+                                )}
+                              </td>
+                            </tr>
+                          );
+                        })}
+                        {org.members.length === 0 && (
+                          <tr>
+                            <td colSpan={6} className="py-6 px-5 text-center text-xs text-slate-400">
+                              No active members found in this organization.
+                            </td>
+                          </tr>
+                        )}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              );
+            })}
+
+          {adminOrganizations.length === 0 && !isLoadingOrgs && (
+            <div className="bg-white rounded-2xl border border-slate-200 p-10 text-center text-xs text-slate-500">
+              No organizations found yet.
+            </div>
+          )}
         </div>
       )}
 
@@ -876,26 +1330,45 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
 
               {/* Plan & Usage Management */}
               <div className="space-y-3">
-                <span className="font-bold text-slate-800 uppercase tracking-wide text-[10px]">
-                  Subscription Plan & Quota
-                </span>
+                <div className="flex items-center justify-between gap-2">
+                  <span className="font-bold text-slate-800 uppercase tracking-wide text-[10px]">
+                    Subscription Plan & Quota
+                  </span>
+                  {platformSettings.inviteOnlyMode && (
+                    <span className="text-[10px] font-semibold text-amber-800 bg-amber-50 border border-amber-200 px-2 py-0.5 rounded-md">
+                      Paid plans disabled in Invite-Only Mode
+                    </span>
+                  )}
+                </div>
                 <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
-                  {(['free', 'pro', 'team', 'complimentary'] as const).map((pId) => (
-                    <button
-                      key={pId}
-                      onClick={() => handleUpdateUserPlan(selectedUserDetail.id, pId)}
-                      className={`p-2.5 rounded-xl border text-center transition-all ${
-                        selectedUserDetail.planId === pId
-                          ? 'border-rose-600 bg-rose-50 text-rose-900 font-bold ring-1 ring-rose-600'
-                          : 'border-slate-200 text-slate-600 hover:bg-slate-50'
-                      }`}
-                    >
-                      <div className="capitalize truncate text-[11px] font-bold">{pId}</div>
-                      <div className="text-[10px] text-slate-400">
-                        {pId === 'free' ? '50/mo' : pId === 'pro' ? '500/mo' : '2000/mo'}
-                      </div>
-                    </button>
-                  ))}
+                  {(['free', 'pro', 'team', 'complimentary'] as const).map((pId) => {
+                    const isPaidDisabled = platformSettings.inviteOnlyMode && (pId === 'pro' || pId === 'team');
+                    return (
+                      <button
+                        key={pId}
+                        disabled={isPaidDisabled}
+                        onClick={() => handleUpdateUserPlan(selectedUserDetail.id, pId)}
+                        className={`p-2.5 rounded-xl border text-center transition-all ${
+                          isPaidDisabled
+                            ? 'border-slate-200 bg-slate-100 text-slate-400 cursor-not-allowed opacity-70'
+                            : selectedUserDetail.planId === pId
+                            ? 'border-rose-600 bg-rose-50 text-rose-900 font-bold ring-1 ring-rose-600'
+                            : 'border-slate-200 text-slate-600 hover:bg-slate-50'
+                        }`}
+                      >
+                        <div className="capitalize truncate text-[11px] font-bold">{pId}</div>
+                        <div className="text-[10px] text-slate-400">
+                          {isPaidDisabled
+                            ? 'Disabled'
+                            : pId === 'free'
+                            ? '50/mo'
+                            : pId === 'pro'
+                            ? '500/mo'
+                            : '2000/mo'}
+                        </div>
+                      </button>
+                    );
+                  })}
                 </div>
 
                 <div className="flex flex-wrap items-center gap-2 pt-1">
@@ -1010,6 +1483,65 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
        * ===================================================================== */}
       {activeTab === 'invites' && (
         <div className="space-y-6">
+          {/* Invite-Only Mode Control Card */}
+          <div
+            className={`rounded-2xl border shadow-sm p-5 flex flex-col sm:flex-row sm:items-center justify-between gap-4 ${
+              platformSettings.inviteOnlyMode
+                ? 'bg-amber-50/70 border-amber-200'
+                : 'bg-white border-slate-200'
+            }`}
+          >
+            <div className="flex items-start gap-3">
+              <div
+                className={`w-10 h-10 rounded-xl flex items-center justify-center shrink-0 border ${
+                  platformSettings.inviteOnlyMode
+                    ? 'bg-amber-100 text-amber-800 border-amber-300'
+                    : 'bg-slate-100 text-slate-600 border-slate-200'
+                }`}
+              >
+                <Lock className="w-5 h-5" />
+              </div>
+              <div className="space-y-1">
+                <div className="flex flex-wrap items-center gap-2">
+                  <h3 className="text-sm font-bold text-slate-900">Invite-Only Mode</h3>
+                  <span
+                    className={`px-2 py-0.5 rounded-full text-[10px] font-extrabold uppercase tracking-wider border ${
+                      platformSettings.inviteOnlyMode
+                        ? 'bg-amber-100 text-amber-900 border-amber-300'
+                        : 'bg-emerald-50 text-emerald-800 border-emerald-200'
+                    }`}
+                  >
+                    {platformSettings.inviteOnlyMode ? 'Enabled' : 'Disabled'}
+                  </span>
+                </div>
+                <p className="text-xs text-slate-600 max-w-2xl leading-relaxed">
+                  {platformSettings.inviteOnlyMode
+                    ? 'Self-account creation and paid plans (Pro & Team) are disabled. Only existing accounts, super admins, and users with a valid complimentary invite can join.'
+                    : 'Open sign-ups are enabled. Enable Invite-Only Mode to block self-account creation for uninvited users and disable all paid plans.'}
+                </p>
+              </div>
+            </div>
+
+            {isSuperAdmin && (
+              <button
+                type="button"
+                onClick={handleToggleInviteOnlyMode}
+                disabled={isUpdatingPlatformSettings}
+                className={`px-4 py-2.5 rounded-xl text-xs font-bold shrink-0 transition-all cursor-pointer disabled:opacity-50 ${
+                  platformSettings.inviteOnlyMode
+                    ? 'bg-white hover:bg-slate-50 text-slate-900 border border-slate-300 shadow-xs'
+                    : 'bg-slate-900 hover:bg-slate-800 text-white shadow-xs'
+                }`}
+              >
+                {isUpdatingPlatformSettings
+                  ? 'Updating...'
+                  : platformSettings.inviteOnlyMode
+                  ? 'Disable Invite-Only Mode'
+                  : 'Enable Invite-Only Mode'}
+              </button>
+            )}
+          </div>
+
           {/* Create Invite Form */}
           <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-6 space-y-4">
             <div className="flex items-center justify-between pb-3 border-b border-slate-100">
@@ -1488,53 +2020,81 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
             </div>
           </div>
 
+          {platformSettings.inviteOnlyMode && (
+            <div className="p-3.5 rounded-xl bg-amber-50 border border-amber-200 text-xs text-amber-900 flex items-center gap-2">
+              <Lock className="w-4 h-4 text-amber-600 shrink-0" />
+              <span>
+                <strong>Invite-Only Mode Active:</strong> Paid plans (Pro Growth &amp; Agency Team) are disabled across the platform.
+              </span>
+            </div>
+          )}
+
           <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-            {plans.map((p) => (
-              <div key={p.id} className="p-5 rounded-2xl border border-slate-200 bg-slate-50/50 space-y-4">
-                <div className="flex items-center justify-between">
-                  <h4 className="font-bold text-slate-900 text-sm">{p.name}</h4>
-                  <span className="text-[10px] uppercase font-mono px-2 py-0.5 rounded bg-slate-200 text-slate-700">
-                    {p.id}
-                  </span>
-                </div>
+            {plans.map((p) => {
+              const isPaidPlanDisabled = platformSettings.inviteOnlyMode && (p.id === 'pro' || p.id === 'team');
+              return (
+                <div
+                  key={p.id}
+                  className={`p-5 rounded-2xl border space-y-4 ${
+                    isPaidPlanDisabled
+                      ? 'border-slate-200 bg-slate-100/70 opacity-75'
+                      : 'border-slate-200 bg-slate-50/50'
+                  }`}
+                >
+                  <div className="flex items-center justify-between gap-2">
+                    <h4 className="font-bold text-slate-900 text-sm">{p.name}</h4>
+                    <div className="flex items-center gap-1.5">
+                      {isPaidPlanDisabled && (
+                        <span className="text-[10px] font-bold px-2 py-0.5 rounded bg-amber-100 text-amber-900 border border-amber-200">
+                          Disabled
+                        </span>
+                      )}
+                      <span className="text-[10px] uppercase font-mono px-2 py-0.5 rounded bg-slate-200 text-slate-700">
+                        {p.id}
+                      </span>
+                    </div>
+                  </div>
 
-                <div>
-                  <label className="block text-[11px] font-bold text-slate-600 mb-1">
-                    Standard Monthly Price ($ USD)
-                  </label>
-                  <input
-                    type="number"
-                    value={p.price}
-                    onChange={(e) => handleUpdatePlanPrice(p.id, Number(e.target.value))}
-                    className="w-full px-3 py-1.5 text-xs font-mono font-bold rounded-lg border border-slate-300 bg-white"
-                  />
-                  <span className="text-[10px] text-slate-400 mt-0.5 block">
-                    Nonprofit 25% discount price: ${p.priceNonprofit}
-                  </span>
-                </div>
+                  <div>
+                    <label className="block text-[11px] font-bold text-slate-600 mb-1">
+                      Standard Monthly Price ($ USD)
+                    </label>
+                    <input
+                      type="number"
+                      disabled={isPaidPlanDisabled}
+                      value={p.price}
+                      onChange={(e) => handleUpdatePlanPrice(p.id, Number(e.target.value))}
+                      className="w-full px-3 py-1.5 text-xs font-mono font-bold rounded-lg border border-slate-300 bg-white disabled:bg-slate-100 disabled:text-slate-400"
+                    />
+                    <span className="text-[10px] text-slate-400 mt-0.5 block">
+                      Nonprofit 25% discount price: ${p.priceNonprofit}
+                    </span>
+                  </div>
 
-                <div>
-                  <label className="block text-[11px] font-bold text-slate-600 mb-1">
-                    Monthly Generation Limit
-                  </label>
-                  <input
-                    type="number"
-                    value={p.generationLimit}
-                    onChange={(e) => handleUpdatePlanLimit(p.id, Number(e.target.value))}
-                    className="w-full px-3 py-1.5 text-xs font-mono font-bold rounded-lg border border-slate-300 bg-white"
-                  />
-                </div>
+                  <div>
+                    <label className="block text-[11px] font-bold text-slate-600 mb-1">
+                      Monthly Generation Limit
+                    </label>
+                    <input
+                      type="number"
+                      disabled={isPaidPlanDisabled}
+                      value={p.generationLimit}
+                      onChange={(e) => handleUpdatePlanLimit(p.id, Number(e.target.value))}
+                      className="w-full px-3 py-1.5 text-xs font-mono font-bold rounded-lg border border-slate-300 bg-white disabled:bg-slate-100 disabled:text-slate-400"
+                    />
+                  </div>
 
-                <div className="text-[11px] text-slate-500 space-y-1">
-                  <p className="font-semibold text-slate-700">Configured Features:</p>
-                  <ul className="list-disc list-inside space-y-0.5">
-                    {p.features.slice(0, 3).map((f, i) => (
-                      <li key={i}>{f}</li>
-                    ))}
-                  </ul>
+                  <div className="text-[11px] text-slate-500 space-y-1">
+                    <p className="font-semibold text-slate-700">Configured Features:</p>
+                    <ul className="list-disc list-inside space-y-0.5">
+                      {p.features.slice(0, 3).map((f, i) => (
+                        <li key={i}>{f}</li>
+                      ))}
+                    </ul>
+                  </div>
                 </div>
-              </div>
-            ))}
+              );
+            })}
           </div>
         </div>
       )}
@@ -1671,6 +2231,48 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                 onChange={(e) => setSettings({ ...settings, contactEmail: e.target.value })}
                 className="w-full px-3 py-2 rounded-xl border border-slate-300"
               />
+            </div>
+
+            {/* Platform Access Control: Invite-Only Mode */}
+            <div
+              className={`p-4 rounded-xl border flex flex-col sm:flex-row sm:items-center justify-between gap-3 ${
+                platformSettings.inviteOnlyMode
+                  ? 'bg-amber-50 border-amber-200'
+                  : 'bg-slate-50 border-slate-200'
+              }`}
+            >
+              <div className="space-y-1">
+                <div className="flex items-center gap-2">
+                  <Lock className="w-4 h-4 text-slate-700" />
+                  <span className="font-bold text-slate-900">Invite-Only Mode</span>
+                  <span
+                    className={`px-2 py-0.5 rounded-full text-[10px] font-bold uppercase ${
+                      platformSettings.inviteOnlyMode
+                        ? 'bg-amber-200 text-amber-950'
+                        : 'bg-slate-200 text-slate-700'
+                    }`}
+                  >
+                    {platformSettings.inviteOnlyMode ? 'Active' : 'Off'}
+                  </span>
+                </div>
+                <p className="text-[11px] text-slate-600">
+                  Disables self-account creation and paid plans (Pro &amp; Team) across the server and UI.
+                </p>
+              </div>
+              {isSuperAdmin && (
+                <button
+                  type="button"
+                  onClick={handleToggleInviteOnlyMode}
+                  disabled={isUpdatingPlatformSettings}
+                  className="px-3.5 py-2 rounded-xl bg-slate-900 hover:bg-slate-800 text-white text-xs font-bold shrink-0 cursor-pointer disabled:opacity-50"
+                >
+                  {isUpdatingPlatformSettings
+                    ? 'Updating...'
+                    : platformSettings.inviteOnlyMode
+                    ? 'Disable'
+                    : 'Enable'}
+                </button>
+              )}
             </div>
 
             <div className="p-4 rounded-xl bg-slate-50 border border-slate-200 space-y-2">

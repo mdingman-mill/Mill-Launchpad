@@ -1,6 +1,6 @@
 import { signInWithPopup, signOut as firebaseSignOut, onAuthStateChanged, User as FirebaseUser } from 'firebase/auth';
 import { auth, googleProvider } from '../firebase';
-import { User } from '../types';
+import { User, Organization } from '../types';
 import { dataService } from './dataService';
 
 type AuthListener = (user: User | null) => void;
@@ -27,6 +27,7 @@ class AuthService {
         } catch (error) {
           console.error('[Auth Service] Backend sync failed on state change:', error);
           this.currentUser = null;
+          dataService.clearCache();
         }
       } else {
         this.currentUser = null;
@@ -43,21 +44,58 @@ class AuthService {
    */
   public async syncWithBackend(fbUser: FirebaseUser): Promise<User> {
     const token = await fbUser.getIdToken();
-    const res = await fetch('/api/auth/sync', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${token}`,
-      },
-    });
 
-    if (!res.ok) {
-      const errData = await res.json().catch(() => ({}));
-      throw new Error(errData.error || 'Failed to authenticate with server');
+    const executeSync = async (): Promise<Response> =>
+      fetch('/api/auth/sync', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+      });
+
+    let res = await executeSync();
+    let contentType = res.headers.get('content-type') || '';
+
+    // Retry once briefly if an HTML fallback/restart page was returned transiently
+    if (!contentType.includes('application/json')) {
+      await new Promise((resolve) => setTimeout(resolve, 600));
+      res = await executeSync();
+      contentType = res.headers.get('content-type') || '';
     }
 
-    const data = await res.json();
-    return data.user as User;
+    const rawText = await res.text();
+    let parsed: any = null;
+    if (contentType.includes('application/json') || rawText.trim().startsWith('{')) {
+      try {
+        parsed = JSON.parse(rawText);
+      } catch {
+        parsed = null;
+      }
+    }
+
+    if (!res.ok) {
+      if (res.status === 401 || res.status === 403) {
+        await firebaseSignOut(auth).catch(() => {});
+      }
+      throw new Error(parsed?.error || 'Failed to authenticate with server');
+    }
+
+    if (!parsed || !parsed.user) {
+      throw new Error('Authentication API returned an invalid response. Please refresh and try again.');
+    }
+
+    if (parsed.platformSettings) {
+      dataService.setCachedPlatformSettings(parsed.platformSettings);
+    }
+    if (parsed.organization) {
+      dataService.setCachedOrganization(parsed.organization as Organization);
+    }
+    return parsed.user as User;
+  }
+
+  public getCurrentOrganization(): Organization | null {
+    return dataService.getCachedOrganization();
   }
 
   public getCurrentUser(): User | null {

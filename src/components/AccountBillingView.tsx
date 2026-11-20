@@ -1,11 +1,18 @@
-import React, { useState, useMemo } from 'react';
-import { User, Invoice, Plan, AuditLogEntry } from '../types';
+import React, { useState, useMemo, useEffect, useCallback } from 'react';
+import {
+  User,
+  Organization,
+  TeamMember,
+  TeamInvite,
+  TeamState,
+  Invoice,
+  AuditLogEntry,
+} from '../types';
 import { dataService } from '../services/dataService';
 import { billingService } from '../services/billingService';
 import { authService } from '../services/authService';
 import { generateActivityReportPdf } from '../utils/activityReportPdf';
 import {
-  User as UserIcon,
   CreditCard,
   Zap,
   Users,
@@ -13,7 +20,6 @@ import {
   Receipt,
   Download,
   Building2,
-  Trash2,
   CheckCircle2,
   Plus,
   Mail,
@@ -21,8 +27,6 @@ import {
   Edit2,
   Calendar,
   History,
-  Activity,
-  Sparkles,
   Wand2,
   ArrowUpRight,
   ArrowDownRight,
@@ -35,14 +39,20 @@ import {
   Bookmark,
   FileText,
   Clock,
+  LogOut,
+  ArrowRightLeft,
+  RefreshCw,
 } from 'lucide-react';
 
 interface AccountBillingViewProps {
   user: User;
+  organization?: Organization | null;
+  inviteOnlyMode?: boolean;
   onOpenUpgrade: () => void;
   onEditProfile: () => void;
   onViewReceipt: (invoice: Invoice) => void;
   onUserUpdated: (user: User) => void;
+  onOrganizationUpdated?: (org: Organization) => void;
   onNavigateToTools?: (toolId?: string) => void;
   onNavigateToLibrary?: () => void;
 }
@@ -180,11 +190,21 @@ function classifyActivity(log: AuditLogEntry): ActivityClassification {
     };
   }
 
-  if (action.startsWith('TEAM_MEMBER_') || action === 'PROFILE_CONFIGURED') {
+  if (
+    action.startsWith('TEAM_MEMBER_') ||
+    action.startsWith('TEAM_INVITE_') ||
+    action === 'OWNERSHIP_TRANSFERRED' ||
+    action === 'PROFILE_CONFIGURED'
+  ) {
     return {
       category: 'workspace',
       categoryLabel: 'Workspace',
-      displayTitle: action === 'PROFILE_CONFIGURED' ? 'Organization Profile Configured' : 'Team Seat Updated',
+      displayTitle:
+        action === 'PROFILE_CONFIGURED'
+          ? 'Organization Profile Configured'
+          : action === 'OWNERSHIP_TRANSFERRED'
+          ? 'Workspace Ownership Transferred'
+          : 'Team Seat Updated',
       badgeStyle: { bg: 'bg-slate-100', text: 'text-slate-700', border: 'border-slate-200' },
       iconType: 'team',
     };
@@ -201,18 +221,23 @@ function classifyActivity(log: AuditLogEntry): ActivityClassification {
 
 export const AccountBillingView: React.FC<AccountBillingViewProps> = ({
   user,
+  organization,
+  inviteOnlyMode = false,
   onOpenUpgrade,
   onEditProfile,
   onViewReceipt,
   onUserUpdated,
+  onOrganizationUpdated,
   onNavigateToTools,
   onNavigateToLibrary,
 }) => {
   const [activeTab, setActiveTab] = useState<TabKey>('plan');
-  const [invoices, setInvoices] = useState<Invoice[]>(() => dataService.getInvoices(user.id));
+  const [invoices] = useState<Invoice[]>(() => dataService.getInvoices(user.id));
   const [inviteEmail, setInviteEmail] = useState('');
-  const [inviteName, setInviteName] = useState('');
-  const [teamMembers, setTeamMembers] = useState(user.teamMembers || []);
+  const [teamState, setTeamState] = useState<TeamState | null>(null);
+  const [loadingTeam, setLoadingTeam] = useState(false);
+  const [teamError, setTeamError] = useState<string | null>(null);
+  const [teamActionBusy, setTeamActionBusy] = useState(false);
   const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
   const [feedbackMsg, setFeedbackMsg] = useState<string | null>(null);
 
@@ -223,15 +248,66 @@ export const AccountBillingView: React.FC<AccountBillingViewProps> = ({
   const [copiedLogId, setCopiedLogId] = useState<string | null>(null);
   const [isExportingPdf, setIsExportingPdf] = useState(false);
 
+  const loadTeamState = useCallback(async () => {
+    try {
+      setLoadingTeam(true);
+      setTeamError(null);
+      const state = await dataService.fetchTeam();
+      setTeamState(state);
+      if (state.organization) {
+        onOrganizationUpdated?.(state.organization);
+      }
+    } catch (err: any) {
+      setTeamError(err?.message || 'Unable to load team details.');
+    } finally {
+      setLoadingTeam(false);
+    }
+  }, [onOrganizationUpdated]);
+
+  useEffect(() => {
+    loadTeamState();
+  }, [user.id, user.organizationId]);
+
   // Sync latest activities whenever the view opens or changes
   const refreshActivities = () => {
-    setActivities(dataService.getUserActivity(user.id));
+    dataService
+      .fetchAuditLogs()
+      .then(() => setActivities(dataService.getUserActivity(user.id)))
+      .catch(() => setActivities(dataService.getUserActivity(user.id)));
   };
 
-  const plan = billingService.getPlanById(user.planId);
-  const maxLimit = (plan?.generationLimit || 50) + (user.bonusGenerations || 0);
-  const currentUsage = user.generationsUsedThisMonth || 0;
+  const activeOrg = teamState?.organization || organization || null;
+  const members: TeamMember[] = teamState?.members || [
+    {
+      id: user.id,
+      name: user.name,
+      email: user.email,
+      avatar: user.avatar,
+      orgRole: user.orgRole || (activeOrg?.ownerId && activeOrg.ownerId !== user.id ? 'member' : 'owner'),
+      generationsUsedThisMonth: user.generationsUsedThisMonth || 0,
+      totalGenerations: user.totalGenerations ?? user.generationsUsedThisMonth ?? 0,
+      signupDate: user.signupDate,
+      lastLogin: user.lastLogin,
+    },
+  ];
+  const allTeamInvites: TeamInvite[] = teamState?.invites || [];
+  const pendingTeamInvites = allTeamInvites.filter((inv) => inv.status === 'pending');
+
+  const effectiveOrgRole =
+    activeOrg?.ownerId === user.id ? 'owner' : user.orgRole || 'owner';
+  const isOwner = effectiveOrgRole === 'owner';
+
+  const effectivePlanId = activeOrg?.planId || user.planId;
+  const plan = billingService.getPlanById(effectivePlanId);
+  const bonusGenerations = activeOrg?.bonusGenerations ?? user.bonusGenerations ?? 0;
+  const maxLimit = (plan?.generationLimit || 50) + bonusGenerations;
+  const currentUsage = activeOrg?.generationsUsedThisMonth ?? user.generationsUsedThisMonth ?? 0;
+  const billingResetDate = activeOrg?.billingResetDate || user.billingResetDate;
   const usagePercentage = Math.min(Math.round((currentUsage / maxLimit) * 100), 100);
+
+  const seatLimit = activeOrg?.seatLimit ?? (effectivePlanId === 'team' || effectivePlanId === 'complimentary' ? 5 : 1);
+  const seatsUsed = members.length + pendingTeamInvites.length;
+  const isAtSeatLimit = seatsUsed >= seatLimit;
 
   const isNonprofit = user.organizationProfile?.type === 'Nonprofit';
   const hasDiscount = isNonprofit && user.nonprofitDiscountApproved;
@@ -327,53 +403,109 @@ export const AccountBillingView: React.FC<AccountBillingViewProps> = ({
     }
   };
 
-  const handleCancelSubscription = async () => {
-    if (window.confirm('Are you sure you want to cancel your subscription? You will be reverted to the Free plan at the end of your billing cycle.')) {
-      try {
-        await billingService.cancelSubscription(user.id);
-        const fresh = dataService.getUserById(user.id);
-        if (fresh) onUserUpdated(fresh);
-        refreshActivities();
-        setFeedbackMsg('Subscription canceled. Your account has returned to the Free Starter tier.');
-      } catch (err: any) {
-        setFeedbackMsg(err?.message || 'Unable to modify subscription from client.');
-      }
+  const handleInviteTeamMember = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const cleanedEmail = inviteEmail.trim().toLowerCase();
+    if (!cleanedEmail || teamActionBusy) return;
+
+    try {
+      setTeamActionBusy(true);
+      setTeamError(null);
+      await dataService.createTeamInvite(cleanedEmail);
+      setInviteEmail('');
+      await loadTeamState();
+      refreshActivities();
+      setFeedbackMsg(`Team invitation created for ${cleanedEmail}. They will join automatically upon signing in with that Google account.`);
+    } catch (err: any) {
+      setTeamError(err?.message || 'Unable to send team invite.');
+    } finally {
+      setTeamActionBusy(false);
     }
   };
 
-  const handleAddTeamMember = (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!inviteEmail || !inviteName) return;
+  const handleRevokeTeamInvite = async (inviteId: string, email: string) => {
+    if (!window.confirm(`Revoke pending team invitation for ${email}?`)) return;
+    try {
+      setTeamActionBusy(true);
+      setTeamError(null);
+      await dataService.revokeTeamInvite(inviteId);
+      await loadTeamState();
+      refreshActivities();
+      setFeedbackMsg(`Revoked pending invitation for ${email}.`);
+    } catch (err: any) {
+      setTeamError(err?.message || 'Unable to revoke invitation.');
+    } finally {
+      setTeamActionBusy(false);
+    }
+  };
 
-    if (teamMembers.length >= 5) {
-      alert('Team plan includes up to 5 user seats. Please contact Millennium Agency for enterprise seats.');
+  const handleRemoveMember = async (member: TeamMember) => {
+    if (
+      !window.confirm(
+        `Remove ${member.name} (${member.email}) from your team? They will be moved to a new personal Free Starter organization.`
+      )
+    ) {
       return;
     }
-
-    const newMember = {
-      name: inviteName,
-      email: inviteEmail,
-      role: 'Marketing Associate',
-      addedAt: new Date().toISOString().split('T')[0],
-    };
-
-    const updatedMembers = [...teamMembers, newMember];
-    setTeamMembers(updatedMembers);
-    dataService.updateUser(user.id, { teamMembers: updatedMembers });
-    dataService.logAction('TEAM_MEMBER_INVITED', `Invited ${inviteName} (${inviteEmail}) to ${user.organizationProfile?.orgName} workspace`, user.id);
-    refreshActivities();
-
-    setInviteEmail('');
-    setInviteName('');
-    setFeedbackMsg(`Invitation sent to ${newMember.email}`);
+    try {
+      setTeamActionBusy(true);
+      setTeamError(null);
+      await dataService.removeTeamMember(member.id);
+      await loadTeamState();
+      refreshActivities();
+      setFeedbackMsg(`${member.name} was removed from the team.`);
+    } catch (err: any) {
+      setTeamError(err?.message || 'Unable to remove team member.');
+    } finally {
+      setTeamActionBusy(false);
+    }
   };
 
-  const handleRemoveMember = (email: string) => {
-    const updated = teamMembers.filter((m) => m.email !== email);
-    setTeamMembers(updated);
-    dataService.updateUser(user.id, { teamMembers: updated });
-    dataService.logAction('TEAM_MEMBER_REMOVED', `Removed team member ${email}`, user.id);
-    refreshActivities();
+  const handleTransferOwnership = async (member: TeamMember) => {
+    if (
+      !window.confirm(
+        `Transfer organization ownership to ${member.name} (${member.email})? You will become a regular Member and lose owner privileges.`
+      )
+    ) {
+      return;
+    }
+    try {
+      setTeamActionBusy(true);
+      setTeamError(null);
+      await dataService.transferOwnership(member.id);
+      onUserUpdated({ ...user, orgRole: 'member' });
+      await loadTeamState();
+      refreshActivities();
+      setFeedbackMsg(`Organization ownership transferred to ${member.name}.`);
+    } catch (err: any) {
+      setTeamError(err?.message || 'Unable to transfer ownership.');
+    } finally {
+      setTeamActionBusy(false);
+    }
+  };
+
+  const handleLeaveTeam = async () => {
+    if (
+      !window.confirm(
+        `Leave ${activeOrg?.name || 'this team'}? You will be placed into a new personal Free Starter organization.`
+      )
+    ) {
+      return;
+    }
+    try {
+      setTeamActionBusy(true);
+      setTeamError(null);
+      const res = await dataService.leaveTeam();
+      onUserUpdated(res.user);
+      onOrganizationUpdated?.(res.organization);
+      await loadTeamState();
+      refreshActivities();
+      setFeedbackMsg(`You left the team and now have your own personal workspace (${res.organization.name}).`);
+    } catch (err: any) {
+      setTeamError(err?.message || 'Unable to leave team.');
+    } finally {
+      setTeamActionBusy(false);
+    }
   };
 
   const handleDeleteAccount = async () => {
@@ -475,7 +607,7 @@ export const AccountBillingView: React.FC<AccountBillingViewProps> = ({
           { key: 'activity', label: `Activity History (${activities.length})`, icon: History },
           { key: 'profile', label: 'Organization Profile', icon: Building2 },
           { key: 'billing', label: 'Billing & Invoices', icon: CreditCard },
-          { key: 'team', label: `Team Seats (${teamMembers.length})`, icon: Users },
+          { key: 'team', label: `Team Seats (${members.length}/${seatLimit})`, icon: Users },
           { key: 'danger', label: 'Danger Zone', icon: AlertTriangle },
         ].map((tab) => {
           const Icon = tab.icon;
@@ -486,6 +618,7 @@ export const AccountBillingView: React.FC<AccountBillingViewProps> = ({
               onClick={() => {
                 setActiveTab(tab.key as TabKey);
                 if (tab.key === 'activity') refreshActivities();
+                if (tab.key === 'team' || tab.key === 'plan') loadTeamState();
               }}
               className={`flex items-center gap-2 px-4 py-2.5 text-xs font-bold border-b-2 transition-all whitespace-nowrap ${
                 isActive
@@ -507,10 +640,13 @@ export const AccountBillingView: React.FC<AccountBillingViewProps> = ({
             <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
               <div>
                 <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400">
-                  Current Subscription
+                  Organization Subscription · {activeOrg?.name || user.organizationProfile?.orgName || 'Workspace'}
                 </span>
-                <h3 className="text-xl font-bold text-slate-900 font-heading mt-0.5 flex items-center gap-2">
+                <h3 className="text-xl font-bold text-slate-900 font-heading mt-0.5 flex flex-wrap items-center gap-2">
                   <span>{plan?.name}</span>
+                  <span className="px-2 py-0.5 rounded-md text-[10px] font-bold bg-slate-100 text-slate-700 border border-slate-200 uppercase">
+                    {isOwner ? 'Org Owner' : 'Org Member'}
+                  </span>
                   {hasDiscount && (
                     <span className="px-2 py-0.5 rounded-md text-[10px] font-bold bg-emerald-50 text-emerald-800 border border-emerald-200">
                       Nonprofit 25% Off Active
@@ -522,7 +658,7 @@ export const AccountBillingView: React.FC<AccountBillingViewProps> = ({
 
               <div className="flex items-center gap-2">
                 <span className="px-3.5 py-1.5 rounded-xl bg-slate-100 text-slate-600 text-xs font-bold border border-slate-200">
-                  Paid plans coming soon
+                  {inviteOnlyMode ? 'Invite-Only Mode (Paid plans disabled)' : 'Paid plans coming soon'}
                 </span>
               </div>
             </div>
@@ -532,7 +668,7 @@ export const AccountBillingView: React.FC<AccountBillingViewProps> = ({
               <div className="flex items-center justify-between text-xs font-bold text-slate-800">
                 <span className="flex items-center gap-1.5">
                   <Zap className="w-4 h-4 text-rose-600" />
-                  <span>Generations this billing month</span>
+                  <span>Pooled Organization Quota (this billing month)</span>
                 </span>
                 <span className="font-mono tabular-nums">
                   {currentUsage} of {maxLimit} used ({usagePercentage}%)
@@ -552,13 +688,15 @@ export const AccountBillingView: React.FC<AccountBillingViewProps> = ({
                 />
               </div>
 
-              <div className="flex items-center justify-between text-[11px] text-slate-500">
+              <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] text-slate-500">
                 <span>
                   Base limit: {plan?.generationLimit}/mo
-                  {user.bonusGenerations > 0 && ` • Bonus granted: +${user.bonusGenerations}`}
+                  {bonusGenerations > 0 && ` • Bonus: +${bonusGenerations}`}
+                  {` • Your personal usage: ${user.generationsUsedThisMonth || 0}`}
+                  {` • Seats: ${seatsUsed}/${seatLimit}`}
                 </span>
                 <span className="flex items-center gap-1 font-mono tabular-nums">
-                  <Calendar className="w-3 h-3" /> Resets: {user.billingResetDate}
+                  <Calendar className="w-3 h-3" /> Resets: {billingResetDate}
                 </span>
               </div>
             </div>
@@ -909,9 +1047,16 @@ export const AccountBillingView: React.FC<AccountBillingViewProps> = ({
               <div>
                 <h3 className="text-base font-bold text-slate-900">{user.name}</h3>
                 <p className="text-xs text-slate-500">{user.email}</p>
-                <span className="mt-1 inline-block px-2 py-0.5 rounded text-[10px] font-bold uppercase bg-slate-100 text-slate-700">
-                  Role: {user.role.replace('_', ' ')}
-                </span>
+                <div className="mt-1 flex flex-wrap items-center gap-1.5">
+                  <span className="inline-block px-2 py-0.5 rounded text-[10px] font-bold uppercase bg-slate-100 text-slate-700">
+                    Org Role: {effectiveOrgRole}
+                  </span>
+                  {user.role !== 'member' && (
+                    <span className="inline-block px-2 py-0.5 rounded text-[10px] font-bold uppercase bg-rose-50 text-rose-700 border border-rose-200">
+                      App Role: {user.role.replace('_', ' ')}
+                    </span>
+                  )}
+                </div>
               </div>
             </div>
 
@@ -984,16 +1129,18 @@ export const AccountBillingView: React.FC<AccountBillingViewProps> = ({
                   Billing & Subscriptions
                 </span>
                 <p className="font-bold text-slate-900 text-sm mt-0.5">
-                  Free Starter Tier (50 generations/month)
+                  {plan?.name || 'Free Starter'} ({plan?.generationLimit || 50} generations/month)
                 </p>
                 <p className="text-xs text-slate-500">
-                  Every user starts on our complimentary Starter plan with all 8 core tools included.
+                  {inviteOnlyMode
+                    ? 'Platform is in Invite-Only Mode. Paid plans and self-upgrades are disabled.'
+                    : 'Every user starts on our complimentary Starter plan with all 8 core tools included.'}
                 </p>
               </div>
             </div>
 
             <div className="px-3.5 py-1.5 rounded-xl bg-slate-100 text-slate-600 text-xs font-bold border border-slate-200 self-start sm:self-auto">
-              Paid plans coming soon
+              {inviteOnlyMode ? 'Invite-Only Mode (Paid plans disabled)' : 'Paid plans coming soon'}
             </div>
           </div>
 
@@ -1061,96 +1208,293 @@ export const AccountBillingView: React.FC<AccountBillingViewProps> = ({
 
       {/* Tab 5: Team Seats */}
       {activeTab === 'team' && (
-        <div className="bg-white rounded-2xl p-6 border border-slate-200 shadow-sm space-y-6">
-          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-4 border-b border-slate-100">
-            <div>
-              <h3 className="font-bold text-slate-900 text-sm">Organization Workspace Seats</h3>
-              <p className="text-xs text-slate-500 mt-0.5">
-                Team plan includes up to 5 collaborative seats sharing the monthly generation quota.
-              </p>
+        <div className="space-y-6">
+          <div className="bg-white rounded-2xl p-6 border border-slate-200 shadow-sm space-y-6">
+            {/* Header & Seats Summary */}
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-4 border-b border-slate-100">
+              <div>
+                <div className="flex flex-wrap items-center gap-2">
+                  <h3 className="font-bold text-slate-900 text-sm">
+                    {activeOrg?.name || user.organizationProfile?.orgName || 'Organization'} · Team Seats
+                  </h3>
+                  <span className="px-2 py-0.5 rounded-md text-[10px] font-bold uppercase bg-slate-100 text-slate-700 border border-slate-200">
+                    {plan?.name || effectivePlanId}
+                  </span>
+                </div>
+                <p className="text-xs text-slate-500 mt-1">
+                  All team members share the organization&apos;s plan, monthly generation pool, and saved outputs library.
+                </p>
+              </div>
+
+              <div className="flex items-center gap-2 self-start sm:self-auto">
+                <button
+                  type="button"
+                  onClick={loadTeamState}
+                  disabled={loadingTeam}
+                  className="p-2 rounded-xl border border-slate-200 hover:bg-slate-50 text-slate-600 cursor-pointer disabled:opacity-50"
+                  title="Refresh team seats"
+                >
+                  <RefreshCw className={`w-3.5 h-3.5 ${loadingTeam ? 'animate-spin' : ''}`} />
+                </button>
+
+                {effectivePlanId !== 'team' && effectivePlanId !== 'complimentary' && !inviteOnlyMode && (
+                  <button
+                    onClick={onOpenUpgrade}
+                    className="px-3.5 py-1.5 rounded-xl bg-purple-50 text-purple-800 border border-purple-200 text-xs font-bold hover:bg-purple-100"
+                  >
+                    Upgrade to Team Plan
+                  </button>
+                )}
+              </div>
             </div>
 
-            {user.planId !== 'team' && (
-              <button
-                onClick={onOpenUpgrade}
-                className="px-3.5 py-1.5 rounded-xl bg-purple-50 text-purple-800 border border-purple-200 text-xs font-bold hover:bg-purple-100"
-              >
-                Upgrade to Team Plan
-              </button>
+            {/* Seats Used vs. Limit Meter */}
+            <div className="p-4 rounded-xl bg-slate-50 border border-slate-200 space-y-2">
+              <div className="flex items-center justify-between text-xs font-bold text-slate-800">
+                <span className="flex items-center gap-1.5">
+                  <Users className="w-4 h-4 text-rose-600" />
+                  <span>Seats Used vs. Limit</span>
+                </span>
+                <span className="font-mono tabular-nums">
+                  {seatsUsed} / {seatLimit} seats used
+                </span>
+              </div>
+              <div className="w-full h-2.5 bg-slate-200 rounded-full overflow-hidden">
+                <div
+                  className={`h-full transition-all duration-300 ${
+                    isAtSeatLimit ? 'bg-amber-500' : 'bg-emerald-500'
+                  }`}
+                  style={{ width: `${Math.min(Math.round((seatsUsed / Math.max(seatLimit, 1)) * 100), 100)}%` }}
+                />
+              </div>
+              <div className="flex flex-wrap items-center justify-between text-[11px] text-slate-500 gap-2">
+                <span>
+                  {members.length} active {members.length === 1 ? 'member' : 'members'} · {pendingTeamInvites.length} pending{' '}
+                  {pendingTeamInvites.length === 1 ? 'invite' : 'invites'}
+                </span>
+                <span>
+                  {isAtSeatLimit
+                    ? 'Seat limit reached'
+                    : `${Math.max(seatLimit - seatsUsed, 0)} ${seatLimit - seatsUsed === 1 ? 'seat' : 'seats'} available`}
+                </span>
+              </div>
+            </div>
+
+            {teamError && (
+              <div className="p-3 bg-rose-50 text-rose-800 text-xs rounded-xl border border-rose-200 flex items-center gap-2">
+                <AlertTriangle className="w-4 h-4 text-rose-600 shrink-0" />
+                <span>{teamError}</span>
+              </div>
             )}
-          </div>
 
-          {/* Invite form */}
-          {user.planId === 'team' && (
-            <form onSubmit={handleAddTeamMember} className="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
-              <input
-                type="text"
-                required
-                value={inviteName}
-                onChange={(e) => setInviteName(e.target.value)}
-                placeholder="Team member name"
-                className="px-3 py-2 text-xs rounded-xl border border-slate-300 focus:outline-none focus:ring-2 focus:ring-rose-500"
-              />
-              <input
-                type="email"
-                required
-                value={inviteEmail}
-                onChange={(e) => setInviteEmail(e.target.value)}
-                placeholder="colleague@example.org"
-                className="px-3 py-2 text-xs rounded-xl border border-slate-300 focus:outline-none focus:ring-2 focus:ring-rose-500"
-              />
-              <button
-                type="submit"
-                className="px-4 py-2 bg-slate-900 hover:bg-slate-800 text-white rounded-xl text-xs font-bold flex items-center justify-center gap-1.5"
-              >
-                <Plus className="w-4 h-4" />
-                <span>Invite to Workspace</span>
-              </button>
-            </form>
-          )}
+            {/* Owner Invite Form */}
+            {isOwner && (
+              <div className="space-y-2.5">
+                <div className="flex items-center justify-between">
+                  <h4 className="text-xs font-bold text-slate-800 uppercase tracking-wide">
+                    Invite Team Member by Email
+                  </h4>
+                  {isAtSeatLimit && (
+                    <span className="text-[11px] font-semibold text-amber-800">
+                      At seat limit ({seatsUsed}/{seatLimit})
+                    </span>
+                  )}
+                </div>
 
-          {/* Team table */}
-          <div className="border border-slate-100 rounded-xl overflow-hidden">
-            <table className="w-full text-left text-xs">
-              <thead className="bg-slate-50 text-slate-500 text-[10px] uppercase font-bold">
-                <tr>
-                  <th className="py-2.5 px-4">Member</th>
-                  <th className="py-2.5 px-4">Role</th>
-                  <th className="py-2.5 px-4">Added</th>
-                  <th className="py-2.5 px-4 text-right">Actions</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-slate-100">
-                <tr className="bg-slate-50/30">
-                  <td className="py-3 px-4 font-bold text-slate-900">
-                    {user.name} <span className="text-[10px] text-rose-600 font-semibold">(Primary Owner)</span>
-                    <div className="text-[11px] text-slate-400 font-normal">{user.email}</div>
-                  </td>
-                  <td className="py-3 px-4 text-slate-600">Admin</td>
-                  <td className="py-3 px-4 font-mono tabular-nums text-slate-500">{user.signupDate.split('T')[0]}</td>
-                  <td className="py-3 px-4 text-right text-slate-400 font-medium">Owner</td>
-                </tr>
+                <form onSubmit={handleInviteTeamMember} className="flex flex-col sm:flex-row gap-2.5">
+                  <div className="relative flex-1">
+                    <Mail className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
+                    <input
+                      type="email"
+                      required
+                      disabled={isAtSeatLimit || teamActionBusy}
+                      value={inviteEmail}
+                      onChange={(e) => setInviteEmail(e.target.value)}
+                      placeholder={
+                        isAtSeatLimit
+                          ? 'Seat limit reached — free a seat or request more seats'
+                          : 'colleague@organization.org'
+                      }
+                      className="w-full pl-9 pr-3 py-2 text-xs rounded-xl border border-slate-300 focus:outline-none focus:ring-2 focus:ring-rose-500 disabled:bg-slate-100 disabled:text-slate-400"
+                    />
+                  </div>
+                  <button
+                    type="submit"
+                    disabled={isAtSeatLimit || teamActionBusy || !inviteEmail.trim()}
+                    className="px-4 py-2 bg-slate-900 hover:bg-slate-800 disabled:opacity-50 disabled:cursor-not-allowed text-white rounded-xl text-xs font-bold flex items-center justify-center gap-1.5 cursor-pointer"
+                  >
+                    <Plus className="w-4 h-4" />
+                    <span>{teamActionBusy ? 'Sending...' : 'Invite Member'}</span>
+                  </button>
+                </form>
+                <p className="text-[11px] text-slate-500">
+                  When the invited person signs in with their Google account matching that exact email, they will join your team automatically and their personal saved items will move into your shared library.
+                </p>
+              </div>
+            )}
 
-                {teamMembers.map((member) => (
-                  <tr key={member.email}>
-                    <td className="py-3 px-4 font-semibold text-slate-900">
-                      {member.name}
-                      <div className="text-[11px] text-slate-400 font-normal">{member.email}</div>
-                    </td>
-                    <td className="py-3 px-4 text-slate-600">{member.role}</td>
-                    <td className="py-3 px-4 font-mono tabular-nums text-slate-500">{member.addedAt}</td>
-                    <td className="py-3 px-4 text-right">
-                      <button
-                        onClick={() => handleRemoveMember(member.email)}
-                        className="text-xs text-rose-600 hover:underline font-medium"
-                      >
-                        Remove
-                      </button>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+            {/* Active Members Table */}
+            <div className="space-y-2">
+              <h4 className="text-xs font-bold text-slate-800 uppercase tracking-wide">
+                Organization Members ({members.length})
+              </h4>
+              <div className="border border-slate-200 rounded-xl overflow-x-auto">
+                <table className="w-full text-left text-xs">
+                  <thead className="bg-slate-50 text-slate-500 text-[10px] uppercase font-bold border-b border-slate-200">
+                    <tr>
+                      <th className="py-2.5 px-4">Member</th>
+                      <th className="py-2.5 px-4">Role</th>
+                      <th className="py-2.5 px-4">Generations This Month</th>
+                      <th className="py-2.5 px-4">Last Active</th>
+                      <th className="py-2.5 px-4 text-right">Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100">
+                    {members.map((member) => {
+                      const isSelf = member.id === user.id;
+                      const isMemberOwner = member.orgRole === 'owner' || activeOrg?.ownerId === member.id;
+                      return (
+                        <tr key={member.id} className={isSelf ? 'bg-slate-50/40' : 'hover:bg-slate-50/50'}>
+                          <td className="py-3 px-4">
+                            <div className="flex items-center gap-2.5">
+                              <img
+                                src={member.avatar}
+                                alt={member.name}
+                                className="w-7 h-7 rounded-full object-cover border border-slate-200 shrink-0"
+                              />
+                              <div className="min-w-0">
+                                <div className="font-bold text-slate-900 flex items-center gap-1.5">
+                                  <span className="truncate">{member.name}</span>
+                                  {isSelf && (
+                                    <span className="text-[10px] text-rose-600 font-semibold">(You)</span>
+                                  )}
+                                </div>
+                                <div className="text-[11px] text-slate-500 font-mono truncate">{member.email}</div>
+                              </div>
+                            </div>
+                          </td>
+                          <td className="py-3 px-4">
+                            <span
+                              className={`px-2 py-0.5 rounded-md text-[10px] font-bold uppercase ${
+                                isMemberOwner
+                                  ? 'bg-rose-50 text-rose-800 border border-rose-200'
+                                  : 'bg-slate-100 text-slate-700 border border-slate-200'
+                              }`}
+                            >
+                              {isMemberOwner ? 'Owner' : 'Member'}
+                            </span>
+                          </td>
+                          <td className="py-3 px-4 font-mono font-bold text-slate-800 tabular-nums">
+                            {member.generationsUsedThisMonth || 0}
+                          </td>
+                          <td className="py-3 px-4 font-mono tabular-nums text-[11px] text-slate-500">
+                            {member.lastLogin ? new Date(member.lastLogin).toLocaleDateString() : '—'}
+                          </td>
+                          <td className="py-3 px-4 text-right whitespace-nowrap">
+                            {isOwner && !isMemberOwner ? (
+                              <div className="inline-flex items-center gap-2">
+                                <button
+                                  type="button"
+                                  disabled={teamActionBusy}
+                                  onClick={() => handleTransferOwnership(member)}
+                                  className="px-2.5 py-1 rounded-lg border border-slate-200 hover:bg-slate-100 text-[11px] font-semibold text-slate-700 inline-flex items-center gap-1 cursor-pointer disabled:opacity-50"
+                                  title="Make this member the organization owner"
+                                >
+                                  <ArrowRightLeft className="w-3 h-3" />
+                                  <span>Make Owner</span>
+                                </button>
+                                <button
+                                  type="button"
+                                  disabled={teamActionBusy}
+                                  onClick={() => handleRemoveMember(member)}
+                                  className="px-2.5 py-1 rounded-lg bg-rose-50 hover:bg-rose-100 text-rose-700 border border-rose-200 text-[11px] font-semibold cursor-pointer disabled:opacity-50"
+                                >
+                                  Remove
+                                </button>
+                              </div>
+                            ) : !isOwner && isSelf ? (
+                              <button
+                                type="button"
+                                disabled={teamActionBusy}
+                                onClick={handleLeaveTeam}
+                                className="px-2.5 py-1 rounded-lg bg-rose-50 hover:bg-rose-100 text-rose-700 border border-rose-200 text-[11px] font-semibold inline-flex items-center gap-1 cursor-pointer disabled:opacity-50"
+                              >
+                                <LogOut className="w-3 h-3" />
+                                <span>Leave Team</span>
+                              </button>
+                            ) : (
+                              <span className="text-[11px] text-slate-400 font-medium">
+                                {isMemberOwner ? 'Workspace Owner' : '—'}
+                              </span>
+                            )}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            {/* Pending Invites Table */}
+            <div className="space-y-2 pt-2">
+              <h4 className="text-xs font-bold text-slate-800 uppercase tracking-wide">
+                Pending Team Invitations ({pendingTeamInvites.length})
+              </h4>
+
+              {pendingTeamInvites.length === 0 ? (
+                <div className="p-4 rounded-xl bg-slate-50 border border-dashed border-slate-200 text-xs text-slate-500 text-center">
+                  No pending team invitations.
+                </div>
+              ) : (
+                <div className="border border-slate-200 rounded-xl overflow-x-auto">
+                  <table className="w-full text-left text-xs">
+                    <thead className="bg-slate-50 text-slate-500 text-[10px] uppercase font-bold border-b border-slate-200">
+                      <tr>
+                        <th className="py-2.5 px-4">Invited Email</th>
+                        <th className="py-2.5 px-4">Status</th>
+                        <th className="py-2.5 px-4">Invited On</th>
+                        <th className="py-2.5 px-4">Expires</th>
+                        <th className="py-2.5 px-4 text-right">Actions</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-100">
+                      {pendingTeamInvites.map((inv) => (
+                        <tr key={inv.id} className="hover:bg-slate-50/50">
+                          <td className="py-3 px-4 font-mono font-semibold text-slate-900">{inv.email}</td>
+                          <td className="py-3 px-4">
+                            <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold bg-amber-50 text-amber-800 border border-amber-200">
+                              <Clock className="w-3 h-3 text-amber-600" />
+                              <span>Pending</span>
+                            </span>
+                          </td>
+                          <td className="py-3 px-4 font-mono tabular-nums text-[11px] text-slate-500">
+                            {new Date(inv.createdAt).toLocaleDateString()}
+                          </td>
+                          <td className="py-3 px-4 font-mono tabular-nums text-[11px] text-slate-500">
+                            {inv.expiresAt ? new Date(inv.expiresAt).toLocaleDateString() : 'Never'}
+                          </td>
+                          <td className="py-3 px-4 text-right">
+                            {isOwner ? (
+                              <button
+                                type="button"
+                                disabled={teamActionBusy}
+                                onClick={() => handleRevokeTeamInvite(inv.id, inv.email)}
+                                className="px-2.5 py-1 rounded-lg bg-rose-50 hover:bg-rose-100 text-rose-700 border border-rose-200 text-[11px] font-semibold cursor-pointer disabled:opacity-50"
+                              >
+                                Revoke
+                              </button>
+                            ) : (
+                              <span className="text-[11px] text-slate-400">—</span>
+                            )}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
           </div>
         </div>
       )}
@@ -1164,13 +1508,18 @@ export const AccountBillingView: React.FC<AccountBillingViewProps> = ({
           </div>
 
           <p className="text-xs text-slate-600 max-w-xl leading-relaxed">
-            Deleting your account will immediately cancel any active subscription, erase all saved library assets, and delete your organization profile from local persistence. This action cannot be undone.
+            {isOwner && members.length > 1
+              ? 'You are currently the owner of a multi-member organization. Transfer ownership in the Team Seats tab (or remove other members) before deleting your account.'
+              : isOwner
+              ? 'Deleting your account will immediately erase your user profile, personal organization workspace, and saved library assets. This action cannot be undone.'
+              : 'Deleting your account will permanently remove your user profile and remove you from the team workspace while preserving the team library for the remaining members.'}
           </p>
 
           {!deleteConfirmOpen ? (
             <button
               onClick={() => setDeleteConfirmOpen(true)}
-              className="px-4 py-2 rounded-xl bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold"
+              disabled={isOwner && members.length > 1}
+              className="px-4 py-2 rounded-xl bg-rose-600 hover:bg-rose-700 disabled:opacity-50 disabled:cursor-not-allowed text-white text-xs font-bold"
             >
               Request Account Deletion
             </button>

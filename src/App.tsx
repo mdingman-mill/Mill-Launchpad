@@ -4,13 +4,14 @@
  */
 
 import React, { useState, useEffect } from 'react';
-import { User, SavedOutput, Invoice } from './types';
+import { User, Organization, SavedOutput, Invoice, PlatformSettings } from './types';
 import { authService } from './services/authService';
 import { dataService } from './services/dataService';
 import { Header } from './components/Header';
 import { Footer } from './components/Footer';
 import { MarketingStudio } from './components/MarketingStudio';
 import { LibraryView } from './components/LibraryView';
+import { HistoryView } from './components/HistoryView';
 import { AccountBillingView } from './components/AccountBillingView';
 import { AdminPanel } from './components/AdminPanel';
 import { OnboardingModal } from './components/OnboardingModal';
@@ -33,9 +34,20 @@ import {
 
 export default function App() {
   const [currentUser, setCurrentUser] = useState<User | null>(null);
-  const [activeView, setActiveView] = useState<'tools' | 'library' | 'account' | 'admin'>('tools');
+  const [currentOrganization, setCurrentOrganization] = useState<Organization | null>(() =>
+    dataService.getCachedOrganization()
+  );
+  const [activeView, setActiveView] = useState<'tools' | 'library' | 'history' | 'account' | 'admin'>('tools');
+  const [pendingToolLaunch, setPendingToolLaunch] = useState<{
+    toolId: string;
+    inputs: Record<string, string>;
+    key: number;
+  } | null>(null);
   const [isSigningIn, setIsSigningIn] = useState(false);
   const [signInError, setSignInError] = useState<string | null>(null);
+  const [platformSettings, setPlatformSettings] = useState<PlatformSettings>(() =>
+    dataService.getPlatformSettings()
+  );
 
   // Invite link routing
   const [currentInviteId, setCurrentInviteId] = useState<string | null>(() => {
@@ -74,8 +86,27 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    dataService.fetchPlatformSettings().then(setPlatformSettings);
+
     const unsubscribe = authService.onAuthChange((user) => {
       setCurrentUser(user);
+      setPlatformSettings(dataService.getPlatformSettings());
+
+      if (user) {
+        const cachedOrg = dataService.getCachedOrganization();
+        if (cachedOrg && (!user.organizationId || cachedOrg.id === user.organizationId)) {
+          setCurrentOrganization(cachedOrg);
+        } else if (user.organizationId) {
+          dataService
+            .getOrganization(user.organizationId)
+            .then((org) => {
+              if (org) setCurrentOrganization(org);
+            })
+            .catch(() => {});
+        }
+      } else {
+        setCurrentOrganization(null);
+      }
 
       // If signed in but no organization profile set yet, prompt onboarding
       if (user && !user.organizationProfile) {
@@ -92,6 +123,10 @@ export default function App() {
       setSignInError(null);
       const user = await authService.signIn();
       setCurrentUser(user);
+      const cachedOrg = dataService.getCachedOrganization();
+      if (cachedOrg) {
+        setCurrentOrganization(cachedOrg);
+      }
       if (!user.organizationProfile) {
         setOnboardingOpen(true);
       }
@@ -148,6 +183,8 @@ export default function App() {
             currentUser={currentUser}
             onSignedIn={(user) => {
               setCurrentUser(user);
+              const cachedOrg = dataService.getCachedOrganization();
+              if (cachedOrg) setCurrentOrganization(cachedOrg);
             }}
             onContinueToApp={() => {
               setCurrentInviteId(null);
@@ -163,9 +200,26 @@ export default function App() {
               {activeView === 'tools' && (
               <MarketingStudio
                 user={currentUser}
-                onUsageUpdated={(newUsage) => {
+                organization={currentOrganization}
+                inviteOnlyMode={platformSettings.inviteOnlyMode}
+                initialToolLaunch={pendingToolLaunch}
+                onClearInitialToolLaunch={() => setPendingToolLaunch(null)}
+                onUsageUpdated={(newOrgUsage, newMemberUsage) => {
                   if (currentUser) {
-                    setCurrentUser({ ...currentUser, generationsUsedThisMonth: newUsage });
+                    setCurrentUser({
+                      ...currentUser,
+                      generationsUsedThisMonth:
+                        typeof newMemberUsage === 'number'
+                          ? newMemberUsage
+                          : (currentUser.generationsUsedThisMonth || 0) + 1,
+                      totalGenerations: (currentUser.totalGenerations ?? currentUser.generationsUsedThisMonth ?? 0) + 1,
+                    });
+                  }
+                  if (currentOrganization) {
+                    setCurrentOrganization({
+                      ...currentOrganization,
+                      generationsUsedThisMonth: newOrgUsage,
+                    });
                   }
                 }}
                 onRequireUpgrade={() => {
@@ -179,12 +233,32 @@ export default function App() {
             )}
 
             {activeView === 'library' && (
-              <LibraryView user={currentUser} />
+              <LibraryView
+                user={currentUser}
+                organization={currentOrganization}
+                onOpenToolWithInputs={(toolId, inputs) => {
+                  setPendingToolLaunch({ toolId, inputs, key: Date.now() });
+                  setActiveView('tools');
+                }}
+              />
+            )}
+
+            {activeView === 'history' && (
+              <HistoryView
+                user={currentUser}
+                organization={currentOrganization}
+                onRerun={(toolId, inputs) => {
+                  setPendingToolLaunch({ toolId, inputs, key: Date.now() });
+                  setActiveView('tools');
+                }}
+              />
             )}
 
             {activeView === 'account' && (
               <AccountBillingView
                 user={currentUser}
+                organization={currentOrganization}
+                inviteOnlyMode={platformSettings.inviteOnlyMode}
                 onOpenUpgrade={() => {
                   setUpgradeReason('upgrade_click');
                   setUpgradeModalOpen(true);
@@ -192,6 +266,7 @@ export default function App() {
                 onEditProfile={() => setOnboardingOpen(true)}
                 onViewReceipt={(inv) => setActiveReceipt(inv)}
                 onUserUpdated={(u) => setCurrentUser(u)}
+                onOrganizationUpdated={(org) => setCurrentOrganization(org)}
                 onNavigateToTools={() => setActiveView('tools')}
                 onNavigateToLibrary={() => setActiveView('library')}
               />
@@ -200,6 +275,8 @@ export default function App() {
             {activeView === 'admin' && currentUser.role === 'super_admin' && (
               <AdminPanel
                 currentUser={currentUser}
+                inviteOnlyMode={platformSettings.inviteOnlyMode}
+                onPlatformSettingsChanged={setPlatformSettings}
                 onImpersonateUser={() => {}}
                 onViewReceipt={(inv) => setActiveReceipt(inv)}
                 onDataReset={() => {}}
@@ -224,6 +301,15 @@ export default function App() {
                 Welcome to Millennium Agency Launchpad. Sign in with your Google account to access your organization's tailored brand foundations, messaging toolkits, and 90-day execution plans.
               </p>
             </div>
+
+            {platformSettings.inviteOnlyMode && (
+              <div className="max-w-xl mx-auto p-3.5 bg-amber-50 border border-amber-200 rounded-2xl text-xs text-amber-900 flex items-center gap-2.5 text-left">
+                <Lock className="w-4 h-4 text-amber-600 shrink-0" />
+                <span>
+                  <strong>Invite-Only Access Active:</strong> New self-account registrations and paid plans are currently disabled. Existing members and invited organizations can sign in below.
+                </span>
+              </div>
+            )}
 
             {signInError && (
               <div className="max-w-md mx-auto p-3.5 bg-rose-50 border border-rose-200 rounded-2xl text-xs text-rose-800 flex items-center gap-2 text-left">
@@ -301,9 +387,13 @@ export default function App() {
                 <div className="w-9 h-9 rounded-xl bg-blue-50 text-blue-600 flex items-center justify-center font-bold">
                   3
                 </div>
-                <h3 className="font-bold text-slate-900 text-base">Free Starter Plan</h3>
+                <h3 className="font-bold text-slate-900 text-base">
+                  {platformSettings.inviteOnlyMode ? 'Invite-Only Access' : 'Free Starter Plan'}
+                </h3>
                 <p className="text-xs text-slate-500 leading-relaxed">
-                  Get 50 complimentary generations every month with all 8 tools included and save deliverables to your library.
+                  {platformSettings.inviteOnlyMode
+                    ? 'Access is provisioned by invitation from Millennium Agency with complimentary Launchpad entitlements.'
+                    : 'Get 50 complimentary generations every month with all 8 tools included and save deliverables to your library.'}
                 </p>
               </div>
             </div>
@@ -327,6 +417,8 @@ export default function App() {
           onCancel={() => setOnboardingOpen(false)}
           onComplete={(updatedUser) => {
             setCurrentUser(updatedUser);
+            const cachedOrg = dataService.getCachedOrganization();
+            if (cachedOrg) setCurrentOrganization(cachedOrg);
             setOnboardingOpen(false);
           }}
         />
@@ -336,6 +428,7 @@ export default function App() {
       {currentUser && (
         <UpgradeModal
           user={currentUser}
+          inviteOnlyMode={platformSettings.inviteOnlyMode}
           isOpen={upgradeModalOpen}
           onClose={() => setUpgradeModalOpen(false)}
           reason={upgradeReason}

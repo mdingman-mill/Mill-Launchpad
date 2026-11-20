@@ -15,13 +15,19 @@ import {
   User,
   OrganizationProfile,
   SavedOutput,
+  GenerationHistoryItem,
   Invoice,
   AuditLogEntry,
   AccessRule,
   Plan,
   ToolDefinition,
   AgencySettings,
+  PlatformSettings,
   Invite,
+  Organization,
+  TeamInvite,
+  TeamState,
+  AdminOrganizationSummary,
 } from '../types';
 
 /**
@@ -344,9 +350,16 @@ export const INITIAL_SETTINGS: AgencySettings = {
 class DataService {
   // In-memory caches to guarantee synchronous component reactivity
   private cachedUsers: Map<string, User> = new Map();
+  private cachedOrganization: Organization | null = null;
   private cachedOutputs: SavedOutput[] = [];
+  private cachedHistory: GenerationHistoryItem[] = [];
   private cachedLogs: AuditLogEntry[] = [];
   private cachedInvoices: Invoice[] = [];
+  private cachedPlatformSettings: PlatformSettings = {
+    inviteOnlyMode: false,
+    paidPlansDisabled: false,
+    selfSignupDisabled: false,
+  };
 
   private stripUndefined<T>(obj: T): T {
     if (Array.isArray(obj)) {
@@ -368,9 +381,29 @@ class DataService {
     this.cachedUsers.set(user.id, user);
   }
 
+  public setCachedOrganization(org: Organization | null): void {
+    this.cachedOrganization = org;
+  }
+
+  public getCachedOrganization(): Organization | null {
+    return this.cachedOrganization;
+  }
+
+  public getCurrentOrganizationId(userId?: string): string | null {
+    const uid = userId || auth.currentUser?.uid;
+    if (uid) {
+      const cached = this.cachedUsers.get(uid);
+      if (cached?.organizationId) return cached.organizationId;
+    }
+    if (this.cachedOrganization?.id) return this.cachedOrganization.id;
+    return null;
+  }
+
   public clearCache(): void {
     this.cachedUsers.clear();
+    this.cachedOrganization = null;
     this.cachedOutputs = [];
+    this.cachedHistory = [];
     this.cachedLogs = [];
   }
 
@@ -381,10 +414,14 @@ class DataService {
   public async refreshLocalCache(): Promise<void> {
     if (typeof window === 'undefined') return;
     try {
-      if (auth.currentUser) {
+      const uid = auth.currentUser?.uid;
+      if (uid) {
+        const fetchedUser = await this.fetchUser(uid);
+        const orgId = fetchedUser?.organizationId || this.getCurrentOrganizationId(uid);
         await Promise.allSettled([
-          this.fetchUser(auth.currentUser.uid),
-          this.fetchOutputs(),
+          orgId ? this.getOrganization(orgId) : Promise.resolve(null),
+          this.fetchOutputs(orgId || undefined),
+          orgId ? this.fetchHistory(orgId) : Promise.resolve([]),
           this.fetchAuditLogs(),
         ]);
       }
@@ -456,6 +493,7 @@ class DataService {
 
   public createUser(userData: Partial<User> & { email: string; name: string }): User {
     const id = auth.currentUser?.uid || `user_${Date.now()}`;
+    const orgId = userData.organizationId || this.getCurrentOrganizationId(id) || undefined;
     const newUser: User = {
       id,
       name: userData.name,
@@ -469,11 +507,13 @@ class DataService {
       signupDate: new Date().toISOString(),
       lastLogin: new Date().toISOString(),
       generationsUsedThisMonth: 0,
+      totalGenerations: 0,
       bonusGenerations: 0,
       billingResetDate: getNextMonthFirstDay(),
       nonprofitDiscountApproved: false,
       organizationProfile: userData.organizationProfile,
-      organizationId: userData.organizationId || (userData.organizationProfile ? `org_${id}` : undefined),
+      organizationId: orgId,
+      orgRole: userData.orgRole || 'owner',
     };
 
     this.cachedUsers.set(id, newUser);
@@ -486,7 +526,14 @@ class DataService {
     const updated: User = { ...current, ...updates };
     this.cachedUsers.set(id, updated);
 
-    const cleanedUpdates = this.stripUndefined(updates);
+    // Client rules allow only profile fields on users/{id}
+    const allowedUserPatch: Record<string, any> = {};
+    if (updates.name !== undefined) allowedUserPatch.name = updates.name;
+    if (updates.avatar !== undefined) allowedUserPatch.avatar = updates.avatar;
+    if (updates.organizationProfile !== undefined) allowedUserPatch.organizationProfile = updates.organizationProfile;
+    if (updates.lastLogin !== undefined) allowedUserPatch.lastLogin = updates.lastLogin;
+
+    const cleanedUpdates = this.stripUndefined(allowedUserPatch);
     if (Object.keys(cleanedUpdates).length > 0) {
       const path = `users/${id}`;
       setDoc(doc(db, 'users', id), cleanedUpdates, { merge: true }).catch((error) => {
@@ -495,23 +542,25 @@ class DataService {
     }
 
     if (updates.organizationProfile) {
-      const orgId = updated.organizationId || `org_${id}`;
-      const orgPayload = this.stripUndefined({
-        id: orgId,
-        name: updates.organizationProfile.orgName,
-        ownerId: id,
-        memberIds: [id],
-        type: updates.organizationProfile.type,
-        whatTheyDo: updates.organizationProfile.whatTheyDo,
-        targetAudience: updates.organizationProfile.targetAudience,
-        goals: updates.organizationProfile.goals,
-        brandTone: updates.organizationProfile.brandTone,
-        budget: updates.organizationProfile.budget,
-        website: updates.organizationProfile.website || '',
-        createdAt: updated.signupDate || new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
-      });
-      this.saveOrganization(orgPayload).catch(() => {});
+      const orgId = updated.organizationId || this.getCurrentOrganizationId(id);
+      if (orgId) {
+        const orgPayload = this.stripUndefined({
+          id: orgId,
+          name: updates.organizationProfile.orgName,
+          type: updates.organizationProfile.type,
+          whatTheyDo: updates.organizationProfile.whatTheyDo,
+          targetAudience: updates.organizationProfile.targetAudience,
+          goals: updates.organizationProfile.goals,
+          brandTone: updates.organizationProfile.brandTone,
+          budget: updates.organizationProfile.budget,
+          website: updates.organizationProfile.website || '',
+          updatedAt: new Date().toISOString(),
+        });
+        if (this.cachedOrganization && this.cachedOrganization.id === orgId) {
+          this.cachedOrganization = { ...this.cachedOrganization, ...orgPayload };
+        }
+        this.saveOrganization(orgPayload).catch(() => {});
+      }
     }
 
     return updated;
@@ -520,27 +569,33 @@ class DataService {
   public async persistUser(user: User): Promise<void> {
     const path = `users/${user.id}`;
     try {
-      const cleanUser = this.stripUndefined(user);
-      await setDoc(doc(db, 'users', user.id), cleanUser, { merge: true });
+      const cleanUser = this.stripUndefined({
+        name: user.name,
+        avatar: user.avatar,
+        organizationProfile: user.organizationProfile,
+        lastLogin: user.lastLogin,
+      });
+      if (Object.keys(cleanUser).length > 0) {
+        await setDoc(doc(db, 'users', user.id), cleanUser, { merge: true });
+      }
       if (user.organizationProfile) {
-        const orgId = user.organizationId || `org_${user.id}`;
-        await this.saveOrganization(
-          this.stripUndefined({
-            id: orgId,
-            name: user.organizationProfile.orgName,
-            ownerId: user.id,
-            memberIds: [user.id],
-            type: user.organizationProfile.type,
-            whatTheyDo: user.organizationProfile.whatTheyDo,
-            targetAudience: user.organizationProfile.targetAudience,
-            goals: user.organizationProfile.goals,
-            brandTone: user.organizationProfile.brandTone,
-            budget: user.organizationProfile.budget,
-            website: user.organizationProfile.website || '',
-            createdAt: user.signupDate || new Date().toISOString(),
-            updatedAt: new Date().toISOString(),
-          })
-        );
+        const orgId = user.organizationId || this.getCurrentOrganizationId(user.id);
+        if (orgId) {
+          await this.saveOrganization(
+            this.stripUndefined({
+              id: orgId,
+              name: user.organizationProfile.orgName,
+              type: user.organizationProfile.type,
+              whatTheyDo: user.organizationProfile.whatTheyDo,
+              targetAudience: user.organizationProfile.targetAudience,
+              goals: user.organizationProfile.goals,
+              brandTone: user.organizationProfile.brandTone,
+              budget: user.organizationProfile.budget,
+              website: user.organizationProfile.website || '',
+              updatedAt: new Date().toISOString(),
+            })
+          );
+        }
       }
     } catch (error) {
       handleFirestoreError(error, OperationType.WRITE, path);
@@ -567,15 +622,34 @@ class DataService {
     this.clearCache();
   }
 
-  public incrementUsage(userId: string): number {
+  public incrementUsage(userId: string, serverOrgUsage?: number, serverMemberUsage?: number): number {
     // Authoritative increment happens inside /api/gemini/generate Admin SDK transaction.
     // Only update local in-memory cache here to keep UI responsive without violating Firestore rules.
     const user = this.cachedUsers.get(userId);
-    const nextCount = (user?.generationsUsedThisMonth || 0) + 1;
+    const nextMemberCount =
+      typeof serverMemberUsage === 'number' ? serverMemberUsage : (user?.generationsUsedThisMonth || 0) + 1;
     if (user) {
-      this.cachedUsers.set(userId, { ...user, generationsUsedThisMonth: nextCount });
+      const nextTotal = (user.totalGenerations ?? user.generationsUsedThisMonth ?? 0) + 1;
+      this.cachedUsers.set(userId, {
+        ...user,
+        generationsUsedThisMonth: nextMemberCount,
+        totalGenerations: nextTotal,
+      });
     }
-    return nextCount;
+
+    if (this.cachedOrganization) {
+      const nextOrgCount =
+        typeof serverOrgUsage === 'number'
+          ? serverOrgUsage
+          : (this.cachedOrganization.generationsUsedThisMonth || 0) + 1;
+      this.cachedOrganization = {
+        ...this.cachedOrganization,
+        generationsUsedThisMonth: nextOrgCount,
+      };
+      return nextOrgCount;
+    }
+
+    return typeof serverOrgUsage === 'number' ? serverOrgUsage : nextMemberCount;
   }
 
   public async adminUserActionServer(
@@ -613,37 +687,63 @@ class DataService {
    * ORGANIZATIONS (/organizations/{orgId})
    * ========================================================================= */
   public async saveOrganization(org: any): Promise<void> {
-    const path = `organizations/${org.id}`;
+    const orgId = org?.id || this.getCurrentOrganizationId();
+    if (!orgId) return;
+    const path = `organizations/${orgId}`;
     try {
-      const cleanOrg = this.stripUndefined(org);
-      delete cleanOrg.planId;
-      await setDoc(doc(db, 'organizations', org.id), cleanOrg, { merge: true });
+      // Only send editable organization profile keys allowed by Firestore rules
+      const cleanOrg = this.stripUndefined({
+        name: org.name,
+        type: org.type,
+        whatTheyDo: org.whatTheyDo,
+        targetAudience: org.targetAudience,
+        goals: org.goals,
+        brandTone: org.brandTone,
+        budget: org.budget,
+        website: org.website,
+        updatedAt: org.updatedAt || new Date().toISOString(),
+      });
+      await setDoc(doc(db, 'organizations', orgId), cleanOrg, { merge: true });
     } catch (error) {
       handleFirestoreError(error, OperationType.WRITE, path);
     }
   }
 
-  public async getOrganization(orgId: string): Promise<any | null> {
-    const path = `organizations/${orgId}`;
+  public async getOrganization(orgId?: string): Promise<Organization | null> {
+    const resolvedOrgId = orgId || this.getCurrentOrganizationId();
+    if (!resolvedOrgId) return null;
+    const path = `organizations/${resolvedOrgId}`;
     try {
-      const snap = await getDoc(doc(db, 'organizations', orgId));
-      return snap.exists() ? snap.data() : null;
+      const snap = await getDoc(doc(db, 'organizations', resolvedOrgId));
+      if (snap.exists()) {
+        const orgData = { id: snap.id, ...snap.data() } as Organization;
+        this.cachedOrganization = orgData;
+        return orgData;
+      }
+      return null;
     } catch (error) {
       handleFirestoreError(error, OperationType.GET, path);
     }
   }
 
   /* =========================================================================
-   * OUTPUTS / MY LIBRARY CRUD (/organizations/{orgId}/outputs/{outputId})
+   * OUTPUTS / SHARED TEAM LIBRARY CRUD (/organizations/{orgId}/outputs/{outputId})
    * ========================================================================= */
   public async fetchOutputs(orgId?: string): Promise<SavedOutput[]> {
-    const currentOrgId = orgId || (auth.currentUser?.uid ? `org_${auth.currentUser.uid}` : null);
+    const currentOrgId = orgId || this.getCurrentOrganizationId();
     if (!currentOrgId) return this.cachedOutputs;
 
     try {
       const snap = await getDocs(collection(db, 'organizations', currentOrgId, 'outputs'));
       const list: SavedOutput[] = [];
-      snap.forEach((d) => list.push(d.data() as SavedOutput));
+      snap.forEach((d) => {
+        const data = d.data() as SavedOutput;
+        list.push({
+          ...data,
+          id: data.id || d.id,
+          orgId: data.orgId || currentOrgId,
+        });
+      });
       list.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
       this.cachedOutputs = list;
       return list;
@@ -655,66 +755,167 @@ class DataService {
   public getOutputs(userId?: string): SavedOutput[] {
     this.fetchOutputs().catch(() => {});
     if (!userId) return this.cachedOutputs;
-    return this.cachedOutputs.filter((o) => o.userId === userId);
+    // Shared organization library: return all items in the organization's library
+    return this.cachedOutputs;
   }
 
   public saveOutput(output: Omit<SavedOutput, 'id' | 'createdAt' | 'updatedAt'>): SavedOutput {
     const id = `out_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
     const now = new Date().toISOString();
-    const newOutput: SavedOutput = {
+    const orgId = output.orgId || this.getCurrentOrganizationId(output.userId) || undefined;
+    const resolvedUserName =
+      output.userName ||
+      this.cachedUsers.get(output.userId)?.name ||
+      auth.currentUser?.displayName ||
+      undefined;
+    const safeTitle = (output.title || `${output.toolName} Output`).trim().slice(0, 300) || 'Untitled Deliverable';
+    const safeContent = (output.content || '').slice(0, 200000);
+
+    const newOutput: SavedOutput = this.stripUndefined({
       ...output,
       id,
+      orgId,
+      userName: resolvedUserName,
+      title: safeTitle,
+      content: safeContent,
       createdAt: now,
       updatedAt: now,
-    };
+    });
 
     this.cachedOutputs.unshift(newOutput);
 
-    // Persist to Firestore under active organization
-    const orgId = auth.currentUser?.uid ? `org_${auth.currentUser.uid}` : 'org_default';
-    const path = `organizations/${orgId}/outputs/${id}`;
-    setDoc(doc(db, 'organizations', orgId, 'outputs', id), newOutput, { merge: true })
-      .catch((err) => {
+    if (orgId) {
+      const path = `organizations/${orgId}/outputs/${id}`;
+      setDoc(doc(db, 'organizations', orgId, 'outputs', id), newOutput, { merge: true }).catch((err) => {
         handleFirestoreError(err, OperationType.CREATE, path);
       });
+    }
 
     this.logAction('OUTPUT_SAVED', `Saved output "${newOutput.title}" (${newOutput.toolName})`, newOutput.userId);
     return newOutput;
   }
 
-  public updateOutput(id: string, updates: Partial<SavedOutput>): SavedOutput | null {
+  public copyOutput(source: SavedOutput, currentUser: User): SavedOutput {
+    const baseTitle = source.title.startsWith('Copy of ') ? source.title : `Copy of ${source.title}`;
+    return this.saveOutput({
+      orgId: currentUser.organizationId || source.orgId || this.getCurrentOrganizationId(currentUser.id) || undefined,
+      userId: currentUser.id,
+      userName: currentUser.name || currentUser.email,
+      toolId: source.toolId,
+      toolName: source.toolName,
+      title: baseTitle.slice(0, 300),
+      content: source.content,
+      tags: source.tags,
+      userInputs: source.userInputs,
+      copiedFromId: source.id,
+    });
+  }
+
+  public updateOutput(
+    id: string,
+    updates: Partial<SavedOutput>,
+    editor?: { id: string; name?: string }
+  ): SavedOutput | null {
     const idx = this.cachedOutputs.findIndex((o) => o.id === id);
     if (idx === -1) return null;
 
+    const now = new Date().toISOString();
+    const currentItem = this.cachedOutputs[idx];
+    const allowedPatch: Record<string, any> = {
+      updatedAt: now,
+    };
+    if (updates.title !== undefined) {
+      allowedPatch.title = String(updates.title).trim().slice(0, 300) || currentItem.title;
+    }
+    if (updates.content !== undefined) {
+      allowedPatch.content = String(updates.content).slice(0, 200000);
+    }
+    if (updates.tags !== undefined) allowedPatch.tags = updates.tags;
+    if (updates.userInputs !== undefined) allowedPatch.userInputs = updates.userInputs;
+    if (editor?.id) {
+      allowedPatch.updatedBy = editor.id;
+      if (editor.name) allowedPatch.updatedByName = editor.name.slice(0, 150);
+    }
+
+    const cleanPatch = this.stripUndefined(allowedPatch);
     this.cachedOutputs[idx] = {
-      ...this.cachedOutputs[idx],
-      ...updates,
-      updatedAt: new Date().toISOString(),
+      ...currentItem,
+      ...cleanPatch,
     };
 
-    const orgId = auth.currentUser?.uid ? `org_${auth.currentUser.uid}` : 'org_default';
-    const path = `organizations/${orgId}/outputs/${id}`;
-    setDoc(doc(db, 'organizations', orgId, 'outputs', id), updates, { merge: true })
-      .catch((err) => {
+    const orgId = currentItem.orgId || this.getCurrentOrganizationId(currentItem.userId);
+    if (orgId) {
+      const path = `organizations/${orgId}/outputs/${id}`;
+      setDoc(doc(db, 'organizations', orgId, 'outputs', id), cleanPatch, { merge: true }).catch((err) => {
         handleFirestoreError(err, OperationType.UPDATE, path);
       });
+    }
 
     return this.cachedOutputs[idx];
   }
 
   public deleteOutput(id: string): boolean {
+    const target = this.cachedOutputs.find((o) => o.id === id);
     const filtered = this.cachedOutputs.filter((o) => o.id !== id);
     if (filtered.length === this.cachedOutputs.length) return false;
     this.cachedOutputs = filtered;
 
-    const orgId = auth.currentUser?.uid ? `org_${auth.currentUser.uid}` : 'org_default';
-    const path = `organizations/${orgId}/outputs/${id}`;
-    deleteDoc(doc(db, 'organizations', orgId, 'outputs', id))
-      .catch((err) => {
+    const orgId = target?.orgId || this.getCurrentOrganizationId(target?.userId);
+    if (orgId) {
+      const path = `organizations/${orgId}/outputs/${id}`;
+      deleteDoc(doc(db, 'organizations', orgId, 'outputs', id)).catch((err) => {
         handleFirestoreError(err, OperationType.DELETE, path);
       });
+    }
 
     return true;
+  }
+
+  /* =========================================================================
+   * GENERATION HISTORY (/organizations/{orgId}/history/{historyId})
+   * ========================================================================= */
+  public async fetchHistory(orgId?: string): Promise<GenerationHistoryItem[]> {
+    const currentOrgId = orgId || this.getCurrentOrganizationId();
+    if (!currentOrgId) return this.cachedHistory;
+
+    const path = `organizations/${currentOrgId}/history`;
+    try {
+      const snap = await getDocs(collection(db, 'organizations', currentOrgId, 'history'));
+      const list: GenerationHistoryItem[] = [];
+      snap.forEach((d) => {
+        const data = d.data() as GenerationHistoryItem;
+        list.push({
+          ...data,
+          id: data.id || d.id,
+          orgId: data.orgId || currentOrgId,
+        });
+      });
+      list.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+      this.cachedHistory = list;
+      return list;
+    } catch (error) {
+      handleFirestoreError(error, OperationType.LIST, path);
+    }
+  }
+
+  public getHistory(): GenerationHistoryItem[] {
+    return this.cachedHistory;
+  }
+
+  public async deleteHistoryItem(id: string, orgId?: string): Promise<void> {
+    const target = this.cachedHistory.find((h) => h.id === id);
+    const resolvedOrgId = orgId || target?.orgId || this.getCurrentOrganizationId(target?.userId);
+    if (!resolvedOrgId) {
+      throw new Error('Organization context is required to delete history records.');
+    }
+
+    const path = `organizations/${resolvedOrgId}/history/${id}`;
+    try {
+      await deleteDoc(doc(db, 'organizations', resolvedOrgId, 'history', id));
+      this.cachedHistory = this.cachedHistory.filter((h) => h.id !== id);
+    } catch (error) {
+      handleFirestoreError(error, OperationType.DELETE, path);
+    }
   }
 
   /* =========================================================================
@@ -821,6 +1022,12 @@ class DataService {
       throw new Error(err.error || 'Failed to accept invite');
     }
     const data = await res.json();
+    if (data.user) {
+      this.setCachedUser(data.user as User);
+    }
+    if (data.organization) {
+      this.setCachedOrganization(data.organization as Organization);
+    }
     return data.user as User;
   }
 
@@ -855,6 +1062,163 @@ class DataService {
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
       throw new Error(err.error || 'Failed to update role on server');
+    }
+  }
+
+  /* =========================================================================
+   * TEAM MANAGEMENT (Server Admin SDK Endpoints)
+   * ========================================================================= */
+  public async fetchTeam(): Promise<TeamState> {
+    const token = await auth.currentUser?.getIdToken();
+    if (!token) throw new Error('Not authenticated');
+    const res = await fetch('/api/team', {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || 'Failed to fetch team details');
+    }
+    const data = (await res.json()) as TeamState;
+    if (data.organization) {
+      this.setCachedOrganization(data.organization);
+    }
+    return data;
+  }
+
+  public async createTeamInvite(email: string): Promise<TeamInvite> {
+    const token = await auth.currentUser?.getIdToken();
+    if (!token) throw new Error('Not authenticated');
+    const res = await fetch('/api/team/invites', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({ email }),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || 'Failed to invite team member');
+    }
+    const data = await res.json();
+    return data.invite as TeamInvite;
+  }
+
+  public async revokeTeamInvite(inviteId: string): Promise<void> {
+    const token = await auth.currentUser?.getIdToken();
+    if (!token) throw new Error('Not authenticated');
+    const res = await fetch(`/api/team/invites/${encodeURIComponent(inviteId)}/revoke`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || 'Failed to revoke team invite');
+    }
+  }
+
+  public async removeTeamMember(memberId: string): Promise<void> {
+    const token = await auth.currentUser?.getIdToken();
+    if (!token) throw new Error('Not authenticated');
+    const res = await fetch(`/api/team/members/${encodeURIComponent(memberId)}/remove`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || 'Failed to remove team member');
+    }
+  }
+
+  public async transferOwnership(newOwnerId: string): Promise<void> {
+    const token = await auth.currentUser?.getIdToken();
+    if (!token) throw new Error('Not authenticated');
+    const res = await fetch('/api/team/transfer-ownership', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({ newOwnerId }),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || 'Failed to transfer ownership');
+    }
+  }
+
+  public async leaveTeam(): Promise<{ user: User; organization: Organization }> {
+    const token = await auth.currentUser?.getIdToken();
+    if (!token) throw new Error('Not authenticated');
+    const res = await fetch('/api/team/leave', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || 'Failed to leave team');
+    }
+    const data = await res.json();
+    if (data.user) this.setCachedUser(data.user as User);
+    if (data.organization) this.setCachedOrganization(data.organization as Organization);
+    this.cachedOutputs = [];
+    this.cachedHistory = [];
+    this.fetchOutputs(data.organization?.id).catch(() => {});
+    return {
+      user: data.user as User,
+      organization: data.organization as Organization,
+    };
+  }
+
+  /* =========================================================================
+   * SUPER ADMIN ORGANIZATIONS MANAGEMENT
+   * ========================================================================= */
+  public async fetchAdminOrganizations(): Promise<AdminOrganizationSummary[]> {
+    const token = await auth.currentUser?.getIdToken();
+    if (!token) return [];
+    const res = await fetch('/api/admin/organizations', {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || 'Failed to load organizations');
+    }
+    const data = await res.json();
+    return (data.organizations || []) as AdminOrganizationSummary[];
+  }
+
+  public async updateOrgSeatLimitServer(orgId: string, seatLimit: number): Promise<Organization> {
+    const token = await auth.currentUser?.getIdToken();
+    if (!token) throw new Error('Not authenticated');
+    const res = await fetch(`/api/admin/organizations/${encodeURIComponent(orgId)}/seat-limit`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({ seatLimit }),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || 'Failed to update seat limit');
+    }
+    const data = await res.json();
+    return data.organization as Organization;
+  }
+
+  public async removeOrgMemberServer(orgId: string, memberId: string): Promise<void> {
+    const token = await auth.currentUser?.getIdToken();
+    if (!token) throw new Error('Not authenticated');
+    const res = await fetch(
+      `/api/admin/organizations/${encodeURIComponent(orgId)}/members/${encodeURIComponent(memberId)}/remove`,
+      {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` },
+      }
+    );
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || 'Failed to remove organization member');
     }
   }
 
@@ -948,6 +1312,56 @@ class DataService {
     if (!t) return null;
     Object.assign(t, updates);
     return t;
+  }
+
+  public getPlatformSettings(): PlatformSettings {
+    return this.cachedPlatformSettings;
+  }
+
+  public setCachedPlatformSettings(settings: PlatformSettings): void {
+    this.cachedPlatformSettings = {
+      inviteOnlyMode: settings.inviteOnlyMode === true,
+      paidPlansDisabled: settings.inviteOnlyMode === true,
+      selfSignupDisabled: settings.inviteOnlyMode === true,
+      ...(settings.updatedAt ? { updatedAt: settings.updatedAt } : {}),
+    };
+    INITIAL_SETTINGS.openSignup = !this.cachedPlatformSettings.inviteOnlyMode;
+  }
+
+  public async fetchPlatformSettings(): Promise<PlatformSettings> {
+    try {
+      const res = await fetch('/api/settings');
+      const contentType = res.headers.get('content-type') || '';
+      if (!res.ok || !contentType.includes('application/json')) {
+        return this.cachedPlatformSettings;
+      }
+      const data = (await res.json()) as PlatformSettings;
+      this.setCachedPlatformSettings(data);
+      return this.cachedPlatformSettings;
+    } catch {
+      return this.cachedPlatformSettings;
+    }
+  }
+
+  public async updatePlatformSettingsServer(inviteOnlyMode: boolean): Promise<PlatformSettings> {
+    const token = await auth.currentUser?.getIdToken();
+    if (!token) throw new Error('Not authenticated');
+    const res = await fetch('/api/admin/settings', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({ inviteOnlyMode }),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || 'Failed to update platform settings');
+    }
+    const data = await res.json();
+    const updated = (data.settings || { inviteOnlyMode }) as PlatformSettings;
+    this.setCachedPlatformSettings(updated);
+    return this.cachedPlatformSettings;
   }
 
   public getSettings(): AgencySettings {

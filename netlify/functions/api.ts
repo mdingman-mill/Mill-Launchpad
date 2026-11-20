@@ -2,6 +2,8 @@ process.env.SERVERLESS = 'true';
 
 import {
   handleHealthCheck,
+  handleGetPublicSettings,
+  handleUpdatePlatformSettings,
   handleAuthSync,
   handleDeleteOwnAccount,
   handleGetInvites,
@@ -12,6 +14,15 @@ import {
   handleUpdateUserPlan,
   handleUpdateUserRole,
   handleAdminUserAction,
+  handleGetTeam,
+  handleCreateTeamInvite,
+  handleRevokeTeamInvite,
+  handleRemoveTeamMember,
+  handleTransferOwnership,
+  handleLeaveTeam,
+  handleAdminGetOrganizations,
+  handleAdminUpdateOrgSeatLimit,
+  handleAdminRemoveOrgMember,
   handleGeminiGenerate,
   getCorsHeaders,
 } from '../../server';
@@ -47,6 +58,25 @@ export default async (req: Request): Promise<Response> => {
     // 1. Health check
     if (method === 'GET' && pathname === '/api/health') {
       const result = await handleHealthCheck();
+      return new Response(JSON.stringify(result.data), {
+        status: result.status,
+        headers: { 'Content-Type': 'application/json', ...corsHeaders },
+      });
+    }
+
+    // 1b. Public platform settings
+    if (method === 'GET' && pathname === '/api/settings') {
+      const result = await handleGetPublicSettings();
+      return new Response(JSON.stringify(result.data), {
+        status: result.status,
+        headers: { 'Content-Type': 'application/json', ...corsHeaders },
+      });
+    }
+
+    // 1c. Super admin update platform settings
+    if (method === 'POST' && pathname === '/api/admin/settings') {
+      const body = await req.json().catch(() => ({}));
+      const result = await handleUpdatePlatformSettings(authHeader, body);
       return new Response(JSON.stringify(result.data), {
         status: result.status,
         headers: { 'Content-Type': 'application/json', ...corsHeaders },
@@ -153,6 +183,99 @@ export default async (req: Request): Promise<Response> => {
       const userId = decodeURIComponent(userActionMatch[1]);
       const body = await req.json().catch(() => ({}));
       const result = await handleAdminUserAction(authHeader, userId, body);
+      return new Response(JSON.stringify(result.data), {
+        status: result.status,
+        headers: { 'Content-Type': 'application/json', ...corsHeaders },
+      });
+    }
+
+    // 9c. Team management: GET /api/team
+    if (method === 'GET' && pathname === '/api/team') {
+      const result = await handleGetTeam(authHeader);
+      return new Response(JSON.stringify(result.data), {
+        status: result.status,
+        headers: { 'Content-Type': 'application/json', ...corsHeaders },
+      });
+    }
+
+    // 9d. Create team invite: POST /api/team/invites
+    if (method === 'POST' && pathname === '/api/team/invites') {
+      const body = await req.json().catch(() => ({}));
+      const result = await handleCreateTeamInvite(authHeader, body);
+      return new Response(JSON.stringify(result.data), {
+        status: result.status,
+        headers: { 'Content-Type': 'application/json', ...corsHeaders },
+      });
+    }
+
+    // 9e. Revoke team invite: POST /api/team/invites/:inviteId/revoke
+    const revokeTeamInviteMatch = pathname.match(/^\/api\/team\/invites\/([^/]+)\/revoke$/);
+    if (method === 'POST' && revokeTeamInviteMatch) {
+      const inviteId = decodeURIComponent(revokeTeamInviteMatch[1]);
+      const result = await handleRevokeTeamInvite(authHeader, inviteId);
+      return new Response(JSON.stringify(result.data), {
+        status: result.status,
+        headers: { 'Content-Type': 'application/json', ...corsHeaders },
+      });
+    }
+
+    // 9f. Remove team member: POST /api/team/members/:memberId/remove
+    const removeTeamMemberMatch = pathname.match(/^\/api\/team\/members\/([^/]+)\/remove$/);
+    if (method === 'POST' && removeTeamMemberMatch) {
+      const memberId = decodeURIComponent(removeTeamMemberMatch[1]);
+      const result = await handleRemoveTeamMember(authHeader, memberId);
+      return new Response(JSON.stringify(result.data), {
+        status: result.status,
+        headers: { 'Content-Type': 'application/json', ...corsHeaders },
+      });
+    }
+
+    // 9g. Transfer ownership: POST /api/team/transfer-ownership
+    if (method === 'POST' && pathname === '/api/team/transfer-ownership') {
+      const body = await req.json().catch(() => ({}));
+      const result = await handleTransferOwnership(authHeader, body);
+      return new Response(JSON.stringify(result.data), {
+        status: result.status,
+        headers: { 'Content-Type': 'application/json', ...corsHeaders },
+      });
+    }
+
+    // 9h. Leave team: POST /api/team/leave
+    if (method === 'POST' && pathname === '/api/team/leave') {
+      const result = await handleLeaveTeam(authHeader);
+      return new Response(JSON.stringify(result.data), {
+        status: result.status,
+        headers: { 'Content-Type': 'application/json', ...corsHeaders },
+      });
+    }
+
+    // 9i. Super admin list organizations: GET /api/admin/organizations
+    if (method === 'GET' && pathname === '/api/admin/organizations') {
+      const result = await handleAdminGetOrganizations(authHeader);
+      return new Response(JSON.stringify(result.data), {
+        status: result.status,
+        headers: { 'Content-Type': 'application/json', ...corsHeaders },
+      });
+    }
+
+    // 9j. Super admin update org seat limit: POST /api/admin/organizations/:orgId/seat-limit
+    const orgSeatLimitMatch = pathname.match(/^\/api\/admin\/organizations\/([^/]+)\/seat-limit$/);
+    if (method === 'POST' && orgSeatLimitMatch) {
+      const orgId = decodeURIComponent(orgSeatLimitMatch[1]);
+      const body = await req.json().catch(() => ({}));
+      const result = await handleAdminUpdateOrgSeatLimit(authHeader, orgId, body);
+      return new Response(JSON.stringify(result.data), {
+        status: result.status,
+        headers: { 'Content-Type': 'application/json', ...corsHeaders },
+      });
+    }
+
+    // 9k. Super admin remove org member: POST /api/admin/organizations/:orgId/members/:memberId/remove
+    const adminRemoveOrgMemberMatch = pathname.match(/^\/api\/admin\/organizations\/([^/]+)\/members\/([^/]+)\/remove$/);
+    if (method === 'POST' && adminRemoveOrgMemberMatch) {
+      const orgId = decodeURIComponent(adminRemoveOrgMemberMatch[1]);
+      const memberId = decodeURIComponent(adminRemoveOrgMemberMatch[2]);
+      const result = await handleAdminRemoveOrgMember(authHeader, orgId, memberId);
       return new Response(JSON.stringify(result.data), {
         status: result.status,
         headers: { 'Content-Type': 'application/json', ...corsHeaders },
