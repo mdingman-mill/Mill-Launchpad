@@ -86,6 +86,16 @@ export const MarketingStudio: React.FC<MarketingStudioProps> = ({
   const [savedSuccess, setSavedSuccess] = useState(false);
   const [mobileTab, setMobileTab] = useState<'inputs' | 'deliverable'>('inputs');
 
+  const isTeamOwner = organization ? organization.ownerId === user.id : user.orgRole !== 'member';
+  const effectiveOrgName = user.organizationProfile?.orgName || organization?.name || 'Your Organization';
+  const effectiveOrgMission = user.organizationProfile?.whatTheyDo || organization?.whatTheyDo || 'Not configured yet';
+  const effectiveOrgAudience = user.organizationProfile?.targetAudience || organization?.targetAudience || 'Not configured yet';
+  const effectiveOrgTone =
+    user.organizationProfile?.brandTone?.join(' & ') ||
+    organization?.brandTone?.join(' & ') ||
+    'Professional';
+  const effectiveOrgType = user.organizationProfile?.type || organization?.type || 'Startup';
+
   const effectivePlanId = organization?.planId || user.planId;
   const plan = billingService.getPlanById(effectivePlanId);
   const bonusGenerations = organization?.bonusGenerations ?? user.bonusGenerations ?? 0;
@@ -95,6 +105,17 @@ export const MarketingStudio: React.FC<MarketingStudioProps> = ({
   const usagePercentage = Math.min(Math.round((currentUsage / maxLimit) * 100), 100);
   const isNearLimit = currentUsage >= maxLimit * 0.8 && currentUsage < maxLimit;
   const isLimitReached = currentUsage >= maxLimit;
+
+  useEffect(() => {
+    setOutput('');
+    setError(null);
+    setSavedSuccess(false);
+    setIsEditingOutput(false);
+    setModelUsed(null);
+    if (activeTool) {
+      setOutputTitle(`${effectiveOrgName} ${activeTool.name}`);
+    }
+  }, [organization?.id, user.organizationId]);
 
   useEffect(() => {
     if (!initialToolLaunch) return;
@@ -523,30 +544,36 @@ export const MarketingStudio: React.FC<MarketingStudioProps> = ({
                   <span className="font-bold text-slate-800 uppercase tracking-wide text-[10px]">
                     Active Brand Context
                   </span>
-                  <button
-                    onClick={onEditProfile}
-                    className="text-xs font-bold text-rose-600 hover:text-rose-700 underline"
-                  >
-                    Edit Profile
-                  </button>
+                  {isTeamOwner ? (
+                    <button
+                      onClick={onEditProfile}
+                      className="text-xs font-bold text-rose-600 hover:text-rose-700 underline"
+                    >
+                      Edit Profile
+                    </button>
+                  ) : (
+                    <span className="text-[11px] text-slate-400 font-medium">
+                      Owner-managed
+                    </span>
+                  )}
                 </div>
 
                 <div className="space-y-1.5 text-slate-600 text-[11px]">
                   <p>
                     <strong className="text-slate-800">Org:</strong>{' '}
-                    {user.organizationProfile?.orgName} ({user.organizationProfile?.type})
+                    {effectiveOrgName} ({effectiveOrgType})
                   </p>
                   <p>
                     <strong className="text-slate-800">Mission:</strong>{' '}
-                    {user.organizationProfile?.whatTheyDo}
+                    {effectiveOrgMission}
                   </p>
                   <p>
                     <strong className="text-slate-800">Audience:</strong>{' '}
-                    {user.organizationProfile?.targetAudience}
+                    {effectiveOrgAudience}
                   </p>
                   <p>
                     <strong className="text-slate-800">Tone:</strong>{' '}
-                    {user.organizationProfile?.brandTone?.join(' & ') || 'Professional'}
+                    {effectiveOrgTone}
                   </p>
                 </div>
               </div>
@@ -800,7 +827,7 @@ export const MarketingStudio: React.FC<MarketingStudioProps> = ({
               </span>
 
               <h1 className="text-2xl sm:text-4xl font-extrabold tracking-tight font-heading">
-                Marketing Tools for {user.organizationProfile?.orgName || 'Your Organization'}
+                Marketing Tools for {effectiveOrgName}
               </h1>
 
               <p className="mt-3 text-xs sm:text-sm text-slate-300 leading-relaxed">
@@ -808,17 +835,28 @@ export const MarketingStudio: React.FC<MarketingStudioProps> = ({
               </p>
 
               <div className="mt-5 flex flex-wrap items-center gap-2 text-xs text-slate-300">
-                <button
-                  onClick={onEditProfile}
-                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-white/10 hover:bg-white/20 text-slate-200 transition-colors border border-white/10"
-                >
-                  <Building2 className="w-3.5 h-3.5 text-rose-400" />
-                  <span>Voice: {user.organizationProfile?.brandTone?.join(' & ') || 'Professional'}</span>
-                  <span className="text-rose-300 underline ml-1 font-semibold">Edit</span>
-                </button>
+                {isTeamOwner ? (
+                  <button
+                    onClick={onEditProfile}
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-white/10 hover:bg-white/20 text-slate-200 transition-colors border border-white/10"
+                  >
+                    <Building2 className="w-3.5 h-3.5 text-rose-400" />
+                    <span>Voice: {effectiveOrgTone}</span>
+                    <span className="text-rose-300 underline ml-1 font-semibold">Edit</span>
+                  </button>
+                ) : (
+                  <div
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-white/10 text-slate-200 border border-white/10"
+                    title="Only the team owner can edit the team brand profile"
+                  >
+                    <Building2 className="w-3.5 h-3.5 text-rose-400" />
+                    <span>Voice: {effectiveOrgTone}</span>
+                    <span className="text-slate-400 ml-1">(View only)</span>
+                  </div>
+                )}
                 <span className="text-slate-600" aria-hidden="true">·</span>
                 <span>
-                  Audience: <strong className="text-white">{user.organizationProfile?.targetAudience}</strong>
+                  Audience: <strong className="text-white">{effectiveOrgAudience}</strong>
                 </span>
               </div>
             </div>

@@ -16,8 +16,15 @@ import {
   handleUpdateUserPlan,
   handleUpdateUserRole,
   handleAdminUserAction,
+  handleGetUserTeams,
+  handleSwitchTeam,
+  handleCreateTeam,
+  handleRenameTeam,
+  handleDeleteTeam,
   handleGetTeam,
   handleCreateTeamInvite,
+  handleAcceptTeamInvite,
+  handleDeclineTeamInvite,
   handleRevokeTeamInvite,
   handleRemoveTeamMember,
   handleTransferOwnership,
@@ -210,9 +217,55 @@ export default async (req: Request): Promise<Response> => {
       });
     }
 
-    // 9c. Team management: GET /api/team
+    // 9c. Multi-team management endpoints
+    if (method === 'GET' && pathname === '/api/teams') {
+      const result = await handleGetUserTeams(authHeader);
+      return new Response(JSON.stringify(result.data), {
+        status: result.status,
+        headers: { 'Content-Type': 'application/json', ...corsHeaders },
+      });
+    }
+
+    if (method === 'POST' && pathname === '/api/team/switch') {
+      const body = await req.json().catch(() => ({}));
+      const result = await handleSwitchTeam(authHeader, body);
+      return new Response(JSON.stringify(result.data), {
+        status: result.status,
+        headers: { 'Content-Type': 'application/json', ...corsHeaders },
+      });
+    }
+
+    if (method === 'POST' && pathname === '/api/team/create') {
+      const body = await req.json().catch(() => ({}));
+      const result = await handleCreateTeam(authHeader, body);
+      return new Response(JSON.stringify(result.data), {
+        status: result.status,
+        headers: { 'Content-Type': 'application/json', ...corsHeaders },
+      });
+    }
+
+    if (method === 'POST' && pathname === '/api/team/rename') {
+      const body = await req.json().catch(() => ({}));
+      const result = await handleRenameTeam(authHeader, body);
+      return new Response(JSON.stringify(result.data), {
+        status: result.status,
+        headers: { 'Content-Type': 'application/json', ...corsHeaders },
+      });
+    }
+
+    if (method === 'POST' && pathname === '/api/team/delete') {
+      const body = await req.json().catch(() => ({}));
+      const result = await handleDeleteTeam(authHeader, body);
+      return new Response(JSON.stringify(result.data), {
+        status: result.status,
+        headers: { 'Content-Type': 'application/json', ...corsHeaders },
+      });
+    }
+
+    // Team management: GET /api/team
     if (method === 'GET' && pathname === '/api/team') {
-      const result = await handleGetTeam(authHeader);
+      const orgIdParam = url.searchParams.get('organizationId') ?? undefined;
+      const result = await handleGetTeam(authHeader, orgIdParam);
       return new Response(JSON.stringify(result.data), {
         status: result.status,
         headers: { 'Content-Type': 'application/json', ...corsHeaders },
@@ -229,11 +282,35 @@ export default async (req: Request): Promise<Response> => {
       });
     }
 
+    // Accept team invite: POST /api/team/invites/:inviteId/accept
+    const acceptTeamInviteMatch = pathname.match(/^\/api\/team\/invites\/([^/]+)\/accept$/);
+    if (method === 'POST' && acceptTeamInviteMatch) {
+      const inviteId = decodeURIComponent(acceptTeamInviteMatch[1]);
+      const result = await handleAcceptTeamInvite(authHeader, inviteId);
+      return new Response(JSON.stringify(result.data), {
+        status: result.status,
+        headers: { 'Content-Type': 'application/json', ...corsHeaders },
+      });
+    }
+
+    // Decline team invite: POST /api/team/invites/:inviteId/decline
+    const declineTeamInviteMatch = pathname.match(/^\/api\/team\/invites\/([^/]+)\/decline$/);
+    if (method === 'POST' && declineTeamInviteMatch) {
+      const inviteId = decodeURIComponent(declineTeamInviteMatch[1]);
+      const result = await handleDeclineTeamInvite(authHeader, inviteId);
+      return new Response(JSON.stringify(result.data), {
+        status: result.status,
+        headers: { 'Content-Type': 'application/json', ...corsHeaders },
+      });
+    }
+
     // 9e. Revoke team invite: POST /api/team/invites/:inviteId/revoke
     const revokeTeamInviteMatch = pathname.match(/^\/api\/team\/invites\/([^/]+)\/revoke$/);
     if (method === 'POST' && revokeTeamInviteMatch) {
       const inviteId = decodeURIComponent(revokeTeamInviteMatch[1]);
-      const result = await handleRevokeTeamInvite(authHeader, inviteId);
+      const body = await req.json().catch(() => ({}));
+      const orgIdParam = typeof body?.organizationId === 'string' ? body.organizationId : undefined;
+      const result = await handleRevokeTeamInvite(authHeader, inviteId, orgIdParam);
       return new Response(JSON.stringify(result.data), {
         status: result.status,
         headers: { 'Content-Type': 'application/json', ...corsHeaders },
@@ -244,7 +321,9 @@ export default async (req: Request): Promise<Response> => {
     const removeTeamMemberMatch = pathname.match(/^\/api\/team\/members\/([^/]+)\/remove$/);
     if (method === 'POST' && removeTeamMemberMatch) {
       const memberId = decodeURIComponent(removeTeamMemberMatch[1]);
-      const result = await handleRemoveTeamMember(authHeader, memberId);
+      const body = await req.json().catch(() => ({}));
+      const orgIdParam = typeof body?.organizationId === 'string' ? body.organizationId : undefined;
+      const result = await handleRemoveTeamMember(authHeader, memberId, orgIdParam);
       return new Response(JSON.stringify(result.data), {
         status: result.status,
         headers: { 'Content-Type': 'application/json', ...corsHeaders },
@@ -263,7 +342,8 @@ export default async (req: Request): Promise<Response> => {
 
     // 9h. Leave team: POST /api/team/leave
     if (method === 'POST' && pathname === '/api/team/leave') {
-      const result = await handleLeaveTeam(authHeader);
+      const body = await req.json().catch(() => ({}));
+      const result = await handleLeaveTeam(authHeader, body);
       return new Response(JSON.stringify(result.data), {
         status: result.status,
         headers: { 'Content-Type': 'application/json', ...corsHeaders },

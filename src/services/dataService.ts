@@ -27,6 +27,8 @@ import {
   Organization,
   TeamInvite,
   TeamState,
+  TeamSummary,
+  UserTeamsResponse,
   AdminOrganizationSummary,
 } from '../types';
 
@@ -351,6 +353,8 @@ class DataService {
   // In-memory caches to guarantee synchronous component reactivity
   private cachedUsers: Map<string, User> = new Map();
   private cachedOrganization: Organization | null = null;
+  private cachedTeams: TeamSummary[] = [];
+  private cachedPendingTeamInvites: TeamInvite[] = [];
   private cachedOutputs: SavedOutput[] = [];
   private cachedHistory: GenerationHistoryItem[] = [];
   private cachedLogs: AuditLogEntry[] = [];
@@ -389,6 +393,22 @@ class DataService {
     return this.cachedOrganization;
   }
 
+  public setCachedTeams(teams: TeamSummary[]): void {
+    this.cachedTeams = Array.isArray(teams) ? teams : [];
+  }
+
+  public getCachedTeams(): TeamSummary[] {
+    return this.cachedTeams;
+  }
+
+  public setCachedPendingTeamInvites(invites: TeamInvite[]): void {
+    this.cachedPendingTeamInvites = Array.isArray(invites) ? invites : [];
+  }
+
+  public getCachedPendingTeamInvites(): TeamInvite[] {
+    return this.cachedPendingTeamInvites;
+  }
+
   public getCurrentOrganizationId(userId?: string): string | null {
     const uid = userId || auth.currentUser?.uid;
     if (uid) {
@@ -402,6 +422,8 @@ class DataService {
   public clearCache(): void {
     this.cachedUsers.clear();
     this.cachedOrganization = null;
+    this.cachedTeams = [];
+    this.cachedPendingTeamInvites = [];
     this.cachedOutputs = [];
     this.cachedHistory = [];
     this.cachedLogs = [];
@@ -420,6 +442,7 @@ class DataService {
         const orgId = fetchedUser?.organizationId || this.getCurrentOrganizationId(uid);
         await Promise.allSettled([
           orgId ? this.getOrganization(orgId) : Promise.resolve(null),
+          this.fetchTeams(),
           this.fetchOutputs(orgId || undefined),
           orgId ? this.fetchHistory(orgId) : Promise.resolve([]),
           this.fetchAuditLogs(),
@@ -543,7 +566,11 @@ class DataService {
 
     if (updates.organizationProfile) {
       const orgId = updated.organizationId || this.getCurrentOrganizationId(id);
-      if (orgId) {
+      const isOrgOwner =
+        this.cachedOrganization && this.cachedOrganization.id === orgId
+          ? this.cachedOrganization.ownerId === id
+          : updated.orgRole === 'owner' || orgId === `org_${id}`;
+      if (orgId && isOrgOwner) {
         const orgPayload = this.stripUndefined({
           id: orgId,
           name: updates.organizationProfile.orgName,
@@ -580,7 +607,11 @@ class DataService {
       }
       if (user.organizationProfile) {
         const orgId = user.organizationId || this.getCurrentOrganizationId(user.id);
-        if (orgId) {
+        const isOrgOwner =
+          this.cachedOrganization && this.cachedOrganization.id === orgId
+            ? this.cachedOrganization.ownerId === user.id
+            : user.orgRole === 'owner' || orgId === `org_${user.id}`;
+        if (orgId && isOrgOwner) {
           await this.saveOrganization(
             this.stripUndefined({
               id: orgId,
@@ -809,6 +840,54 @@ class DataService {
       userInputs: source.userInputs,
       copiedFromId: source.id,
     });
+  }
+
+  public async copyOutputToTeam(
+    source: SavedOutput,
+    targetOrgId: string,
+    currentUser: User
+  ): Promise<SavedOutput> {
+    const id = `out_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
+    const now = new Date().toISOString();
+    const resolvedUserName =
+      currentUser.name ||
+      currentUser.email ||
+      auth.currentUser?.displayName ||
+      'Team Member';
+
+    const newOutput: SavedOutput = this.stripUndefined({
+      id,
+      orgId: targetOrgId,
+      userId: currentUser.id,
+      userName: resolvedUserName,
+      toolId: source.toolId,
+      toolName: source.toolName,
+      title: (source.title || `${source.toolName} Output`).trim().slice(0, 300),
+      content: (source.content || '').slice(0, 200000),
+      tags: source.tags,
+      userInputs: source.userInputs,
+      copiedFromId: source.id,
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    const path = `organizations/${targetOrgId}/outputs/${id}`;
+    try {
+      await setDoc(doc(db, 'organizations', targetOrgId, 'outputs', id), newOutput, { merge: true });
+    } catch (err) {
+      handleFirestoreError(err, OperationType.CREATE, path);
+    }
+
+    if (targetOrgId === this.getCurrentOrganizationId(currentUser.id)) {
+      this.cachedOutputs.unshift(newOutput);
+    }
+
+    this.logAction(
+      'OUTPUT_SAVED',
+      `Copied output "${newOutput.title}" (${newOutput.toolName}) to team ${targetOrgId}`,
+      currentUser.id
+    );
+    return newOutput;
   }
 
   public updateOutput(
@@ -1066,12 +1145,249 @@ class DataService {
   }
 
   /* =========================================================================
-   * TEAM MANAGEMENT (Server Admin SDK Endpoints)
+   * TEAM MANAGEMENT (Multi-Team Server Admin SDK Endpoints)
    * ========================================================================= */
-  public async fetchTeam(): Promise<TeamState> {
+  public async fetchTeams(): Promise<UserTeamsResponse> {
+    const token = await auth.currentUser?.getIdToken();
+    if (!token) {
+      return {
+        teams: this.cachedTeams,
+        pendingInvites: this.cachedPendingTeamInvites,
+      };
+    }
+    const res = await fetch('/api/teams', {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || 'Failed to fetch teams');
+    }
+    const data = (await res.json()) as UserTeamsResponse;
+    this.setCachedTeams(data.teams || []);
+    this.setCachedPendingTeamInvites(data.pendingInvites || []);
+    return data;
+  }
+
+  public async switchTeam(organizationId: string): Promise<{
+    user: User;
+    organization: Organization;
+    teams: TeamSummary[];
+    pendingTeamInvites: TeamInvite[];
+  }> {
     const token = await auth.currentUser?.getIdToken();
     if (!token) throw new Error('Not authenticated');
-    const res = await fetch('/api/team', {
+    const res = await fetch('/api/team/switch', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({ organizationId }),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || 'Failed to switch team');
+    }
+    const data = await res.json();
+    if (data.user) this.setCachedUser(data.user as User);
+    if (data.organization) this.setCachedOrganization(data.organization as Organization);
+    if (Array.isArray(data.teams)) this.setCachedTeams(data.teams as TeamSummary[]);
+    if (Array.isArray(data.pendingTeamInvites)) {
+      this.setCachedPendingTeamInvites(data.pendingTeamInvites as TeamInvite[]);
+    }
+    this.cachedOutputs = [];
+    this.cachedHistory = [];
+    await Promise.allSettled([
+      this.fetchOutputs(data.organization?.id || organizationId),
+      this.fetchHistory(data.organization?.id || organizationId),
+    ]);
+    return {
+      user: data.user as User,
+      organization: data.organization as Organization,
+      teams: (data.teams || []) as TeamSummary[],
+      pendingTeamInvites: (data.pendingTeamInvites || []) as TeamInvite[],
+    };
+  }
+
+  public async createTeam(
+    name: string,
+    switchActive = true
+  ): Promise<{
+    user: User;
+    organization: Organization;
+    teams: TeamSummary[];
+    pendingTeamInvites: TeamInvite[];
+  }> {
+    const token = await auth.currentUser?.getIdToken();
+    if (!token) throw new Error('Not authenticated');
+    const res = await fetch('/api/team/create', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({ name, switchActive }),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || 'Failed to create team');
+    }
+    const data = await res.json();
+    if (data.user) this.setCachedUser(data.user as User);
+    if (switchActive && data.organization) {
+      this.setCachedOrganization(data.organization as Organization);
+      this.cachedOutputs = [];
+      this.cachedHistory = [];
+    }
+    if (Array.isArray(data.teams)) this.setCachedTeams(data.teams as TeamSummary[]);
+    if (Array.isArray(data.pendingTeamInvites)) {
+      this.setCachedPendingTeamInvites(data.pendingTeamInvites as TeamInvite[]);
+    }
+    return {
+      user: data.user as User,
+      organization: data.organization as Organization,
+      teams: (data.teams || []) as TeamSummary[],
+      pendingTeamInvites: (data.pendingTeamInvites || []) as TeamInvite[],
+    };
+  }
+
+  public async renameTeam(name: string, organizationId?: string): Promise<Organization> {
+    const token = await auth.currentUser?.getIdToken();
+    if (!token) throw new Error('Not authenticated');
+    const res = await fetch('/api/team/rename', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({ name, ...(organizationId ? { organizationId } : {}) }),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || 'Failed to rename team');
+    }
+    const data = await res.json();
+    const updatedOrg = data.organization as Organization;
+    if (updatedOrg && this.cachedOrganization?.id === updatedOrg.id) {
+      this.setCachedOrganization(updatedOrg);
+      const uid = auth.currentUser?.uid;
+      if (uid) {
+        const cachedUser = this.cachedUsers.get(uid);
+        if (cachedUser?.organizationProfile) {
+          this.setCachedUser({
+            ...cachedUser,
+            organizationProfile: { ...cachedUser.organizationProfile, orgName: updatedOrg.name },
+          });
+        }
+      }
+    }
+    this.fetchTeams().catch(() => {});
+    return updatedOrg;
+  }
+
+  public async deleteTeam(organizationId?: string): Promise<{
+    user: User;
+    organization: Organization;
+    teams: TeamSummary[];
+    pendingTeamInvites: TeamInvite[];
+  }> {
+    const token = await auth.currentUser?.getIdToken();
+    if (!token) throw new Error('Not authenticated');
+    const res = await fetch('/api/team/delete', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify(organizationId ? { organizationId } : {}),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || 'Failed to delete team');
+    }
+    const data = await res.json();
+    if (data.user) this.setCachedUser(data.user as User);
+    if (data.organization) this.setCachedOrganization(data.organization as Organization);
+    if (Array.isArray(data.teams)) this.setCachedTeams(data.teams as TeamSummary[]);
+    if (Array.isArray(data.pendingTeamInvites)) {
+      this.setCachedPendingTeamInvites(data.pendingTeamInvites as TeamInvite[]);
+    }
+    this.cachedOutputs = [];
+    this.cachedHistory = [];
+    if (data.organization?.id) {
+      await Promise.allSettled([
+        this.fetchOutputs(data.organization.id),
+        this.fetchHistory(data.organization.id),
+      ]);
+    }
+    return {
+      user: data.user as User,
+      organization: data.organization as Organization,
+      teams: (data.teams || []) as TeamSummary[],
+      pendingTeamInvites: (data.pendingTeamInvites || []) as TeamInvite[],
+    };
+  }
+
+  public async acceptTeamInvite(inviteId: string): Promise<{
+    user: User;
+    organization: Organization;
+    teams: TeamSummary[];
+    pendingTeamInvites: TeamInvite[];
+  }> {
+    const token = await auth.currentUser?.getIdToken();
+    if (!token) throw new Error('Not authenticated');
+    const res = await fetch(`/api/team/invites/${encodeURIComponent(inviteId)}/accept`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || 'Failed to accept team invitation');
+    }
+    const data = await res.json();
+    if (data.user) this.setCachedUser(data.user as User);
+    if (Array.isArray(data.teams)) this.setCachedTeams(data.teams as TeamSummary[]);
+    if (Array.isArray(data.pendingTeamInvites)) {
+      this.setCachedPendingTeamInvites(data.pendingTeamInvites as TeamInvite[]);
+    }
+    return {
+      user: data.user as User,
+      organization: data.organization as Organization,
+      teams: (data.teams || []) as TeamSummary[],
+      pendingTeamInvites: (data.pendingTeamInvites || []) as TeamInvite[],
+    };
+  }
+
+  public async declineTeamInvite(inviteId: string): Promise<{
+    teams: TeamSummary[];
+    pendingTeamInvites: TeamInvite[];
+  }> {
+    const token = await auth.currentUser?.getIdToken();
+    if (!token) throw new Error('Not authenticated');
+    const res = await fetch(`/api/team/invites/${encodeURIComponent(inviteId)}/decline`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || 'Failed to decline team invitation');
+    }
+    const data = await res.json();
+    if (Array.isArray(data.teams)) this.setCachedTeams(data.teams as TeamSummary[]);
+    if (Array.isArray(data.pendingTeamInvites)) {
+      this.setCachedPendingTeamInvites(data.pendingTeamInvites as TeamInvite[]);
+    }
+    return {
+      teams: (data.teams || []) as TeamSummary[],
+      pendingTeamInvites: (data.pendingTeamInvites || []) as TeamInvite[],
+    };
+  }
+
+  public async fetchTeam(organizationId?: string): Promise<TeamState> {
+    const token = await auth.currentUser?.getIdToken();
+    if (!token) throw new Error('Not authenticated');
+    const qs = organizationId ? `?organizationId=${encodeURIComponent(organizationId)}` : '';
+    const res = await fetch(`/api/team${qs}`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     if (!res.ok) {
@@ -1079,13 +1395,13 @@ class DataService {
       throw new Error(err.error || 'Failed to fetch team details');
     }
     const data = (await res.json()) as TeamState;
-    if (data.organization) {
+    if (data.organization && (!organizationId || organizationId === this.getCurrentOrganizationId())) {
       this.setCachedOrganization(data.organization);
     }
     return data;
   }
 
-  public async createTeamInvite(email: string): Promise<TeamInvite> {
+  public async createTeamInvite(email: string, organizationId?: string): Promise<TeamInvite> {
     const token = await auth.currentUser?.getIdToken();
     if (!token) throw new Error('Not authenticated');
     const res = await fetch('/api/team/invites', {
@@ -1094,7 +1410,7 @@ class DataService {
         'Content-Type': 'application/json',
         Authorization: `Bearer ${token}`,
       },
-      body: JSON.stringify({ email }),
+      body: JSON.stringify({ email, ...(organizationId ? { organizationId } : {}) }),
     });
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
@@ -1104,12 +1420,16 @@ class DataService {
     return data.invite as TeamInvite;
   }
 
-  public async revokeTeamInvite(inviteId: string): Promise<void> {
+  public async revokeTeamInvite(inviteId: string, organizationId?: string): Promise<void> {
     const token = await auth.currentUser?.getIdToken();
     if (!token) throw new Error('Not authenticated');
     const res = await fetch(`/api/team/invites/${encodeURIComponent(inviteId)}/revoke`, {
       method: 'POST',
-      headers: { Authorization: `Bearer ${token}` },
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify(organizationId ? { organizationId } : {}),
     });
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
@@ -1117,12 +1437,16 @@ class DataService {
     }
   }
 
-  public async removeTeamMember(memberId: string): Promise<void> {
+  public async removeTeamMember(memberId: string, organizationId?: string): Promise<void> {
     const token = await auth.currentUser?.getIdToken();
     if (!token) throw new Error('Not authenticated');
     const res = await fetch(`/api/team/members/${encodeURIComponent(memberId)}/remove`, {
       method: 'POST',
-      headers: { Authorization: `Bearer ${token}` },
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify(organizationId ? { organizationId } : {}),
     });
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
@@ -1130,7 +1454,7 @@ class DataService {
     }
   }
 
-  public async transferOwnership(newOwnerId: string): Promise<void> {
+  public async transferOwnership(newOwnerId: string, organizationId?: string): Promise<void> {
     const token = await auth.currentUser?.getIdToken();
     if (!token) throw new Error('Not authenticated');
     const res = await fetch('/api/team/transfer-ownership', {
@@ -1139,7 +1463,7 @@ class DataService {
         'Content-Type': 'application/json',
         Authorization: `Bearer ${token}`,
       },
-      body: JSON.stringify({ newOwnerId }),
+      body: JSON.stringify({ newOwnerId, ...(organizationId ? { organizationId } : {}) }),
     });
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
@@ -1147,12 +1471,21 @@ class DataService {
     }
   }
 
-  public async leaveTeam(): Promise<{ user: User; organization: Organization }> {
+  public async leaveTeam(organizationId?: string): Promise<{
+    user: User;
+    organization: Organization;
+    teams: TeamSummary[];
+    pendingTeamInvites: TeamInvite[];
+  }> {
     const token = await auth.currentUser?.getIdToken();
     if (!token) throw new Error('Not authenticated');
     const res = await fetch('/api/team/leave', {
       method: 'POST',
-      headers: { Authorization: `Bearer ${token}` },
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify(organizationId ? { organizationId } : {}),
     });
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
@@ -1161,12 +1494,23 @@ class DataService {
     const data = await res.json();
     if (data.user) this.setCachedUser(data.user as User);
     if (data.organization) this.setCachedOrganization(data.organization as Organization);
+    if (Array.isArray(data.teams)) this.setCachedTeams(data.teams as TeamSummary[]);
+    if (Array.isArray(data.pendingTeamInvites)) {
+      this.setCachedPendingTeamInvites(data.pendingTeamInvites as TeamInvite[]);
+    }
     this.cachedOutputs = [];
     this.cachedHistory = [];
-    this.fetchOutputs(data.organization?.id).catch(() => {});
+    if (data.organization?.id) {
+      await Promise.allSettled([
+        this.fetchOutputs(data.organization.id),
+        this.fetchHistory(data.organization.id),
+      ]);
+    }
     return {
       user: data.user as User,
       organization: data.organization as Organization,
+      teams: (data.teams || []) as TeamSummary[],
+      pendingTeamInvites: (data.pendingTeamInvites || []) as TeamInvite[],
     };
   }
 

@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useMemo } from 'react';
-import { User, Organization, SavedOutput, TeamMember } from '../types';
+import { User, Organization, SavedOutput, TeamMember, TeamSummary } from '../types';
 import { dataService } from '../services/dataService';
 import { FormattedOutput } from './FormattedOutput';
 import { copyFormattedOutput, renderMarkdownToHtml } from '../utils/exportFormatting';
@@ -21,6 +21,7 @@ import {
   Save,
   Eye,
   Users,
+  FolderInput,
 } from 'lucide-react';
 
 interface LibraryViewProps {
@@ -36,6 +37,7 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
 }) => {
   const [outputs, setOutputs] = useState<SavedOutput[]>(() => dataService.getOutputs(user.id));
   const [teamMembers, setTeamMembers] = useState<TeamMember[]>([]);
+  const [userTeams, setUserTeams] = useState<TeamSummary[]>(() => dataService.getCachedTeams());
   const [orgOwnerId, setOrgOwnerId] = useState<string>(organization?.ownerId || '');
   const [scopeFilter, setScopeFilter] = useState<'all' | 'mine'>('all');
   const [titleSearch, setTitleSearch] = useState('');
@@ -47,9 +49,24 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
   const [editContent, setEditContent] = useState('');
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [copySuccessBanner, setCopySuccessBanner] = useState<string | null>(null);
+  const [copyTeamMenuItemId, setCopyTeamMenuItemId] = useState<string | null>(null);
+  const [modalCopyTeamOpen, setModalCopyTeamOpen] = useState(false);
+  const [copyingToTeamId, setCopyingToTeamId] = useState<string | null>(null);
+  const [copyErrorBanner, setCopyErrorBanner] = useState<string | null>(null);
+
+  const activeOrgId = organization?.id || user.organizationId || `org_${user.id}`;
+  const otherTeams = useMemo(
+    () => userTeams.filter((t) => t.id !== activeOrgId),
+    [userTeams, activeOrgId]
+  );
 
   useEffect(() => {
     let active = true;
+    setSelectedOutput(null);
+    setIsEditing(false);
+    setCopyTeamMenuItemId(null);
+    setModalCopyTeamOpen(false);
+
     dataService
       .fetchOutputs(user.organizationId || organization?.id)
       .then((list) => {
@@ -65,6 +82,14 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
         if (team.organization?.ownerId) {
           setOrgOwnerId(team.organization.ownerId);
         }
+      })
+      .catch(() => {});
+
+    dataService
+      .fetchTeams()
+      .then((res) => {
+        if (!active) return;
+        setUserTeams(res.teams || []);
       })
       .catch(() => {});
 
@@ -152,11 +177,14 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
     setEditTitle(item.title);
     setEditContent(item.content);
     setIsEditing(startEditing && canEditOrDelete(item));
+    setModalCopyTeamOpen(false);
+    setCopyTeamMenuItemId(null);
   };
 
   const handleCloseModal = () => {
     setSelectedOutput(null);
     setIsEditing(false);
+    setModalCopyTeamOpen(false);
   };
 
   const handleSaveEdit = () => {
@@ -182,6 +210,7 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
   const handleSaveCopy = (item: SavedOutput) => {
     const copied = dataService.copyOutput(item, user);
     refreshOutputs();
+    setCopyErrorBanner(null);
     setCopySuccessBanner(`Saved your editable copy: "${copied.title}"`);
     setTimeout(() => setCopySuccessBanner(null), 3500);
     if (selectedOutput?.id === item.id) {
@@ -189,6 +218,23 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
       setEditTitle(copied.title);
       setEditContent(copied.content);
       setIsEditing(false);
+    }
+  };
+
+  const handleCopyToOtherTeam = async (item: SavedOutput, targetTeam: TeamSummary) => {
+    if (copyingToTeamId) return;
+    try {
+      setCopyingToTeamId(targetTeam.id);
+      setCopyErrorBanner(null);
+      await dataService.copyOutputToTeam(item, targetTeam.id, user);
+      setCopyTeamMenuItemId(null);
+      setModalCopyTeamOpen(false);
+      setCopySuccessBanner(`Copied "${item.title}" to team "${targetTeam.name}".`);
+      setTimeout(() => setCopySuccessBanner(null), 3500);
+    } catch (err: any) {
+      setCopyErrorBanner(err?.message || `Failed to copy "${item.title}" to ${targetTeam.name}.`);
+    } finally {
+      setCopyingToTeamId(null);
     }
   };
 
@@ -298,6 +344,15 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
         <div className="p-3 bg-emerald-50 border border-emerald-200 rounded-2xl text-xs text-emerald-800 font-semibold flex items-center gap-2">
           <Check className="w-4 h-4 text-emerald-600 shrink-0" />
           <span>{copySuccessBanner}</span>
+        </div>
+      )}
+
+      {copyErrorBanner && (
+        <div className="p-3 bg-rose-50 border border-rose-200 rounded-2xl text-xs text-rose-800 font-semibold flex items-center justify-between gap-2">
+          <span>{copyErrorBanner}</span>
+          <button onClick={() => setCopyErrorBanner(null)} className="text-rose-900 font-bold">
+            &times;
+          </button>
         </div>
       )}
 
@@ -435,7 +490,7 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
                     <ExternalLink className="w-3 h-3" />
                   </button>
 
-                  <div className="flex items-center gap-1">
+                  <div className="flex items-center gap-1 relative">
                     <button
                       onClick={() => handleSaveCopy(item)}
                       className="p-1.5 rounded-lg text-slate-500 hover:text-emerald-700 hover:bg-emerald-50 transition-colors"
@@ -443,6 +498,53 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
                     >
                       <CopyPlus className="w-3.5 h-3.5" />
                     </button>
+
+                    {otherTeams.length > 0 && (
+                      <div className="relative">
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setCopyTeamMenuItemId(copyTeamMenuItemId === item.id ? null : item.id)
+                          }
+                          className="p-1.5 rounded-lg text-slate-500 hover:text-indigo-700 hover:bg-indigo-50 transition-colors cursor-pointer"
+                          title="Copy to another team"
+                        >
+                          <FolderInput className="w-3.5 h-3.5" />
+                        </button>
+
+                        {copyTeamMenuItemId === item.id && (
+                          <>
+                            <div
+                              className="fixed inset-0 z-30"
+                              onClick={() => setCopyTeamMenuItemId(null)}
+                            />
+                            <div className="absolute right-0 bottom-full mb-1.5 w-56 bg-white rounded-xl shadow-xl border border-slate-200 z-40 p-1.5 text-xs">
+                              <div className="px-2 py-1 text-[10px] font-bold uppercase tracking-wider text-slate-400">
+                                Copy to another team
+                              </div>
+                              <div className="max-h-48 overflow-y-auto space-y-0.5">
+                                {otherTeams.map((targetTeam) => (
+                                  <button
+                                    key={targetTeam.id}
+                                    type="button"
+                                    disabled={Boolean(copyingToTeamId)}
+                                    onClick={() => handleCopyToOtherTeam(item, targetTeam)}
+                                    className="w-full text-left px-2.5 py-1.5 rounded-lg hover:bg-slate-50 text-slate-800 font-medium flex items-center justify-between gap-2 cursor-pointer disabled:opacity-50"
+                                  >
+                                    <span className="truncate">{targetTeam.name}</span>
+                                    {targetTeam.isPersonal && (
+                                      <span className="text-[9px] uppercase font-bold text-slate-400 shrink-0">
+                                        Personal
+                                      </span>
+                                    )}
+                                  </button>
+                                ))}
+                              </div>
+                            </div>
+                          </>
+                        )}
+                      </div>
+                    )}
 
                     {modifiable && (
                       <button
@@ -604,6 +706,51 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
                       <CopyPlus className="w-3.5 h-3.5" />
                       <span>Save a copy</span>
                     </button>
+
+                    {otherTeams.length > 0 && (
+                      <div className="relative">
+                        <button
+                          type="button"
+                          onClick={() => setModalCopyTeamOpen(!modalCopyTeamOpen)}
+                          className="px-3 py-1.5 rounded-xl border border-indigo-200 bg-indigo-50 hover:bg-indigo-100 text-xs font-semibold text-indigo-800 flex items-center gap-1.5 cursor-pointer"
+                        >
+                          <FolderInput className="w-3.5 h-3.5" />
+                          <span>Copy to another team</span>
+                        </button>
+
+                        {modalCopyTeamOpen && (
+                          <>
+                            <div
+                              className="fixed inset-0 z-30"
+                              onClick={() => setModalCopyTeamOpen(false)}
+                            />
+                            <div className="absolute right-0 bottom-full mb-1.5 w-60 bg-white rounded-xl shadow-xl border border-slate-200 z-40 p-1.5 text-xs">
+                              <div className="px-2 py-1 text-[10px] font-bold uppercase tracking-wider text-slate-400">
+                                Select destination team
+                              </div>
+                              <div className="max-h-52 overflow-y-auto space-y-0.5">
+                                {otherTeams.map((targetTeam) => (
+                                  <button
+                                    key={targetTeam.id}
+                                    type="button"
+                                    disabled={Boolean(copyingToTeamId)}
+                                    onClick={() => handleCopyToOtherTeam(selectedOutput, targetTeam)}
+                                    className="w-full text-left px-2.5 py-2 rounded-lg hover:bg-slate-50 text-slate-800 font-medium flex items-center justify-between gap-2 cursor-pointer disabled:opacity-50"
+                                  >
+                                    <span className="truncate">{targetTeam.name}</span>
+                                    {targetTeam.isPersonal && (
+                                      <span className="text-[9px] uppercase font-bold text-slate-400 shrink-0">
+                                        Personal
+                                      </span>
+                                    )}
+                                  </button>
+                                ))}
+                              </div>
+                            </div>
+                          </>
+                        )}
+                      </div>
+                    )}
 
                     {canEditOrDelete(selectedOutput) && (
                       <button

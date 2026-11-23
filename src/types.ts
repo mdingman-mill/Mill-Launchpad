@@ -26,6 +26,7 @@ export interface Organization {
   name: string;
   ownerId: string;
   memberIds: string[];
+  memberRoles?: Record<string, OrgRole>;
   planId: PlanId;
   seatLimit: number;
   generationsUsedThisMonth: number;
@@ -40,6 +41,20 @@ export interface Organization {
   website?: string;
   createdAt?: string;
   updatedAt?: string;
+}
+
+export interface TeamSummary {
+  id: string;
+  name: string;
+  ownerId: string;
+  planId: PlanId;
+  seatLimit: number;
+  memberCount: number;
+  seatsUsed: number;
+  orgRole: OrgRole;
+  isPersonal: boolean;
+  generationsUsedThisMonth: number;
+  bonusGenerations?: number;
 }
 
 export interface TeamMember {
@@ -62,11 +77,13 @@ export interface TeamInvite {
   role: 'member';
   invitedBy: string;
   invitedByEmail?: string;
-  status: 'pending' | 'accepted' | 'revoked' | 'expired';
+  status: 'pending' | 'accepted' | 'declined' | 'revoked' | 'expired';
   createdAt: string;
   expiresAt?: string | null;
   acceptedAt?: string | null;
   acceptedBy?: string | null;
+  declinedAt?: string | null;
+  declinedBy?: string | null;
   revokedAt?: string | null;
 }
 
@@ -74,6 +91,13 @@ export interface TeamState {
   organization: Organization;
   members: TeamMember[];
   invites: TeamInvite[];
+}
+
+export interface UserTeamsResponse {
+  teams: TeamSummary[];
+  pendingInvites: TeamInvite[];
+  activeOrganizationId?: string;
+  organizationIds?: string[];
 }
 
 export interface AdminOrganizationSummary extends Organization {
@@ -105,6 +129,7 @@ export interface User {
     expYear: string;
   };
   organizationId?: string;
+  organizationIds?: string[];
   orgRole?: OrgRole;
   teamMembers?: Array<{
     email: string;

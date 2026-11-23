@@ -1,6 +1,6 @@
 import { signInWithPopup, signOut as firebaseSignOut, onAuthStateChanged, User as FirebaseUser } from 'firebase/auth';
 import { auth, googleProvider } from '../firebase';
-import { User, Organization } from '../types';
+import { User, Organization, TeamSummary, TeamInvite } from '../types';
 import { dataService } from './dataService';
 
 type AuthListener = (user: User | null) => void;
@@ -90,6 +90,12 @@ class AuthService {
     }
     if (parsed.organization) {
       dataService.setCachedOrganization(parsed.organization as Organization);
+    }
+    if (Array.isArray(parsed.teams)) {
+      dataService.setCachedTeams(parsed.teams as TeamSummary[]);
+    }
+    if (Array.isArray(parsed.pendingTeamInvites)) {
+      dataService.setCachedPendingTeamInvites(parsed.pendingTeamInvites as TeamInvite[]);
     }
     return parsed.user as User;
   }

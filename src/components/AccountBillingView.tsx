@@ -5,6 +5,7 @@ import {
   TeamMember,
   TeamInvite,
   TeamState,
+  TeamSummary,
   Invoice,
   AuditLogEntry,
 } from '../types';
@@ -42,22 +43,33 @@ import {
   LogOut,
   ArrowRightLeft,
   RefreshCw,
+  Trash2,
+  Lock,
 } from 'lucide-react';
+
+type TabKey = 'plan' | 'teams' | 'activity' | 'profile' | 'billing' | 'team' | 'danger';
 
 interface AccountBillingViewProps {
   user: User;
   organization?: Organization | null;
+  teams?: TeamSummary[];
+  pendingTeamInvites?: TeamInvite[];
+  requestedTab?: { tab: TabKey; key: number };
   inviteOnlyMode?: boolean;
   onOpenUpgrade: () => void;
   onEditProfile: () => void;
   onViewReceipt: (invoice: Invoice) => void;
   onUserUpdated: (user: User) => void;
   onOrganizationUpdated?: (org: Organization) => void;
+  onTeamsChanged?: (teams: TeamSummary[], pendingInvites: TeamInvite[]) => void;
+  onSwitchTeam?: (organizationId: string) => Promise<void>;
+  onCreateTeam?: (name: string) => Promise<void>;
+  onAcceptTeamInvite?: (inviteId: string) => Promise<void>;
+  onDeclineTeamInvite?: (inviteId: string) => Promise<void>;
   onNavigateToTools?: (toolId?: string) => void;
   onNavigateToLibrary?: () => void;
 }
 
-type TabKey = 'plan' | 'activity' | 'profile' | 'billing' | 'team' | 'danger';
 type ActivityCategory = 'all' | 'generation' | 'plan' | 'saved' | 'workspace';
 
 function formatRelativeTime(dateString: string): string {
@@ -191,8 +203,7 @@ function classifyActivity(log: AuditLogEntry): ActivityClassification {
   }
 
   if (
-    action.startsWith('TEAM_MEMBER_') ||
-    action.startsWith('TEAM_INVITE_') ||
+    action.startsWith('TEAM_') ||
     action === 'OWNERSHIP_TRANSFERRED' ||
     action === 'PROFILE_CONFIGURED'
   ) {
@@ -204,7 +215,19 @@ function classifyActivity(log: AuditLogEntry): ActivityClassification {
           ? 'Organization Profile Configured'
           : action === 'OWNERSHIP_TRANSFERRED'
           ? 'Workspace Ownership Transferred'
-          : 'Team Seat Updated',
+          : action === 'TEAM_CREATED'
+          ? 'Team Created'
+          : action === 'TEAM_DELETED'
+          ? 'Team Deleted'
+          : action === 'TEAM_RENAMED'
+          ? 'Team Renamed'
+          : action === 'TEAM_SWITCHED'
+          ? 'Active Team Switched'
+          : action === 'TEAM_INVITE_ACCEPTED'
+          ? 'Team Invite Accepted'
+          : action === 'TEAM_INVITE_DECLINED'
+          ? 'Team Invite Declined'
+          : 'Team Updated',
       badgeStyle: { bg: 'bg-slate-100', text: 'text-slate-700', border: 'border-slate-200' },
       iconType: 'team',
     };
@@ -222,19 +245,40 @@ function classifyActivity(log: AuditLogEntry): ActivityClassification {
 export const AccountBillingView: React.FC<AccountBillingViewProps> = ({
   user,
   organization,
+  teams: propTeams,
+  pendingTeamInvites: propPendingInvites,
+  requestedTab,
   inviteOnlyMode = false,
   onOpenUpgrade,
   onEditProfile,
   onViewReceipt,
   onUserUpdated,
   onOrganizationUpdated,
+  onTeamsChanged,
+  onSwitchTeam,
+  onCreateTeam,
+  onAcceptTeamInvite,
+  onDeclineTeamInvite,
   onNavigateToTools,
   onNavigateToLibrary,
 }) => {
-  const [activeTab, setActiveTab] = useState<TabKey>('plan');
+  const [activeTab, setActiveTab] = useState<TabKey>(requestedTab?.tab || 'plan');
   const [invoices] = useState<Invoice[]>(() => dataService.getInvoices(user.id));
   const [inviteEmail, setInviteEmail] = useState('');
   const [teamState, setTeamState] = useState<TeamState | null>(null);
+  const [managedTeamId, setManagedTeamId] = useState<string | null>(null);
+  const [localTeams, setLocalTeams] = useState<TeamSummary[]>(
+    () => propTeams || dataService.getCachedTeams()
+  );
+  const [localPendingInvites, setLocalPendingInvites] = useState<TeamInvite[]>(
+    () => propPendingInvites || dataService.getCachedPendingTeamInvites()
+  );
+  const [newTeamNameInput, setNewTeamNameInput] = useState('');
+  const [renamingTeamId, setRenamingTeamId] = useState<string | null>(null);
+  const [renameTeamDraft, setRenameTeamDraft] = useState('');
+  const [teamsActionError, setTeamsActionError] = useState<string | null>(null);
+  const [teamsBusyKey, setTeamsBusyKey] = useState<string | null>(null);
+
   const [loadingTeam, setLoadingTeam] = useState(false);
   const [teamError, setTeamError] = useState<string | null>(null);
   const [teamActionBusy, setTeamActionBusy] = useState(false);
@@ -248,25 +292,61 @@ export const AccountBillingView: React.FC<AccountBillingViewProps> = ({
   const [copiedLogId, setCopiedLogId] = useState<string | null>(null);
   const [isExportingPdf, setIsExportingPdf] = useState(false);
 
-  const loadTeamState = useCallback(async () => {
-    try {
-      setLoadingTeam(true);
-      setTeamError(null);
-      const state = await dataService.fetchTeam();
-      setTeamState(state);
-      if (state.organization) {
-        onOrganizationUpdated?.(state.organization);
-      }
-    } catch (err: any) {
-      setTeamError(err?.message || 'Unable to load team details.');
-    } finally {
-      setLoadingTeam(false);
-    }
-  }, [onOrganizationUpdated]);
+  useEffect(() => {
+    if (propTeams) setLocalTeams(propTeams);
+  }, [propTeams]);
 
   useEffect(() => {
+    if (propPendingInvites) setLocalPendingInvites(propPendingInvites);
+  }, [propPendingInvites]);
+
+  const refreshUserTeams = useCallback(async () => {
+    try {
+      const res = await dataService.fetchTeams();
+      setLocalTeams(res.teams || []);
+      setLocalPendingInvites(res.pendingInvites || []);
+      onTeamsChanged?.(res.teams || [], res.pendingInvites || []);
+    } catch {
+      // Background sync
+    }
+  }, [onTeamsChanged]);
+
+  const loadTeamState = useCallback(
+    async (targetOrgId?: string) => {
+      try {
+        setLoadingTeam(true);
+        setTeamError(null);
+        const state = await dataService.fetchTeam(targetOrgId);
+        setTeamState(state);
+        if (state.organization && (!targetOrgId || targetOrgId === user.organizationId)) {
+          onOrganizationUpdated?.(state.organization);
+        }
+      } catch (err: any) {
+        setTeamError(err?.message || 'Unable to load team details.');
+      } finally {
+        setLoadingTeam(false);
+      }
+    },
+    [onOrganizationUpdated, user.organizationId]
+  );
+
+  useEffect(() => {
+    setManagedTeamId(null);
     loadTeamState();
+    refreshUserTeams();
   }, [user.id, user.organizationId]);
+
+  useEffect(() => {
+    if (requestedTab?.tab) {
+      setActiveTab(requestedTab.tab);
+      if (requestedTab.tab === 'teams') {
+        refreshUserTeams();
+      } else if (requestedTab.tab === 'team') {
+        setManagedTeamId(null);
+        loadTeamState();
+      }
+    }
+  }, [requestedTab?.key]);
 
   // Sync latest activities whenever the view opens or changes
   const refreshActivities = () => {
@@ -276,14 +356,17 @@ export const AccountBillingView: React.FC<AccountBillingViewProps> = ({
       .catch(() => setActivities(dataService.getUserActivity(user.id)));
   };
 
-  const activeOrg = teamState?.organization || organization || null;
+  const activeWorkspaceOrg = organization || null;
+  const inspectedOrg = teamState?.organization || activeWorkspaceOrg || null;
+  const targetTeamOrgId = managedTeamId || inspectedOrg?.id || user.organizationId || `org_${user.id}`;
+  const isPersonalInspectedOrg = targetTeamOrgId === `org_${user.id}`;
   const members: TeamMember[] = teamState?.members || [
     {
       id: user.id,
       name: user.name,
       email: user.email,
       avatar: user.avatar,
-      orgRole: user.orgRole || (activeOrg?.ownerId && activeOrg.ownerId !== user.id ? 'member' : 'owner'),
+      orgRole: user.orgRole || (inspectedOrg?.ownerId && inspectedOrg.ownerId !== user.id ? 'member' : 'owner'),
       generationsUsedThisMonth: user.generationsUsedThisMonth || 0,
       totalGenerations: user.totalGenerations ?? user.generationsUsedThisMonth ?? 0,
       signupDate: user.signupDate,
@@ -293,24 +376,39 @@ export const AccountBillingView: React.FC<AccountBillingViewProps> = ({
   const allTeamInvites: TeamInvite[] = teamState?.invites || [];
   const pendingTeamInvites = allTeamInvites.filter((inv) => inv.status === 'pending');
 
-  const effectiveOrgRole =
-    activeOrg?.ownerId === user.id ? 'owner' : user.orgRole || 'owner';
-  const isOwner = effectiveOrgRole === 'owner';
+  const activeWorkspaceRole =
+    activeWorkspaceOrg?.ownerId === user.id ? 'owner' : user.orgRole || 'owner';
+  const isActiveWorkspaceOwner = activeWorkspaceRole === 'owner';
 
-  const effectivePlanId = activeOrg?.planId || user.planId;
+  const inspectedOrgRole =
+    inspectedOrg?.ownerId === user.id ? 'owner' : inspectedOrg?.memberRoles?.[user.id] || 'member';
+  const isInspectedOwner = inspectedOrgRole === 'owner';
+
+  const effectivePlanId = activeWorkspaceOrg?.planId || user.planId;
   const plan = billingService.getPlanById(effectivePlanId);
-  const bonusGenerations = activeOrg?.bonusGenerations ?? user.bonusGenerations ?? 0;
+  const inspectedPlan = billingService.getPlanById(inspectedOrg?.planId || effectivePlanId);
+  const bonusGenerations = activeWorkspaceOrg?.bonusGenerations ?? user.bonusGenerations ?? 0;
   const maxLimit = (plan?.generationLimit || 50) + bonusGenerations;
-  const currentUsage = activeOrg?.generationsUsedThisMonth ?? user.generationsUsedThisMonth ?? 0;
-  const billingResetDate = activeOrg?.billingResetDate || user.billingResetDate;
+  const currentUsage = activeWorkspaceOrg?.generationsUsedThisMonth ?? user.generationsUsedThisMonth ?? 0;
+  const billingResetDate = activeWorkspaceOrg?.billingResetDate || user.billingResetDate;
   const usagePercentage = Math.min(Math.round((currentUsage / maxLimit) * 100), 100);
 
-  const seatLimit = activeOrg?.seatLimit ?? (effectivePlanId === 'team' || effectivePlanId === 'complimentary' ? 5 : 1);
+  const seatLimit = inspectedOrg?.seatLimit ?? (effectivePlanId === 'team' || effectivePlanId === 'complimentary' ? 5 : 1);
   const seatsUsed = members.length + pendingTeamInvites.length;
   const isAtSeatLimit = seatsUsed >= seatLimit;
 
-  const isNonprofit = user.organizationProfile?.type === 'Nonprofit';
+  const isNonprofit = (user.organizationProfile?.type || activeWorkspaceOrg?.type) === 'Nonprofit';
   const hasDiscount = isNonprofit && user.nonprofitDiscountApproved;
+
+  const orderedTeams = useMemo(() => {
+    const list = [...localTeams];
+    list.sort((a, b) => {
+      if (a.isPersonal && !b.isPersonal) return -1;
+      if (!a.isPersonal && b.isPersonal) return 1;
+      return (a.name || '').localeCompare(b.name || '');
+    });
+    return list;
+  }, [localTeams]);
 
   // Filtered Activities
   const { filteredActivities, counts } = useMemo(() => {
@@ -411,11 +509,13 @@ export const AccountBillingView: React.FC<AccountBillingViewProps> = ({
     try {
       setTeamActionBusy(true);
       setTeamError(null);
-      await dataService.createTeamInvite(cleanedEmail);
+      await dataService.createTeamInvite(cleanedEmail, targetTeamOrgId);
       setInviteEmail('');
-      await loadTeamState();
+      await Promise.all([loadTeamState(targetTeamOrgId), refreshUserTeams()]);
       refreshActivities();
-      setFeedbackMsg(`Team invitation created for ${cleanedEmail}. They will join automatically upon signing in with that Google account.`);
+      setFeedbackMsg(
+        `Team invitation sent to ${cleanedEmail}. They can accept or decline it from their team switcher.`
+      );
     } catch (err: any) {
       setTeamError(err?.message || 'Unable to send team invite.');
     } finally {
@@ -428,8 +528,8 @@ export const AccountBillingView: React.FC<AccountBillingViewProps> = ({
     try {
       setTeamActionBusy(true);
       setTeamError(null);
-      await dataService.revokeTeamInvite(inviteId);
-      await loadTeamState();
+      await dataService.revokeTeamInvite(inviteId, targetTeamOrgId);
+      await Promise.all([loadTeamState(targetTeamOrgId), refreshUserTeams()]);
       refreshActivities();
       setFeedbackMsg(`Revoked pending invitation for ${email}.`);
     } catch (err: any) {
@@ -442,7 +542,7 @@ export const AccountBillingView: React.FC<AccountBillingViewProps> = ({
   const handleRemoveMember = async (member: TeamMember) => {
     if (
       !window.confirm(
-        `Remove ${member.name} (${member.email}) from your team? They will be moved to a new personal Free Starter organization.`
+        `Remove ${member.name} (${member.email}) from ${inspectedOrg?.name || 'this team'}?`
       )
     ) {
       return;
@@ -450,8 +550,8 @@ export const AccountBillingView: React.FC<AccountBillingViewProps> = ({
     try {
       setTeamActionBusy(true);
       setTeamError(null);
-      await dataService.removeTeamMember(member.id);
-      await loadTeamState();
+      await dataService.removeTeamMember(member.id, targetTeamOrgId);
+      await Promise.all([loadTeamState(targetTeamOrgId), refreshUserTeams()]);
       refreshActivities();
       setFeedbackMsg(`${member.name} was removed from the team.`);
     } catch (err: any) {
@@ -472,9 +572,11 @@ export const AccountBillingView: React.FC<AccountBillingViewProps> = ({
     try {
       setTeamActionBusy(true);
       setTeamError(null);
-      await dataService.transferOwnership(member.id);
-      onUserUpdated({ ...user, orgRole: 'member' });
-      await loadTeamState();
+      await dataService.transferOwnership(member.id, targetTeamOrgId);
+      if (targetTeamOrgId === (user.organizationId || `org_${user.id}`)) {
+        onUserUpdated({ ...user, orgRole: 'member' });
+      }
+      await Promise.all([loadTeamState(targetTeamOrgId), refreshUserTeams()]);
       refreshActivities();
       setFeedbackMsg(`Organization ownership transferred to ${member.name}.`);
     } catch (err: any) {
@@ -484,27 +586,180 @@ export const AccountBillingView: React.FC<AccountBillingViewProps> = ({
     }
   };
 
-  const handleLeaveTeam = async () => {
+  const handleLeaveTeam = async (orgIdOverride?: string, orgNameOverride?: string) => {
+    const leaveId = orgIdOverride || targetTeamOrgId;
+    const leaveName = orgNameOverride || inspectedOrg?.name || 'this team';
+    if (leaveId === `org_${user.id}`) return;
     if (
       !window.confirm(
-        `Leave ${activeOrg?.name || 'this team'}? You will be placed into a new personal Free Starter organization.`
+        `Leave ${leaveName}? You will lose access to its shared library and history.`
       )
     ) {
       return;
     }
     try {
       setTeamActionBusy(true);
+      setTeamsBusyKey(`leave:${leaveId}`);
       setTeamError(null);
-      const res = await dataService.leaveTeam();
+      setTeamsActionError(null);
+      const res = await dataService.leaveTeam(leaveId);
       onUserUpdated(res.user);
       onOrganizationUpdated?.(res.organization);
-      await loadTeamState();
+      setLocalTeams(res.teams);
+      setLocalPendingInvites(res.pendingTeamInvites);
+      onTeamsChanged?.(res.teams, res.pendingTeamInvites);
+      setManagedTeamId(null);
+      await loadTeamState(res.organization.id);
       refreshActivities();
-      setFeedbackMsg(`You left the team and now have your own personal workspace (${res.organization.name}).`);
+      setFeedbackMsg(`You left ${leaveName}. Active workspace: ${res.organization.name}.`);
     } catch (err: any) {
-      setTeamError(err?.message || 'Unable to leave team.');
+      const msg = err?.message || 'Unable to leave team.';
+      setTeamError(msg);
+      setTeamsActionError(msg);
     } finally {
       setTeamActionBusy(false);
+      setTeamsBusyKey(null);
+    }
+  };
+
+  const handleCreateNewTeam = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const cleaned = newTeamNameInput.trim();
+    if (!cleaned || teamsBusyKey) return;
+    try {
+      setTeamsBusyKey('create');
+      setTeamsActionError(null);
+      if (onCreateTeam) {
+        await onCreateTeam(cleaned);
+      } else {
+        const res = await dataService.createTeam(cleaned, true);
+        onUserUpdated(res.user);
+        onOrganizationUpdated?.(res.organization);
+        setLocalTeams(res.teams);
+        setLocalPendingInvites(res.pendingTeamInvites);
+        onTeamsChanged?.(res.teams, res.pendingTeamInvites);
+      }
+      setNewTeamNameInput('');
+      setFeedbackMsg(`Created team "${cleaned}" and switched into it.`);
+    } catch (err: any) {
+      setTeamsActionError(err?.message || 'Unable to create team.');
+    } finally {
+      setTeamsBusyKey(null);
+    }
+  };
+
+  const handleSwitchTeamFromTab = async (orgId: string, orgName: string) => {
+    if (teamsBusyKey) return;
+    try {
+      setTeamsBusyKey(`switch:${orgId}`);
+      setTeamsActionError(null);
+      if (onSwitchTeam) {
+        await onSwitchTeam(orgId);
+      } else {
+        const res = await dataService.switchTeam(orgId);
+        onUserUpdated(res.user);
+        onOrganizationUpdated?.(res.organization);
+        setLocalTeams(res.teams);
+        setLocalPendingInvites(res.pendingTeamInvites);
+        onTeamsChanged?.(res.teams, res.pendingTeamInvites);
+      }
+      setFeedbackMsg(`Switched active workspace to ${orgName}.`);
+    } catch (err: any) {
+      setTeamsActionError(err?.message || 'Unable to switch team.');
+    } finally {
+      setTeamsBusyKey(null);
+    }
+  };
+
+  const handleRenameTeamSubmit = async (teamId: string) => {
+    const cleaned = renameTeamDraft.trim();
+    if (!cleaned || teamsBusyKey) return;
+    try {
+      setTeamsBusyKey(`rename:${teamId}`);
+      setTeamsActionError(null);
+      const updatedOrg = await dataService.renameTeam(cleaned, teamId);
+      if (updatedOrg.id === (user.organizationId || `org_${user.id}`)) {
+        onOrganizationUpdated?.(updatedOrg);
+        if (user.organizationProfile) {
+          onUserUpdated({
+            ...user,
+            organizationProfile: { ...user.organizationProfile, orgName: updatedOrg.name },
+          });
+        }
+      }
+      await refreshUserTeams();
+      if (managedTeamId === teamId || teamId === user.organizationId) {
+        await loadTeamState(teamId);
+      }
+      setRenamingTeamId(null);
+      setRenameTeamDraft('');
+      setFeedbackMsg(`Renamed team to "${updatedOrg.name}".`);
+    } catch (err: any) {
+      setTeamsActionError(err?.message || 'Unable to rename team.');
+    } finally {
+      setTeamsBusyKey(null);
+    }
+  };
+
+  const handleDeleteTeam = async (team: TeamSummary) => {
+    if (team.isPersonal) return;
+    if (
+      !window.confirm(
+        `Permanently delete team "${team.name}"? All members will lose access and any shared library items or history for this team will be erased.`
+      )
+    ) {
+      return;
+    }
+    try {
+      setTeamsBusyKey(`delete:${team.id}`);
+      setTeamsActionError(null);
+      const res = await dataService.deleteTeam(team.id);
+      onUserUpdated(res.user);
+      onOrganizationUpdated?.(res.organization);
+      setLocalTeams(res.teams);
+      setLocalPendingInvites(res.pendingTeamInvites);
+      onTeamsChanged?.(res.teams, res.pendingTeamInvites);
+      if (managedTeamId === team.id) setManagedTeamId(null);
+      await loadTeamState(res.organization.id);
+      setFeedbackMsg(`Deleted team "${team.name}".`);
+    } catch (err: any) {
+      setTeamsActionError(err?.message || 'Unable to delete team.');
+    } finally {
+      setTeamsBusyKey(null);
+    }
+  };
+
+  const handleInviteDecision = async (inv: TeamInvite, decision: 'accept' | 'decline') => {
+    if (teamsBusyKey) return;
+    try {
+      setTeamsBusyKey(`invite:${inv.id}`);
+      setTeamsActionError(null);
+      if (decision === 'accept') {
+        if (onAcceptTeamInvite) {
+          await onAcceptTeamInvite(inv.id);
+        } else {
+          const res = await dataService.acceptTeamInvite(inv.id);
+          onUserUpdated(res.user);
+          setLocalTeams(res.teams);
+          setLocalPendingInvites(res.pendingTeamInvites);
+          onTeamsChanged?.(res.teams, res.pendingTeamInvites);
+        }
+        setFeedbackMsg(`Joined "${inv.orgName || 'Team Workspace'}". You can switch to it anytime.`);
+      } else {
+        if (onDeclineTeamInvite) {
+          await onDeclineTeamInvite(inv.id);
+        } else {
+          const res = await dataService.declineTeamInvite(inv.id);
+          setLocalTeams(res.teams);
+          setLocalPendingInvites(res.pendingTeamInvites);
+          onTeamsChanged?.(res.teams, res.pendingTeamInvites);
+        }
+        setFeedbackMsg(`Declined invitation to "${inv.orgName || 'Team Workspace'}".`);
+      }
+    } catch (err: any) {
+      setTeamsActionError(err?.message || `Unable to ${decision} invitation.`);
+    } finally {
+      setTeamsBusyKey(null);
     }
   };
 
@@ -604,10 +859,18 @@ export const AccountBillingView: React.FC<AccountBillingViewProps> = ({
       <div className="flex items-center gap-2 border-b border-slate-200 pb-px overflow-x-auto">
         {[
           { key: 'plan', label: 'Plan & Usage', icon: Zap },
-          { key: 'activity', label: `Activity History (${activities.length})`, icon: History },
-          { key: 'profile', label: 'Organization Profile', icon: Building2 },
-          { key: 'billing', label: 'Billing & Invoices', icon: CreditCard },
+          {
+            key: 'teams',
+            label:
+              localPendingInvites.length > 0
+                ? `Manage Teams (${orderedTeams.length}) · ${localPendingInvites.length} invite`
+                : `Manage Teams (${orderedTeams.length || 1})`,
+            icon: Building2,
+          },
           { key: 'team', label: `Team Seats (${members.length}/${seatLimit})`, icon: Users },
+          { key: 'profile', label: 'Organization Profile', icon: ShieldCheck },
+          { key: 'activity', label: `Activity History (${activities.length})`, icon: History },
+          { key: 'billing', label: 'Billing & Invoices', icon: CreditCard },
           { key: 'danger', label: 'Danger Zone', icon: AlertTriangle },
         ].map((tab) => {
           const Icon = tab.icon;
@@ -618,7 +881,12 @@ export const AccountBillingView: React.FC<AccountBillingViewProps> = ({
               onClick={() => {
                 setActiveTab(tab.key as TabKey);
                 if (tab.key === 'activity') refreshActivities();
-                if (tab.key === 'team' || tab.key === 'plan') loadTeamState();
+                if (tab.key === 'teams') refreshUserTeams();
+                if (tab.key === 'team') {
+                  setManagedTeamId(null);
+                  loadTeamState();
+                }
+                if (tab.key === 'plan') loadTeamState();
               }}
               className={`flex items-center gap-2 px-4 py-2.5 text-xs font-bold border-b-2 transition-all whitespace-nowrap ${
                 isActive
@@ -640,12 +908,12 @@ export const AccountBillingView: React.FC<AccountBillingViewProps> = ({
             <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
               <div>
                 <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400">
-                  Organization Subscription · {activeOrg?.name || user.organizationProfile?.orgName || 'Workspace'}
+                  Active Organization · {activeWorkspaceOrg?.name || user.organizationProfile?.orgName || 'Workspace'}
                 </span>
                 <h3 className="text-xl font-bold text-slate-900 font-heading mt-0.5 flex flex-wrap items-center gap-2">
                   <span>{plan?.name}</span>
                   <span className="px-2 py-0.5 rounded-md text-[10px] font-bold bg-slate-100 text-slate-700 border border-slate-200 uppercase">
-                    {isOwner ? 'Org Owner' : 'Org Member'}
+                    {isActiveWorkspaceOwner ? 'Org Owner' : 'Org Member'}
                   </span>
                   {hasDiscount && (
                     <span className="px-2 py-0.5 rounded-md text-[10px] font-bold bg-emerald-50 text-emerald-800 border border-emerald-200">
@@ -770,6 +1038,285 @@ export const AccountBillingView: React.FC<AccountBillingViewProps> = ({
                   })}
                 </div>
               )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Tab 1b: Manage Teams */}
+      {activeTab === 'teams' && (
+        <div className="space-y-6">
+          {teamsActionError && (
+            <div className="p-3 bg-rose-50 text-rose-800 text-xs rounded-xl border border-rose-200 flex items-center justify-between gap-2">
+              <div className="flex items-center gap-2">
+                <AlertTriangle className="w-4 h-4 text-rose-600 shrink-0" />
+                <span>{teamsActionError}</span>
+              </div>
+              <button onClick={() => setTeamsActionError(null)} className="font-bold text-rose-900">
+                &times;
+              </button>
+            </div>
+          )}
+
+          {/* Pending Team Invitations */}
+          {localPendingInvites.length > 0 && (
+            <div className="bg-amber-50/70 rounded-2xl p-5 border border-amber-200 space-y-3">
+              <div className="flex items-center justify-between">
+                <h3 className="text-sm font-bold text-slate-900 flex items-center gap-2">
+                  <Mail className="w-4 h-4 text-amber-600" />
+                  <span>Pending Team Invitations ({localPendingInvites.length})</span>
+                </h3>
+              </div>
+
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                {localPendingInvites.map((inv) => {
+                  const busy = teamsBusyKey === `invite:${inv.id}`;
+                  return (
+                    <div
+                      key={inv.id}
+                      className="p-4 rounded-xl bg-white border border-amber-200 flex flex-col justify-between gap-3"
+                    >
+                      <div>
+                        <div className="font-bold text-slate-900 text-sm">
+                          {inv.orgName || 'Team Workspace'}
+                        </div>
+                        <p className="text-xs text-slate-500 mt-0.5">
+                          Invited by <span className="font-mono">{inv.invitedByEmail || 'team owner'}</span>
+                        </p>
+                        {inv.expiresAt && (
+                          <p className="text-[11px] text-slate-400 mt-1">
+                            Expires {new Date(inv.expiresAt).toLocaleDateString()}
+                          </p>
+                        )}
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <button
+                          type="button"
+                          disabled={Boolean(teamsBusyKey)}
+                          onClick={() => handleInviteDecision(inv, 'accept')}
+                          className="flex-1 py-2 px-3 rounded-xl bg-slate-900 hover:bg-slate-800 disabled:opacity-50 text-white text-xs font-bold cursor-pointer"
+                        >
+                          {busy ? 'Joining...' : 'Accept Invite'}
+                        </button>
+                        <button
+                          type="button"
+                          disabled={Boolean(teamsBusyKey)}
+                          onClick={() => handleInviteDecision(inv, 'decline')}
+                          className="py-2 px-3 rounded-xl border border-slate-300 hover:bg-slate-50 disabled:opacity-50 text-slate-700 text-xs font-semibold cursor-pointer"
+                        >
+                          Decline
+                        </button>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
+          {/* Create Team Form */}
+          <div className="bg-white rounded-2xl p-6 border border-slate-200 shadow-sm space-y-4">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+              <div>
+                <h3 className="text-sm font-bold text-slate-900">Create a New Team</h3>
+                <p className="text-xs text-slate-500">
+                  Each team gets its own Free plan workspace, shared library, generation history, and brand profile.
+                </p>
+              </div>
+              <span className="text-xs font-mono font-bold text-slate-600">
+                {orderedTeams.length} / 10 teams
+              </span>
+            </div>
+
+            <form onSubmit={handleCreateNewTeam} className="flex flex-col sm:flex-row gap-2.5">
+              <input
+                type="text"
+                maxLength={120}
+                disabled={orderedTeams.length >= 10 || Boolean(teamsBusyKey)}
+                value={newTeamNameInput}
+                onChange={(e) => setNewTeamNameInput(e.target.value)}
+                placeholder={
+                  orderedTeams.length >= 10
+                    ? 'Maximum 10 teams reached — leave or delete a team first'
+                    : 'e.g. Q3 Campaign Team or Client Workspace'
+                }
+                className="flex-1 px-3.5 py-2 text-xs rounded-xl border border-slate-300 focus:outline-none focus:ring-2 focus:ring-rose-500 disabled:bg-slate-100"
+              />
+              <button
+                type="submit"
+                disabled={orderedTeams.length >= 10 || !newTeamNameInput.trim() || Boolean(teamsBusyKey)}
+                className="px-4 py-2 rounded-xl bg-slate-900 hover:bg-slate-800 disabled:opacity-50 text-white text-xs font-bold flex items-center justify-center gap-1.5 cursor-pointer"
+              >
+                <Plus className="w-4 h-4" />
+                <span>{teamsBusyKey === 'create' ? 'Creating...' : 'Create Team'}</span>
+              </button>
+            </form>
+          </div>
+
+          {/* All Teams List */}
+          <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
+            <div className="p-5 border-b border-slate-100 flex items-center justify-between">
+              <div>
+                <h3 className="text-sm font-bold text-slate-900">Your Teams ({orderedTeams.length})</h3>
+                <p className="text-xs text-slate-500">
+                  Switch workspaces, rename or delete teams you own, or leave teams where you are a member.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={refreshUserTeams}
+                className="p-2 rounded-xl border border-slate-200 hover:bg-slate-50 text-slate-600 cursor-pointer"
+                title="Refresh teams"
+              >
+                <RefreshCw className="w-3.5 h-3.5" />
+              </button>
+            </div>
+
+            <div className="divide-y divide-slate-100">
+              {orderedTeams.map((team) => {
+                const isActive = team.id === (activeWorkspaceOrg?.id || user.organizationId || `org_${user.id}`);
+                const isRenaming = renamingTeamId === team.id;
+                const teamPlan = billingService.getPlanById(team.planId);
+
+                return (
+                  <div
+                    key={team.id}
+                    className={`p-5 flex flex-col lg:flex-row lg:items-center justify-between gap-4 ${
+                      isActive ? 'bg-rose-50/40' : 'hover:bg-slate-50/50'
+                    }`}
+                  >
+                    <div className="space-y-1 min-w-0 flex-1">
+                      {isRenaming ? (
+                        <div className="flex items-center gap-2 max-w-md">
+                          <input
+                            type="text"
+                            maxLength={120}
+                            value={renameTeamDraft}
+                            onChange={(e) => setRenameTeamDraft(e.target.value)}
+                            className="flex-1 px-3 py-1.5 text-xs rounded-lg border border-slate-300 bg-white focus:outline-none focus:ring-2 focus:ring-rose-500"
+                          />
+                          <button
+                            type="button"
+                            disabled={!renameTeamDraft.trim() || Boolean(teamsBusyKey)}
+                            onClick={() => handleRenameTeamSubmit(team.id)}
+                            className="px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white text-xs font-bold cursor-pointer"
+                          >
+                            Save
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setRenamingTeamId(null);
+                              setRenameTeamDraft('');
+                            }}
+                            className="px-2.5 py-1.5 rounded-lg border border-slate-200 text-xs text-slate-600 hover:bg-slate-100"
+                          >
+                            Cancel
+                          </button>
+                        </div>
+                      ) : (
+                        <div className="flex flex-wrap items-center gap-2">
+                          <h4 className="text-sm font-bold text-slate-900">{team.name}</h4>
+                          {team.isPersonal && (
+                            <span className="px-2 py-0.5 rounded-md text-[10px] font-bold uppercase bg-slate-100 text-slate-600 border border-slate-200">
+                              Personal Workspace
+                            </span>
+                          )}
+                          {isActive && (
+                            <span className="px-2 py-0.5 rounded-md text-[10px] font-bold uppercase bg-emerald-50 text-emerald-700 border border-emerald-200">
+                              Active
+                            </span>
+                          )}
+                          <span
+                            className={`px-2 py-0.5 rounded-md text-[10px] font-bold uppercase ${
+                              team.orgRole === 'owner'
+                                ? 'bg-rose-50 text-rose-800 border border-rose-200'
+                                : 'bg-slate-100 text-slate-700 border border-slate-200'
+                            }`}
+                          >
+                            {team.orgRole === 'owner' ? 'Owner' : 'Member'}
+                          </span>
+                        </div>
+                      )}
+
+                      <div className="flex flex-wrap items-center gap-2.5 text-[11px] text-slate-500 font-mono">
+                        <span>Plan: {teamPlan?.name || team.planId}</span>
+                        <span>·</span>
+                        <span>
+                          Seats: {team.seatsUsed}/{team.seatLimit}
+                        </span>
+                        <span>·</span>
+                        <span>Usage: {team.generationsUsedThisMonth} this month</span>
+                      </div>
+                    </div>
+
+                    <div className="flex flex-wrap items-center gap-2 shrink-0">
+                      {!isActive && (
+                        <button
+                          type="button"
+                          disabled={Boolean(teamsBusyKey)}
+                          onClick={() => handleSwitchTeamFromTab(team.id, team.name)}
+                          className="px-3 py-1.5 rounded-xl bg-slate-900 hover:bg-slate-800 disabled:opacity-50 text-white text-xs font-bold cursor-pointer"
+                        >
+                          {teamsBusyKey === `switch:${team.id}` ? 'Switching...' : 'Switch'}
+                        </button>
+                      )}
+
+                      <button
+                        type="button"
+                        disabled={Boolean(teamsBusyKey)}
+                        onClick={() => {
+                          setManagedTeamId(team.id);
+                          loadTeamState(team.id);
+                          setActiveTab('team');
+                        }}
+                        className="px-3 py-1.5 rounded-xl border border-slate-200 bg-white hover:bg-slate-50 text-slate-800 text-xs font-semibold cursor-pointer"
+                      >
+                        Manage
+                      </button>
+
+                      {!team.isPersonal && team.orgRole === 'owner' && (
+                        <>
+                          <button
+                            type="button"
+                            disabled={Boolean(teamsBusyKey)}
+                            onClick={() => {
+                              setRenamingTeamId(team.id);
+                              setRenameTeamDraft(team.name);
+                            }}
+                            className="px-2.5 py-1.5 rounded-xl border border-slate-200 bg-white hover:bg-slate-50 text-slate-700 text-xs font-semibold inline-flex items-center gap-1 cursor-pointer"
+                          >
+                            <Edit2 className="w-3 h-3" />
+                            <span>Rename</span>
+                          </button>
+
+                          <button
+                            type="button"
+                            disabled={Boolean(teamsBusyKey)}
+                            onClick={() => handleDeleteTeam(team)}
+                            className="px-2.5 py-1.5 rounded-xl bg-rose-50 hover:bg-rose-100 text-rose-700 border border-rose-200 text-xs font-semibold inline-flex items-center gap-1 cursor-pointer disabled:opacity-50"
+                          >
+                            <Trash2 className="w-3 h-3" />
+                            <span>{teamsBusyKey === `delete:${team.id}` ? 'Deleting...' : 'Delete'}</span>
+                          </button>
+                        </>
+                      )}
+
+                      {!team.isPersonal && team.orgRole !== 'owner' && (
+                        <button
+                          type="button"
+                          disabled={Boolean(teamsBusyKey) || teamActionBusy}
+                          onClick={() => handleLeaveTeam(team.id, team.name)}
+                          className="px-2.5 py-1.5 rounded-xl bg-rose-50 hover:bg-rose-100 text-rose-700 border border-rose-200 text-xs font-semibold inline-flex items-center gap-1 cursor-pointer disabled:opacity-50"
+                        >
+                          <LogOut className="w-3 h-3" />
+                          <span>Leave</span>
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
             </div>
           </div>
         </div>
@@ -1037,7 +1584,7 @@ export const AccountBillingView: React.FC<AccountBillingViewProps> = ({
       {/* Tab 3: Organization Profile */}
       {activeTab === 'profile' && (
         <div className="bg-white rounded-2xl p-6 border border-slate-200 shadow-sm space-y-6">
-          <div className="flex items-center justify-between pb-4 border-b border-slate-100">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-4 border-b border-slate-100">
             <div className="flex items-center gap-4">
               <img
                 src={user.avatar}
@@ -1049,7 +1596,7 @@ export const AccountBillingView: React.FC<AccountBillingViewProps> = ({
                 <p className="text-xs text-slate-500">{user.email}</p>
                 <div className="mt-1 flex flex-wrap items-center gap-1.5">
                   <span className="inline-block px-2 py-0.5 rounded text-[10px] font-bold uppercase bg-slate-100 text-slate-700">
-                    Org Role: {effectiveOrgRole}
+                    Active Team Role: {activeWorkspaceRole}
                   </span>
                   {user.role !== 'member' && (
                     <span className="inline-block px-2 py-0.5 rounded text-[10px] font-bold uppercase bg-rose-50 text-rose-700 border border-rose-200">
@@ -1060,25 +1607,38 @@ export const AccountBillingView: React.FC<AccountBillingViewProps> = ({
               </div>
             </div>
 
-            <button
-              onClick={onEditProfile}
-              className="px-4 py-2 rounded-xl bg-slate-900 hover:bg-slate-800 text-white text-xs font-bold flex items-center gap-1.5"
-            >
-              <Edit2 className="w-3.5 h-3.5" />
-              <span>Edit Organization Details</span>
-            </button>
+            {isActiveWorkspaceOwner ? (
+              <button
+                onClick={onEditProfile}
+                className="px-4 py-2 rounded-xl bg-slate-900 hover:bg-slate-800 text-white text-xs font-bold flex items-center gap-1.5 self-start sm:self-auto"
+              >
+                <Edit2 className="w-3.5 h-3.5" />
+                <span>Edit Organization Details</span>
+              </button>
+            ) : (
+              <div className="px-3.5 py-2 rounded-xl bg-slate-100 text-slate-600 text-xs font-semibold border border-slate-200 inline-flex items-center gap-1.5 self-start sm:self-auto">
+                <Lock className="w-3.5 h-3.5 text-slate-500" />
+                <span>Only the team owner can edit the brand profile</span>
+              </div>
+            )}
           </div>
 
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 text-xs">
             <div className="p-3.5 rounded-xl bg-slate-50 border border-slate-100">
               <span className="text-[10px] font-bold uppercase text-slate-400">Organization Name</span>
-              <p className="font-bold text-slate-900 mt-1">{user.organizationProfile?.orgName}</p>
-              <p className="text-slate-500 mt-0.5">{user.organizationProfile?.website || 'No website provided'}</p>
+              <p className="font-bold text-slate-900 mt-1">
+                {user.organizationProfile?.orgName || activeWorkspaceOrg?.name || 'Not configured yet'}
+              </p>
+              <p className="text-slate-500 mt-0.5">
+                {user.organizationProfile?.website || activeWorkspaceOrg?.website || 'No website provided'}
+              </p>
             </div>
 
             <div className="p-3.5 rounded-xl bg-slate-50 border border-slate-100">
               <span className="text-[10px] font-bold uppercase text-slate-400">Organization Category</span>
-              <p className="font-bold text-slate-900 mt-1">{user.organizationProfile?.type}</p>
+              <p className="font-bold text-slate-900 mt-1">
+                {user.organizationProfile?.type || activeWorkspaceOrg?.type || 'Startup'}
+              </p>
               <p className="text-slate-500 mt-0.5">
                 {isNonprofit
                   ? hasDiscount
@@ -1090,26 +1650,38 @@ export const AccountBillingView: React.FC<AccountBillingViewProps> = ({
 
             <div className="p-3.5 rounded-xl bg-slate-50 border border-slate-100 sm:col-span-2">
               <span className="text-[10px] font-bold uppercase text-slate-400">What they do</span>
-              <p className="text-slate-700 mt-1">{user.organizationProfile?.whatTheyDo}</p>
+              <p className="text-slate-700 mt-1">
+                {user.organizationProfile?.whatTheyDo || activeWorkspaceOrg?.whatTheyDo || 'Not configured yet'}
+              </p>
             </div>
 
             <div className="p-3.5 rounded-xl bg-slate-50 border border-slate-100">
               <span className="text-[10px] font-bold uppercase text-slate-400">Target Audience</span>
-              <p className="text-slate-700 mt-1">{user.organizationProfile?.targetAudience}</p>
+              <p className="text-slate-700 mt-1">
+                {user.organizationProfile?.targetAudience || activeWorkspaceOrg?.targetAudience || 'Not configured yet'}
+              </p>
             </div>
 
             <div className="p-3.5 rounded-xl bg-slate-50 border border-slate-100">
               <span className="text-[10px] font-bold uppercase text-slate-400">Brand Tones</span>
-              <p className="text-slate-700 mt-1 font-semibold">{user.organizationProfile?.brandTone?.join(', ')}</p>
+              <p className="text-slate-700 mt-1 font-semibold">
+                {user.organizationProfile?.brandTone?.join(', ') ||
+                  activeWorkspaceOrg?.brandTone?.join(', ') ||
+                  'Not configured yet'}
+              </p>
             </div>
 
             <div className="p-3.5 rounded-xl bg-slate-50 border border-slate-100 sm:col-span-2">
               <span className="text-[10px] font-bold uppercase text-slate-400">Top 6-Month Goals</span>
-              <ul className="list-disc list-inside text-slate-700 mt-1 space-y-0.5">
-                {user.organizationProfile?.goals?.map((g, idx) => (
-                  <li key={idx}>{g}</li>
-                ))}
-              </ul>
+              {(user.organizationProfile?.goals || activeWorkspaceOrg?.goals)?.length ? (
+                <ul className="list-disc list-inside text-slate-700 mt-1 space-y-0.5">
+                  {(user.organizationProfile?.goals || activeWorkspaceOrg?.goals)?.map((g, idx) => (
+                    <li key={idx}>{g}</li>
+                  ))}
+                </ul>
+              ) : (
+                <p className="text-slate-500 mt-1">No goals configured yet.</p>
+              )}
             </div>
           </div>
         </div>
@@ -1215,11 +1787,20 @@ export const AccountBillingView: React.FC<AccountBillingViewProps> = ({
               <div>
                 <div className="flex flex-wrap items-center gap-2">
                   <h3 className="font-bold text-slate-900 text-sm">
-                    {activeOrg?.name || user.organizationProfile?.orgName || 'Organization'} · Team Seats
+                    {inspectedOrg?.name || user.organizationProfile?.orgName || 'Organization'} · Team Seats
                   </h3>
                   <span className="px-2 py-0.5 rounded-md text-[10px] font-bold uppercase bg-slate-100 text-slate-700 border border-slate-200">
-                    {plan?.name || effectivePlanId}
+                    {inspectedPlan?.name || inspectedOrg?.planId || effectivePlanId}
                   </span>
+                  {managedTeamId && managedTeamId !== (user.organizationId || `org_${user.id}`) && (
+                    <button
+                      type="button"
+                      onClick={() => handleSwitchTeamFromTab(managedTeamId, inspectedOrg?.name || 'team')}
+                      className="px-2 py-0.5 rounded-md text-[10px] font-bold bg-rose-50 text-rose-700 border border-rose-200 hover:bg-rose-100 cursor-pointer"
+                    >
+                      Make Active Workspace
+                    </button>
+                  )}
                 </div>
                 <p className="text-xs text-slate-500 mt-1">
                   All team members share the organization&apos;s plan, monthly generation pool, and saved outputs library.
@@ -1229,7 +1810,14 @@ export const AccountBillingView: React.FC<AccountBillingViewProps> = ({
               <div className="flex items-center gap-2 self-start sm:self-auto">
                 <button
                   type="button"
-                  onClick={loadTeamState}
+                  onClick={() => setActiveTab('teams')}
+                  className="px-3 py-1.5 rounded-xl border border-slate-200 hover:bg-slate-50 text-xs font-semibold text-slate-700 cursor-pointer"
+                >
+                  All Teams
+                </button>
+                <button
+                  type="button"
+                  onClick={() => loadTeamState(targetTeamOrgId)}
                   disabled={loadingTeam}
                   className="p-2 rounded-xl border border-slate-200 hover:bg-slate-50 text-slate-600 cursor-pointer disabled:opacity-50"
                   title="Refresh team seats"
@@ -1237,14 +1825,16 @@ export const AccountBillingView: React.FC<AccountBillingViewProps> = ({
                   <RefreshCw className={`w-3.5 h-3.5 ${loadingTeam ? 'animate-spin' : ''}`} />
                 </button>
 
-                {effectivePlanId !== 'team' && effectivePlanId !== 'complimentary' && !inviteOnlyMode && (
-                  <button
-                    onClick={onOpenUpgrade}
-                    className="px-3.5 py-1.5 rounded-xl bg-purple-50 text-purple-800 border border-purple-200 text-xs font-bold hover:bg-purple-100"
-                  >
-                    Upgrade to Team Plan
-                  </button>
-                )}
+                {(inspectedOrg?.planId || effectivePlanId) !== 'team' &&
+                  (inspectedOrg?.planId || effectivePlanId) !== 'complimentary' &&
+                  !inviteOnlyMode && (
+                    <button
+                      onClick={onOpenUpgrade}
+                      className="px-3.5 py-1.5 rounded-xl bg-purple-50 text-purple-800 border border-purple-200 text-xs font-bold hover:bg-purple-100"
+                    >
+                      Upgrade to Team Plan
+                    </button>
+                  )}
               </div>
             </div>
 
@@ -1288,7 +1878,7 @@ export const AccountBillingView: React.FC<AccountBillingViewProps> = ({
             )}
 
             {/* Owner Invite Form */}
-            {isOwner && (
+            {isInspectedOwner && (
               <div className="space-y-2.5">
                 <div className="flex items-center justify-between">
                   <h4 className="text-xs font-bold text-slate-800 uppercase tracking-wide">
@@ -1328,7 +1918,7 @@ export const AccountBillingView: React.FC<AccountBillingViewProps> = ({
                   </button>
                 </form>
                 <p className="text-[11px] text-slate-500">
-                  When the invited person signs in with their Google account matching that exact email, they will join your team automatically and their personal saved items will move into your shared library.
+                  When the invited person signs in with their Google account matching that exact email, the invitation will appear in their team switcher where they can accept or decline it.
                 </p>
               </div>
             )}
@@ -1352,7 +1942,7 @@ export const AccountBillingView: React.FC<AccountBillingViewProps> = ({
                   <tbody className="divide-y divide-slate-100">
                     {members.map((member) => {
                       const isSelf = member.id === user.id;
-                      const isMemberOwner = member.orgRole === 'owner' || activeOrg?.ownerId === member.id;
+                      const isMemberOwner = member.orgRole === 'owner' || inspectedOrg?.ownerId === member.id;
                       return (
                         <tr key={member.id} className={isSelf ? 'bg-slate-50/40' : 'hover:bg-slate-50/50'}>
                           <td className="py-3 px-4">
@@ -1391,7 +1981,7 @@ export const AccountBillingView: React.FC<AccountBillingViewProps> = ({
                             {member.lastLogin ? new Date(member.lastLogin).toLocaleDateString() : '—'}
                           </td>
                           <td className="py-3 px-4 text-right whitespace-nowrap">
-                            {isOwner && !isMemberOwner ? (
+                            {isInspectedOwner && !isMemberOwner ? (
                               <div className="inline-flex items-center gap-2">
                                 <button
                                   type="button"
@@ -1412,11 +2002,11 @@ export const AccountBillingView: React.FC<AccountBillingViewProps> = ({
                                   Remove
                                 </button>
                               </div>
-                            ) : !isOwner && isSelf ? (
+                            ) : !isInspectedOwner && isSelf && !isPersonalInspectedOrg ? (
                               <button
                                 type="button"
                                 disabled={teamActionBusy}
-                                onClick={handleLeaveTeam}
+                                onClick={() => handleLeaveTeam(targetTeamOrgId, inspectedOrg?.name)}
                                 className="px-2.5 py-1 rounded-lg bg-rose-50 hover:bg-rose-100 text-rose-700 border border-rose-200 text-[11px] font-semibold inline-flex items-center gap-1 cursor-pointer disabled:opacity-50"
                               >
                                 <LogOut className="w-3 h-3" />
@@ -1475,7 +2065,7 @@ export const AccountBillingView: React.FC<AccountBillingViewProps> = ({
                             {inv.expiresAt ? new Date(inv.expiresAt).toLocaleDateString() : 'Never'}
                           </td>
                           <td className="py-3 px-4 text-right">
-                            {isOwner ? (
+                            {isInspectedOwner ? (
                               <button
                                 type="button"
                                 disabled={teamActionBusy}
@@ -1508,17 +2098,17 @@ export const AccountBillingView: React.FC<AccountBillingViewProps> = ({
           </div>
 
           <p className="text-xs text-slate-600 max-w-xl leading-relaxed">
-            {isOwner && members.length > 1
+            {isInspectedOwner && members.length > 1
               ? 'You are currently the owner of a multi-member organization. Transfer ownership in the Team Seats tab (or remove other members) before deleting your account.'
-              : isOwner
-              ? 'Deleting your account will immediately erase your user profile, personal organization workspace, and saved library assets. This action cannot be undone.'
-              : 'Deleting your account will permanently remove your user profile and remove you from the team workspace while preserving the team library for the remaining members.'}
+              : isInspectedOwner
+              ? 'Deleting your account will immediately erase your user profile, personal workspace, and owned library assets. This action cannot be undone.'
+              : 'Deleting your account will permanently remove your user profile and remove you from your team memberships while preserving shared team libraries for the remaining members.'}
           </p>
 
           {!deleteConfirmOpen ? (
             <button
               onClick={() => setDeleteConfirmOpen(true)}
-              disabled={isOwner && members.length > 1}
+              disabled={isInspectedOwner && members.length > 1}
               className="px-4 py-2 rounded-xl bg-rose-600 hover:bg-rose-700 disabled:opacity-50 disabled:cursor-not-allowed text-white text-xs font-bold"
             >
               Request Account Deletion

@@ -10,6 +10,17 @@ import { FieldValue, getFirestore, initializeFirestore } from 'firebase-admin/fi
 
 dotenv.config();
 
+const UNHANDLED_REJECTION_GUARD_KEY = '__mlaUnhandledRejectionRegistered';
+if (!(globalThis as any)[UNHANDLED_REJECTION_GUARD_KEY]) {
+  (globalThis as any)[UNHANDLED_REJECTION_GUARD_KEY] = true;
+  process.on('unhandledRejection', (reason: unknown) => {
+    console.error(
+      '[Unhandled Promise Rejection]:',
+      reason instanceof Error ? reason.stack || reason.message : reason
+    );
+  });
+}
+
 const serverFile = fileURLToPath(import.meta.url);
 const serverDir = path.dirname(serverFile);
 
@@ -297,15 +308,38 @@ function buildOrgProfileFromOrgDoc(orgData: any): any | undefined {
   };
 }
 
+export const MAX_TEAMS_PER_USER = 10;
+
+function computeUserOrganizationIds(uid: string, rawOrgIds: unknown, extraOrgId?: unknown): string[] {
+  const personalOrgId = `org_${uid}`;
+  const set = new Set<string>([personalOrgId]);
+  if (Array.isArray(rawOrgIds)) {
+    for (const id of rawOrgIds) {
+      if (isValidFirestoreId(id)) set.add(id);
+    }
+  }
+  if (isValidFirestoreId(extraOrgId)) {
+    set.add(extraOrgId);
+  }
+  // Keep personal workspace first
+  return [personalOrgId, ...Array.from(set).filter((id) => id !== personalOrgId)];
+}
+
 function normalizeOrganizationRecord(orgId: string, data: any): any {
   const planId = data?.planId || 'free';
   const rawMembers = Array.isArray(data?.memberIds) ? data.memberIds : [];
-  const memberIds = Array.from(new Set([...rawMembers, ...(data?.ownerId ? [data.ownerId] : [])]));
+  const ownerId = data?.ownerId || rawMembers[0] || '';
+  const memberIds = Array.from(new Set([...rawMembers, ...(ownerId ? [ownerId] : [])]));
+  const memberRoles: Record<string, 'owner' | 'member'> = {};
+  for (const mId of memberIds) {
+    memberRoles[mId] = mId === ownerId ? 'owner' : 'member';
+  }
   return {
     id: orgId,
     name: data?.name || 'Personal Workspace',
-    ownerId: data?.ownerId || memberIds[0] || '',
+    ownerId,
     memberIds,
+    memberRoles,
     planId,
     seatLimit: Number(data?.seatLimit || getDefaultSeatLimit(planId)),
     generationsUsedThisMonth: Number(data?.generationsUsedThisMonth || 0),
@@ -323,24 +357,26 @@ function normalizeOrganizationRecord(orgId: string, data: any): any {
   };
 }
 
-async function ensureOrganizationForUser(userData: any, uid: string, now: string): Promise<any> {
-  const orgId = isValidFirestoreId(userData.organizationId) ? userData.organizationId : `org_${uid}`;
-  const orgRef = adminDb.collection('organizations').doc(orgId);
+async function ensurePersonalWorkspace(uid: string, userData: any, now: string): Promise<any> {
+  const personalOrgId = `org_${uid}`;
+  const orgRef = adminDb.collection('organizations').doc(personalOrgId);
   const orgSnap = await orgRef.get();
 
   if (!orgSnap.exists) {
-    const planId = userData.planId || 'free';
-    const profile = userData.organizationProfile;
+    const isPersonalActive = !userData?.organizationId || userData.organizationId === personalOrgId;
+    const planId = isPersonalActive ? userData?.planId || 'free' : 'free';
+    const profile = isPersonalActive ? userData?.organizationProfile : undefined;
     const newOrg = {
-      id: orgId,
-      name: profile?.orgName || `${userData.name || 'Personal'}'s Workspace`,
+      id: personalOrgId,
+      name: profile?.orgName || `${userData?.name || userData?.email?.split('@')[0] || 'Personal'}'s Workspace`,
       ownerId: uid,
       memberIds: [uid],
+      memberRoles: { [uid]: 'owner' as const },
       planId,
       seatLimit: getDefaultSeatLimit(planId),
-      generationsUsedThisMonth: Number(userData.generationsUsedThisMonth || 0),
-      bonusGenerations: Number(userData.bonusGenerations || 0),
-      billingResetDate: userData.billingResetDate || getNextMonthFirstDay(),
+      generationsUsedThisMonth: isPersonalActive ? Number(userData?.generationsUsedThisMonth || 0) : 0,
+      bonusGenerations: isPersonalActive ? Number(userData?.bonusGenerations || 0) : 0,
+      billingResetDate: userData?.billingResetDate || getNextMonthFirstDay(),
       ...(profile
         ? {
             type: profile.type || 'Startup',
@@ -352,11 +388,27 @@ async function ensureOrganizationForUser(userData: any, uid: string, now: string
             website: profile.website || '',
           }
         : {}),
-      createdAt: userData.signupDate || now,
+      createdAt: userData?.signupDate || now,
       updatedAt: now,
     };
     await orgRef.set(newOrg, { merge: true });
-    return normalizeOrganizationRecord(orgId, newOrg);
+    return normalizeOrganizationRecord(personalOrgId, newOrg);
+  }
+
+  return normalizeOrganizationRecord(personalOrgId, orgSnap.data());
+}
+
+async function ensureOrganizationForUser(userData: any, uid: string, now: string): Promise<any> {
+  const orgId = isValidFirestoreId(userData.organizationId) ? userData.organizationId : `org_${uid}`;
+  const orgRef = adminDb.collection('organizations').doc(orgId);
+  const orgSnap = await orgRef.get();
+
+  if (!orgSnap.exists) {
+    // If a stale non-personal org was deleted, fall back to personal workspace
+    if (orgId !== `org_${uid}`) {
+      return ensurePersonalWorkspace(uid, { ...userData, organizationId: `org_${uid}` }, now);
+    }
+    return ensurePersonalWorkspace(uid, userData, now);
   }
 
   const rawOrg = orgSnap.data()!;
@@ -375,9 +427,21 @@ async function ensureOrganizationForUser(userData: any, uid: string, now: string
   if (!rawOrg.billingResetDate) {
     patch.billingResetDate = userData.billingResetDate || getNextMonthFirstDay();
   }
-  const existingMembers = Array.isArray(rawOrg.memberIds) ? rawOrg.memberIds : [];
+  const existingMembers: string[] = Array.isArray(rawOrg.memberIds) ? rawOrg.memberIds : [];
+  let updatedMembers = existingMembers;
   if (!existingMembers.includes(uid) && rawOrg.ownerId === uid) {
-    patch.memberIds = Array.from(new Set([...existingMembers, uid]));
+    updatedMembers = Array.from(new Set([...existingMembers, uid]));
+    patch.memberIds = updatedMembers;
+  }
+  const normalizedRoles: Record<string, 'owner' | 'member'> = {};
+  for (const mId of updatedMembers) {
+    normalizedRoles[mId] = mId === rawOrg.ownerId ? 'owner' : 'member';
+  }
+  if (rawOrg.ownerId && !normalizedRoles[rawOrg.ownerId]) {
+    normalizedRoles[rawOrg.ownerId] = 'owner';
+  }
+  if (!rawOrg.memberRoles || JSON.stringify(rawOrg.memberRoles) !== JSON.stringify(normalizedRoles)) {
+    patch.memberRoles = normalizedRoles;
   }
   const todayStr = new Date().toISOString().split('T')[0];
   const resetDate = patch.billingResetDate || rawOrg.billingResetDate;
@@ -398,110 +462,168 @@ async function syncPlanToOrgMembers(orgId: string, planId: string, now: string):
   const orgData = orgSnap.data()!;
   const memberIds = Array.from(
     new Set([...(Array.isArray(orgData.memberIds) ? orgData.memberIds : []), ...(orgData.ownerId ? [orgData.ownerId] : [])])
-  );
+  ).filter((id) => isValidFirestoreId(id));
   if (memberIds.length === 0) return;
 
-  for (let i = 0; i < memberIds.length; i += 400) {
-    const batch = adminDb.batch();
-    for (const mId of memberIds.slice(i, i + 400)) {
-      if (isValidFirestoreId(mId)) {
-        batch.set(adminDb.collection('users').doc(mId), { planId, updatedAt: now }, { merge: true });
-      }
+  const memberSnaps = await Promise.all(memberIds.map((mId) => adminDb.collection('users').doc(mId).get()));
+  const batch = adminDb.batch();
+  let updatesCount = 0;
+  for (const mSnap of memberSnaps) {
+    if (!mSnap.exists) continue;
+    const mData = mSnap.data()!;
+    const activeOrg = isValidFirestoreId(mData.organizationId) ? mData.organizationId : `org_${mSnap.id}`;
+    if (activeOrg === orgId) {
+      batch.set(mSnap.ref, { planId, updatedAt: now }, { merge: true });
+      updatesCount++;
     }
+  }
+  if (updatesCount > 0) {
     await batch.commit();
   }
 }
 
-async function movePersonalOutputsToTeamOrg(uid: string, fromOrgId: string, toOrgId: string, now: string): Promise<number> {
-  if (!fromOrgId || !toOrgId || fromOrgId === toOrgId) return 0;
+async function deleteOrganizationCascade(orgId: string): Promise<void> {
+  const orgRef = adminDb.collection('organizations').doc(orgId);
+  const [outputsSnap, invitesSnap, historySnap] = await Promise.all([
+    orgRef.collection('outputs').get().catch(() => null),
+    orgRef.collection('invites').get().catch(() => null),
+    orgRef.collection('history').get().catch(() => null),
+  ]);
 
-  const fromOrgRef = adminDb.collection('organizations').doc(fromOrgId);
-  const fromOrgSnap = await fromOrgRef.get();
-  if (fromOrgSnap.exists) {
-    const fromData = fromOrgSnap.data()!;
-    const fromMembers = Array.from(
-      new Set([...(Array.isArray(fromData.memberIds) ? fromData.memberIds : []), ...(fromData.ownerId ? [fromData.ownerId] : [])])
-    );
-    if (fromData.ownerId !== uid || fromMembers.length > 1) {
-      // Do not move outputs out of a multi-member or non-owned organization
-      return 0;
-    }
-  } else if (fromOrgId !== `org_${uid}`) {
-    return 0;
-  }
-
-  const outputsSnap = await fromOrgRef.collection('outputs').get();
-  let movedCount = 0;
-
-  if (!outputsSnap.empty) {
-    const toOutputsCol = adminDb.collection('organizations').doc(toOrgId).collection('outputs');
-    const docs = outputsSnap.docs;
-    for (let i = 0; i < docs.length; i += 200) {
+  if (outputsSnap && !outputsSnap.empty) {
+    for (let i = 0; i < outputsSnap.docs.length; i += 400) {
       const batch = adminDb.batch();
-      const chunk = docs.slice(i, i + 200);
-      for (const docSnap of chunk) {
-        const data = docSnap.data();
-        batch.set(
-          toOutputsCol.doc(docSnap.id),
-          {
-            ...data,
-            id: docSnap.id,
-            userId: data.userId || uid,
-            orgId: toOrgId,
-            updatedAt: now,
-          },
-          { merge: true }
-        );
-        batch.delete(docSnap.ref);
-        movedCount++;
-      }
+      outputsSnap.docs.slice(i, i + 400).forEach((d) => batch.delete(d.ref));
       await batch.commit();
     }
   }
+  if (invitesSnap && !invitesSnap.empty) {
+    for (let i = 0; i < invitesSnap.docs.length; i += 200) {
+      const batch = adminDb.batch();
+      invitesSnap.docs.slice(i, i + 200).forEach((d) => {
+        batch.delete(d.ref);
+        batch.delete(adminDb.collection('teamInvites').doc(d.id));
+      });
+      await batch.commit();
+    }
+  }
+  if (historySnap && !historySnap.empty) {
+    for (let i = 0; i < historySnap.docs.length; i += 400) {
+      const batch = adminDb.batch();
+      historySnap.docs.slice(i, i + 400).forEach((d) => batch.delete(d.ref));
+      await batch.commit();
+    }
+  }
+  await orgRef.delete().catch(() => {});
+}
 
-  // Clean up empty solo personal org record if it had no other members
-  if (fromOrgSnap.exists) {
-    const fromData = fromOrgSnap.data()!;
-    const fromMembers = Array.from(
-      new Set([...(Array.isArray(fromData.memberIds) ? fromData.memberIds : []), ...(fromData.ownerId ? [fromData.ownerId] : [])])
-    );
-    if (fromData.ownerId === uid && fromMembers.length <= 1) {
-      await fromOrgRef.delete().catch(() => {});
+async function getTeamSummariesAndInvitesForUser(
+  uid: string,
+  email: string | undefined,
+  emailVerified: boolean,
+  userData: any
+): Promise<{
+  teams: any[];
+  pendingInvites: any[];
+  validOrgIds: string[];
+}> {
+  const personalOrgId = `org_${uid}`;
+  const candidateIds = computeUserOrganizationIds(uid, userData?.organizationIds, userData?.organizationId);
+  const orgSnaps = await Promise.all(
+    candidateIds.map((id) => adminDb.collection('organizations').doc(id).get().catch(() => null))
+  );
+
+  const validOrgIds: string[] = [];
+  const teams: any[] = [];
+  const nowMs = Date.now();
+
+  await Promise.all(
+    orgSnaps.map(async (orgSnap, idx) => {
+      const id = candidateIds[idx];
+      if (!orgSnap || !orgSnap.exists) return;
+      const normalized = normalizeOrganizationRecord(id, orgSnap.data());
+      const isMember = normalized.ownerId === uid || normalized.memberIds.includes(uid);
+      if (!isMember) return;
+
+      validOrgIds.push(id);
+      let pendingCount = 0;
+      try {
+        const invSnap = await adminDb.collection('organizations').doc(id).collection('invites').get();
+        for (const d of invSnap.docs) {
+          const inv = d.data();
+          if (inv.status === 'pending') {
+            if (inv.expiresAt && new Date(inv.expiresAt).getTime() <= nowMs) {
+              d.ref.update({ status: 'expired' }).catch(() => {});
+              adminDb.collection('teamInvites').doc(d.id).update({ status: 'expired' }).catch(() => {});
+            } else {
+              pendingCount++;
+            }
+          }
+        }
+      } catch {
+        // Ignore invite subcollection read errors
+      }
+
+      teams.push({
+        id: normalized.id,
+        name: normalized.name,
+        ownerId: normalized.ownerId,
+        planId: normalized.planId,
+        seatLimit: normalized.seatLimit,
+        memberCount: normalized.memberIds.length,
+        seatsUsed: normalized.memberIds.length + pendingCount,
+        orgRole: normalized.memberRoles?.[uid] || (normalized.ownerId === uid ? 'owner' : 'member'),
+        isPersonal: id === personalOrgId,
+        generationsUsedThisMonth: normalized.generationsUsedThisMonth,
+        bonusGenerations: normalized.bonusGenerations || 0,
+      });
+    })
+  );
+
+  // Order personal workspace first, then alphabetically by name
+  teams.sort((a, b) => {
+    if (a.isPersonal && !b.isPersonal) return -1;
+    if (!a.isPersonal && b.isPersonal) return 1;
+    return (a.name || '').localeCompare(b.name || '');
+  });
+
+  const sortedValidIds = teams.map((t) => t.id);
+
+  // Fetch pending unexpired team invites for user's verified email
+  const pendingInvites: any[] = [];
+  const cleanEmail = (email || '').trim().toLowerCase();
+  if (emailVerified && cleanEmail) {
+    try {
+      const teamSnap = await adminDb.collection('teamInvites').where('email', '==', cleanEmail).get();
+      for (const d of teamSnap.docs) {
+        const inv = d.data();
+        if (inv.status !== 'pending') continue;
+        if (inv.expiresAt && new Date(inv.expiresAt).getTime() <= nowMs) {
+          d.ref.update({ status: 'expired' }).catch(() => {});
+          if (isValidFirestoreId(inv.orgId)) {
+            adminDb
+              .collection('organizations')
+              .doc(inv.orgId)
+              .collection('invites')
+              .doc(d.id)
+              .update({ status: 'expired' })
+              .catch(() => {});
+          }
+          continue;
+        }
+        pendingInvites.push({ id: d.id, ...inv, status: 'pending' });
+      }
+      pendingInvites.sort((a, b) => new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime());
+    } catch (err: any) {
+      console.warn('[User Pending Team Invites Warning]:', err?.message);
     }
   }
 
-  return movedCount;
-}
-
-async function createPersonalFreeOrgForUser(
-  uid: string,
-  userData: any,
-  now: string
-): Promise<{ orgId: string; org: any }> {
-  const preferredId = `org_${uid}`;
-  const preferredSnap = await adminDb.collection('organizations').doc(preferredId).get();
-  const orgId =
-    !preferredSnap.exists || preferredSnap.data()?.ownerId === uid
-      ? preferredId
-      : `org_${uid}_${Date.now()}`;
-
-  const resetDate = getNextMonthFirstDay();
-  const personalOrg = {
-    id: orgId,
-    name: `${userData?.name || userData?.email?.split('@')[0] || 'Personal'}'s Workspace`,
-    ownerId: uid,
-    memberIds: [uid],
-    planId: 'free',
-    seatLimit: SEAT_LIMITS.free,
-    generationsUsedThisMonth: 0,
-    bonusGenerations: 0,
-    billingResetDate: resetDate,
-    createdAt: now,
-    updatedAt: now,
+  return {
+    teams,
+    pendingInvites,
+    validOrgIds: sortedValidIds.length > 0 ? sortedValidIds : [personalOrgId],
   };
-
-  await adminDb.collection('organizations').doc(orgId).set(personalOrg, { merge: false });
-  return { orgId, org: personalOrg };
 }
 
 async function getOrgSeatStats(orgId: string, orgData: any): Promise<{
@@ -882,6 +1004,7 @@ export async function handleAuthSync(authHeader?: string | null): Promise<{ stat
     }
 
     let userData: any = null;
+    const personalOrgId = `org_${verified.uid}`;
     if (snap.exists) {
       const existing = snap.data()!;
       const resolvedRole = isSuperAdmin
@@ -891,7 +1014,8 @@ export async function handleAuthSync(authHeader?: string | null): Promise<{ stat
         : existing.role || role;
       const resolvedOrgId = isValidFirestoreId(existing.organizationId)
         ? existing.organizationId
-        : `org_${verified.uid}`;
+        : personalOrgId;
+      const resolvedOrgIds = computeUserOrganizationIds(verified.uid, existing.organizationIds, resolvedOrgId);
       const resolvedOrgRole = existing.orgRole === 'member' || existing.orgRole === 'owner' ? existing.orgRole : 'owner';
 
       userData = {
@@ -902,6 +1026,7 @@ export async function handleAuthSync(authHeader?: string | null): Promise<{ stat
         avatar: verified.picture || existing.avatar,
         role: resolvedRole,
         organizationId: resolvedOrgId,
+        organizationIds: resolvedOrgIds,
         orgRole: resolvedOrgRole,
         lastLogin: now,
       };
@@ -921,7 +1046,8 @@ export async function handleAuthSync(authHeader?: string | null): Promise<{ stat
         role,
         planId: 'free',
         status: 'active',
-        organizationId: `org_${verified.uid}`,
+        organizationId: personalOrgId,
+        organizationIds: [personalOrgId],
         orgRole: 'owner',
         generationsUsedThisMonth: 0,
         totalGenerations: 0,
@@ -939,8 +1065,13 @@ export async function handleAuthSync(authHeader?: string | null): Promise<{ stat
       }
     }
 
-    // Ensure user has an organization document
+    // Always ensure personal workspace org_<uid> exists and backfill active organization
+    await ensurePersonalWorkspace(verified.uid, userData, now);
     let orgData = await ensureOrganizationForUser(userData, verified.uid, now);
+    // Ensure user is still a member of orgData; otherwise fall back to personal workspace
+    if (orgData.ownerId !== verified.uid && !orgData.memberIds.includes(verified.uid)) {
+      orgData = await ensurePersonalWorkspace(verified.uid, { ...userData, organizationId: personalOrgId }, now);
+    }
 
     // Claim first valid pending complimentary invite matching user's exact verified email (updates organization planId)
     if (pendingInviteDocs.length > 0 && userData.status !== 'suspended') {
@@ -989,131 +1120,33 @@ export async function handleAuthSync(authHeader?: string | null): Promise<{ stat
       }
     }
 
-    // Claim first valid pending unexpired team invite matching user's exact verified email
-    if (pendingTeamInviteDocs.length > 0 && userData.status !== 'suspended') {
-      for (const teamInvDoc of pendingTeamInviteDocs) {
-        try {
-          const teamInvData = teamInvDoc.data();
-          const targetOrgId = teamInvData.orgId;
-          if (!isValidFirestoreId(targetOrgId)) continue;
+    // Note: Pending team invites are NOT auto-joined on /api/auth/sync; users accept/decline them explicitly from the team switcher.
 
-          const targetOrgRef = adminDb.collection('organizations').doc(targetOrgId);
-          const orgInviteRef = targetOrgRef.collection('invites').doc(teamInvDoc.id);
-          const prevOrgId = userData.organizationId || `org_${verified.uid}`;
+    // Collect valid teams & pending team invites for this user
+    const { teams, pendingInvites, validOrgIds } = await getTeamSummariesAndInvitesForUser(
+      verified.uid,
+      email,
+      verified.emailVerified,
+      userData
+    );
 
-          const joinResult = await adminDb.runTransaction(async (tx) => {
-            const [freshTeamInv, freshOrgInv, freshTargetOrg] = await Promise.all([
-              tx.get(teamInvDoc.ref),
-              tx.get(orgInviteRef),
-              tx.get(targetOrgRef),
-            ]);
-
-            if (!freshTeamInv.exists || freshTeamInv.data()?.status !== 'pending') {
-              return { joined: false, reason: 'not_pending' };
-            }
-            if (freshOrgInv.exists && freshOrgInv.data()?.status !== 'pending') {
-              return { joined: false, reason: 'not_pending' };
-            }
-            if (!freshTargetOrg.exists) {
-              return { joined: false, reason: 'org_missing' };
-            }
-
-            const tOrg = freshTargetOrg.data()!;
-            const existingMembers: string[] = Array.from(
-              new Set([
-                ...(Array.isArray(tOrg.memberIds) ? tOrg.memberIds : []),
-                ...(tOrg.ownerId ? [tOrg.ownerId] : []),
-              ])
-            );
-            const targetSeatLimit = Number(tOrg.seatLimit || getDefaultSeatLimit(tOrg.planId));
-
-            if (!existingMembers.includes(verified.uid) && existingMembers.length >= targetSeatLimit) {
-              return { joined: false, reason: 'seat_limit' };
-            }
-
-            const updatedMembers = Array.from(new Set([...existingMembers, verified.uid]));
-            const targetPlanId = tOrg.planId || 'free';
-            const nextOrgRole = tOrg.ownerId === verified.uid ? 'owner' : 'member';
-            const sharedProfile = buildOrgProfileFromOrgDoc(tOrg);
-
-            tx.set(
-              targetOrgRef,
-              {
-                memberIds: updatedMembers,
-                updatedAt: now,
-              },
-              { merge: true }
-            );
-            tx.set(
-              userRef,
-              {
-                organizationId: targetOrgId,
-                orgRole: nextOrgRole,
-                planId: targetPlanId,
-                ...(sharedProfile ? { organizationProfile: sharedProfile } : {}),
-                updatedAt: now,
-              },
-              { merge: true }
-            );
-            tx.set(
-              teamInvDoc.ref,
-              { status: 'accepted', acceptedAt: now, acceptedBy: verified.uid },
-              { merge: true }
-            );
-            if (freshOrgInv.exists) {
-              tx.set(
-                orgInviteRef,
-                { status: 'accepted', acceptedAt: now, acceptedBy: verified.uid },
-                { merge: true }
-              );
-            }
-
-            return {
-              joined: true,
-              targetPlanId,
-              nextOrgRole,
-              targetOrgData: normalizeOrganizationRecord(targetOrgId, { ...tOrg, memberIds: updatedMembers }),
-              sharedProfile,
-            };
-          });
-
-          if (joinResult.joined && joinResult.targetOrgData) {
-            if (prevOrgId && prevOrgId !== targetOrgId) {
-              const movedCount = await movePersonalOutputsToTeamOrg(verified.uid, prevOrgId, targetOrgId, now);
-              if (movedCount > 0) {
-                console.log(`[Team Join] Moved ${movedCount} personal library outputs from ${prevOrgId} to ${targetOrgId}`);
-              }
-            }
-            userData.organizationId = targetOrgId;
-            userData.orgRole = joinResult.nextOrgRole;
-            userData.planId = joinResult.targetPlanId;
-            if (joinResult.sharedProfile) {
-              userData.organizationProfile = joinResult.sharedProfile;
-            }
-            orgData = joinResult.targetOrgData;
-
-            await logServerAudit(
-              'TEAM_MEMBER_ADDED',
-              `Added ${email} as member to organization ${orgData.name} (${targetOrgId}) via team invite ${teamInvDoc.id}`,
-              verified,
-              verified.uid
-            );
-            break;
-          }
-        } catch (teamErr: any) {
-          console.warn('[Team Invite Claim Warning]:', teamErr.message);
-        }
-      }
-    }
-
-    // Ensure user reflects authoritative organization planId, orgRole, and profile
+    // Ensure user reflects authoritative active organizationId, organizationIds, planId, orgRole, and profile
     const authoritativeOrgSnap = await adminDb.collection('organizations').doc(orgData.id).get();
     if (authoritativeOrgSnap.exists) {
       orgData = normalizeOrganizationRecord(orgData.id, authoritativeOrgSnap.data());
     }
-    const authoritativeOrgRole = orgData.ownerId === verified.uid ? 'owner' : 'member';
+    const authoritativeOrgRole = orgData.memberRoles?.[verified.uid] || (orgData.ownerId === verified.uid ? 'owner' : 'member');
     const orgSharedProfile = buildOrgProfileFromOrgDoc(orgData);
     const syncPatch: Record<string, any> = {};
+
+    if (userData.organizationId !== orgData.id) {
+      userData.organizationId = orgData.id;
+      syncPatch.organizationId = orgData.id;
+    }
+    if (JSON.stringify(userData.organizationIds || []) !== JSON.stringify(validOrgIds)) {
+      userData.organizationIds = validOrgIds;
+      syncPatch.organizationIds = validOrgIds;
+    }
     if (userData.planId !== orgData.planId) {
       userData.planId = orgData.planId;
       syncPatch.planId = orgData.planId;
@@ -1122,10 +1155,16 @@ export async function handleAuthSync(authHeader?: string | null): Promise<{ stat
       userData.orgRole = authoritativeOrgRole;
       syncPatch.orgRole = authoritativeOrgRole;
     }
-    if (orgSharedProfile && JSON.stringify(userData.organizationProfile || {}) !== JSON.stringify(orgSharedProfile)) {
-      userData.organizationProfile = orgSharedProfile;
-      syncPatch.organizationProfile = orgSharedProfile;
+    if (orgSharedProfile) {
+      if (JSON.stringify(userData.organizationProfile || {}) !== JSON.stringify(orgSharedProfile)) {
+        userData.organizationProfile = orgSharedProfile;
+        syncPatch.organizationProfile = orgSharedProfile;
+      }
+    } else if (userData.organizationProfile !== undefined) {
+      delete userData.organizationProfile;
+      syncPatch.organizationProfile = FieldValue.delete();
     }
+
     if (Object.keys(syncPatch).length > 0) {
       syncPatch.updatedAt = now;
       await userRef.set(syncPatch, { merge: true }).catch(() => {});
@@ -1154,6 +1193,8 @@ export async function handleAuthSync(authHeader?: string | null): Promise<{ stat
       data: {
         user: userData,
         organization: orgData,
+        teams,
+        pendingTeamInvites: pendingInvites,
         platformSettings: {
           inviteOnlyMode: platformSettings.inviteOnlyMode,
           paidPlansDisabled: platformSettings.inviteOnlyMode,
@@ -1188,7 +1229,7 @@ export async function handleGetInvites(authHeader?: string | null): Promise<{ st
       let status = data.status || 'pending';
       if (status === 'pending' && data.expiresAt && new Date(data.expiresAt).getTime() <= now) {
         status = 'expired';
-        await docSnap.ref.update({ status: 'expired' });
+        await docSnap.ref.update({ status: 'expired' }).catch(() => {});
       }
       invites.push({
         id: docSnap.id,
@@ -1474,6 +1515,7 @@ export async function handleAcceptInvite(
             `${verified.name || userEmail.split('@')[0] || 'Personal'}'s Workspace`,
           ownerId: verified.uid,
           memberIds: [verified.uid],
+          memberRoles: { [verified.uid]: 'owner' },
           planId: 'complimentary',
           seatLimit: nextSeatLimit,
           generationsUsedThisMonth: Number(userSnap.data()?.generationsUsedThisMonth || 0),
@@ -1506,6 +1548,7 @@ export async function handleAcceptInvite(
           planId: 'complimentary',
           status: 'active',
           organizationId: targetOrgId,
+          organizationIds: [`org_${verified.uid}`],
           orgRole: 'owner',
           generationsUsedThisMonth: 0,
           totalGenerations: 0,
@@ -1517,11 +1560,17 @@ export async function handleAcceptInvite(
           updatedAt: now,
         });
       } else {
+        const existingOrgIds = computeUserOrganizationIds(
+          verified.uid,
+          userSnap.data()?.organizationIds,
+          targetOrgId
+        );
         tx.set(
           userRef,
           {
             planId: 'complimentary',
             organizationId: targetOrgId,
+            organizationIds: existingOrgIds,
             orgRole: userSnap.data()?.orgRole || 'owner',
             updatedAt: now,
           },
@@ -1788,40 +1837,38 @@ export async function handleAdminUserAction(
         return { status: 404, data: { error: 'User not found' } };
       }
       const uData = snap.data()!;
-      const orgId = isValidFirestoreId(uData.organizationId) ? uData.organizationId : `org_${userId}`;
-      const orgRef = adminDb.collection('organizations').doc(orgId);
-      const orgSnap = await orgRef.get();
-      if (orgSnap.exists) {
+      const allUserOrgIds = computeUserOrganizationIds(userId, uData.organizationIds, uData.organizationId);
+      const orgSnaps = await Promise.all(
+        allUserOrgIds.map((oId) => adminDb.collection('organizations').doc(oId).get().catch(() => null))
+      );
+
+      for (const orgSnap of orgSnaps) {
+        if (!orgSnap || !orgSnap.exists) continue;
         const orgData = orgSnap.data()!;
         const members = Array.from(new Set(Array.isArray(orgData.memberIds) ? orgData.memberIds : []));
         if (orgData.ownerId === userId && members.filter((id) => id !== userId).length > 0) {
           return {
             status: 400,
             data: {
-              error: 'Cannot delete an organization owner while other team members exist. Remove members or transfer ownership first.',
+              error: `Cannot delete user while they still own multi-member team "${orgData.name || orgSnap.id}". Remove members or transfer ownership first.`,
             },
           };
         }
+      }
+
+      for (const orgSnap of orgSnaps) {
+        if (!orgSnap || !orgSnap.exists) continue;
+        const orgData = orgSnap.data()!;
         if (orgData.ownerId === userId) {
-          const [outputsSnap, historySnap] = await Promise.all([
-            orgRef.collection('outputs').get().catch(() => null),
-            orgRef.collection('history').get().catch(() => null),
-          ]);
-          if (outputsSnap && !outputsSnap.empty) {
-            const batch = adminDb.batch();
-            outputsSnap.docs.forEach((d) => batch.delete(d.ref));
-            await batch.commit();
-          }
-          if (historySnap && !historySnap.empty) {
-            for (let i = 0; i < historySnap.docs.length; i += 400) {
-              const batch = adminDb.batch();
-              historySnap.docs.slice(i, i + 400).forEach((d) => batch.delete(d.ref));
-              await batch.commit();
-            }
-          }
-          await orgRef.delete().catch(() => {});
+          await deleteOrganizationCascade(orgSnap.id);
         } else {
-          await orgRef.update({ memberIds: FieldValue.arrayRemove(userId), updatedAt: now }).catch(() => {});
+          await orgSnap.ref
+            .update({
+              memberIds: FieldValue.arrayRemove(userId),
+              [`memberRoles.${userId}`]: FieldValue.delete(),
+              updatedAt: now,
+            })
+            .catch(() => {});
         }
       }
 
@@ -1844,53 +1891,42 @@ export async function handleDeleteOwnAccount(authHeader?: string | null): Promis
     const userRef = adminDb.collection('users').doc(verified.uid);
     const userSnap = await userRef.get();
     const userData = userSnap.exists ? userSnap.data()! : {};
-    const orgId = isValidFirestoreId(userData.organizationId) ? userData.organizationId : `org_${verified.uid}`;
-    const orgRef = adminDb.collection('organizations').doc(orgId);
-    const orgSnap = await orgRef.get();
+    const allUserOrgIds = computeUserOrganizationIds(verified.uid, userData.organizationIds, userData.organizationId);
     const now = new Date().toISOString();
 
-    if (orgSnap.exists) {
+    const orgSnaps = await Promise.all(
+      allUserOrgIds.map((oId) => adminDb.collection('organizations').doc(oId).get().catch(() => null))
+    );
+
+    for (const orgSnap of orgSnaps) {
+      if (!orgSnap || !orgSnap.exists) continue;
       const orgData = orgSnap.data()!;
       const otherMembers = (Array.isArray(orgData.memberIds) ? orgData.memberIds : []).filter(
         (id: string) => id !== verified.uid
       );
+      if (orgData.ownerId === verified.uid && otherMembers.length > 0) {
+        return {
+          status: 400,
+          data: {
+            error: `You are the owner of multi-member team "${orgData.name || orgSnap.id}". Transfer ownership to another member before deleting your account.`,
+          },
+        };
+      }
+    }
+
+    for (const orgSnap of orgSnaps) {
+      if (!orgSnap || !orgSnap.exists) continue;
+      const orgData = orgSnap.data()!;
       if (orgData.ownerId === verified.uid) {
-        if (otherMembers.length > 0) {
-          return {
-            status: 400,
-            data: {
-              error: 'You are the organization owner. Transfer ownership to another member before deleting your account.',
-            },
-          };
-        }
-        const [outputsSnap, invitesSnap, historySnap] = await Promise.all([
-          orgRef.collection('outputs').get().catch(() => null),
-          orgRef.collection('invites').get().catch(() => null),
-          orgRef.collection('history').get().catch(() => null),
-        ]);
-        if (outputsSnap && !outputsSnap.empty) {
-          const batch = adminDb.batch();
-          outputsSnap.docs.forEach((d) => batch.delete(d.ref));
-          await batch.commit();
-        }
-        if (invitesSnap && !invitesSnap.empty) {
-          const batch = adminDb.batch();
-          invitesSnap.docs.forEach((d) => {
-            batch.delete(d.ref);
-            batch.delete(adminDb.collection('teamInvites').doc(d.id));
-          });
-          await batch.commit();
-        }
-        if (historySnap && !historySnap.empty) {
-          for (let i = 0; i < historySnap.docs.length; i += 400) {
-            const batch = adminDb.batch();
-            historySnap.docs.slice(i, i + 400).forEach((d) => batch.delete(d.ref));
-            await batch.commit();
-          }
-        }
-        await orgRef.delete().catch(() => {});
+        await deleteOrganizationCascade(orgSnap.id);
       } else {
-        await orgRef.update({ memberIds: FieldValue.arrayRemove(verified.uid), updatedAt: now }).catch(() => {});
+        await orgSnap.ref
+          .update({
+            memberIds: FieldValue.arrayRemove(verified.uid),
+            [`memberRoles.${verified.uid}`]: FieldValue.delete(),
+            updatedAt: now,
+          })
+          .catch(() => {});
       }
     }
 
@@ -1908,8 +1944,8 @@ export async function handleDeleteOwnAccount(authHeader?: string | null): Promis
 // TEAM MANAGEMENT HANDLERS (ADMIN SDK ONLY)
 // =========================================================================
 
-// T1. Get current user's organization team state
-export async function handleGetTeam(authHeader?: string | null): Promise<{ status: number; data: any }> {
+// T0. List all teams user belongs to + pending invites
+export async function handleGetUserTeams(authHeader?: string | null): Promise<{ status: number; data: any }> {
   try {
     const verified = await verifyFirebaseTokenFromHeader(authHeader);
     const now = new Date().toISOString();
@@ -1919,7 +1955,428 @@ export async function handleGetTeam(authHeader?: string | null): Promise<{ statu
       return { status: 404, data: { error: 'Account not found. Please sign in again.' } };
     }
     const userData = userSnap.data()!;
-    const org = await ensureOrganizationForUser(userData, verified.uid, now);
+    await ensurePersonalWorkspace(verified.uid, userData, now);
+    const { teams, pendingInvites, validOrgIds } = await getTeamSummariesAndInvitesForUser(
+      verified.uid,
+      verified.email,
+      verified.emailVerified,
+      userData
+    );
+
+    if (JSON.stringify(userData.organizationIds || []) !== JSON.stringify(validOrgIds)) {
+      userRef.set({ organizationIds: validOrgIds, updatedAt: now }, { merge: true }).catch(() => {});
+    }
+
+    return {
+      status: 200,
+      data: {
+        teams,
+        pendingInvites,
+        activeOrganizationId: isValidFirestoreId(userData.organizationId)
+          ? userData.organizationId
+          : `org_${verified.uid}`,
+        organizationIds: validOrgIds,
+      },
+    };
+  } catch (err: any) {
+    return { status: err.status || 500, data: { error: err.message } };
+  }
+}
+
+// T0b. Switch active team workspace
+export async function handleSwitchTeam(
+  authHeader: string | null | undefined,
+  body: any
+): Promise<{ status: number; data: any }> {
+  try {
+    const verified = await verifyFirebaseTokenFromHeader(authHeader);
+    const targetOrgId = body?.organizationId;
+    if (!isValidFirestoreId(targetOrgId)) {
+      return { status: 400, data: { error: 'Valid organizationId is required.' } };
+    }
+
+    const now = new Date().toISOString();
+    const userRef = adminDb.collection('users').doc(verified.uid);
+    const orgRef = adminDb.collection('organizations').doc(targetOrgId);
+    const [userSnap, orgSnap] = await Promise.all([userRef.get(), orgRef.get()]);
+
+    if (!userSnap.exists) {
+      return { status: 404, data: { error: 'Account not found.' } };
+    }
+    if (!orgSnap.exists) {
+      return { status: 404, data: { error: 'Team not found.' } };
+    }
+
+    const orgData = normalizeOrganizationRecord(targetOrgId, orgSnap.data());
+    const isMember = orgData.ownerId === verified.uid || orgData.memberIds.includes(verified.uid);
+    if (!isMember) {
+      return { status: 403, data: { error: 'Forbidden: You are not a member of this team.' } };
+    }
+
+    const userData = userSnap.data()!;
+    const prevOrgId = userData.organizationId || `org_${verified.uid}`;
+    const nextOrgRole: 'owner' | 'member' =
+      orgData.memberRoles?.[verified.uid] || (orgData.ownerId === verified.uid ? 'owner' : 'member');
+    const updatedOrgIds = computeUserOrganizationIds(verified.uid, userData.organizationIds, targetOrgId);
+    const sharedProfile = buildOrgProfileFromOrgDoc(orgData);
+
+    const writePatch: Record<string, any> = {
+      organizationId: targetOrgId,
+      organizationIds: updatedOrgIds,
+      orgRole: nextOrgRole,
+      planId: orgData.planId || 'free',
+      updatedAt: now,
+    };
+    if (sharedProfile) {
+      writePatch.organizationProfile = sharedProfile;
+    } else {
+      writePatch.organizationProfile = FieldValue.delete();
+    }
+
+    await userRef.set(writePatch, { merge: true });
+
+    const [updatedUserSnap, teamsInfo] = await Promise.all([
+      userRef.get(),
+      getTeamSummariesAndInvitesForUser(verified.uid, verified.email, verified.emailVerified, {
+        ...userData,
+        organizationId: targetOrgId,
+        organizationIds: updatedOrgIds,
+      }),
+    ]);
+
+    if (prevOrgId !== targetOrgId) {
+      await logServerAudit(
+        'TEAM_SWITCHED',
+        `Switched active workspace from ${prevOrgId} to ${orgData.name} (${targetOrgId})`,
+        verified,
+        verified.uid
+      );
+    }
+
+    return {
+      status: 200,
+      data: {
+        user: updatedUserSnap.data(),
+        organization: orgData,
+        teams: teamsInfo.teams,
+        pendingTeamInvites: teamsInfo.pendingInvites,
+      },
+    };
+  } catch (err: any) {
+    return { status: err.status || 500, data: { error: err.message } };
+  }
+}
+
+// T0c. Create a new team (free plan; caller becomes owner; max 10 teams)
+export async function handleCreateTeam(
+  authHeader: string | null | undefined,
+  body: any
+): Promise<{ status: number; data: any }> {
+  try {
+    const verified = await verifyFirebaseTokenFromHeader(authHeader);
+    const cleanName = typeof body?.name === 'string' ? body.name.trim().slice(0, 120) : '';
+    if (!cleanName) {
+      return { status: 400, data: { error: 'Team name is required.' } };
+    }
+
+    const now = new Date().toISOString();
+    const userRef = adminDb.collection('users').doc(verified.uid);
+    const userSnap = await userRef.get();
+    if (!userSnap.exists) {
+      return { status: 404, data: { error: 'Account not found.' } };
+    }
+
+    const userData = userSnap.data()!;
+    await ensurePersonalWorkspace(verified.uid, userData, now);
+    const { validOrgIds } = await getTeamSummariesAndInvitesForUser(
+      verified.uid,
+      verified.email,
+      verified.emailVerified,
+      userData
+    );
+
+    if (validOrgIds.length >= MAX_TEAMS_PER_USER) {
+      return {
+        status: 400,
+        data: { error: `Team limit reached. You can belong to at most ${MAX_TEAMS_PER_USER} teams (including your personal workspace).` },
+      };
+    }
+
+    const teamId = `team_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
+    const newOrg = {
+      id: teamId,
+      name: cleanName,
+      ownerId: verified.uid,
+      memberIds: [verified.uid],
+      memberRoles: { [verified.uid]: 'owner' as const },
+      planId: 'free',
+      seatLimit: SEAT_LIMITS.free,
+      generationsUsedThisMonth: 0,
+      bonusGenerations: 0,
+      billingResetDate: getNextMonthFirstDay(),
+      createdAt: now,
+      updatedAt: now,
+    };
+
+    const nextOrgIds = computeUserOrganizationIds(verified.uid, validOrgIds, teamId);
+    const switchToNew = body?.switchActive !== false;
+
+    const batch = adminDb.batch();
+    batch.set(adminDb.collection('organizations').doc(teamId), newOrg);
+    const userPatch: Record<string, any> = {
+      organizationIds: nextOrgIds,
+      updatedAt: now,
+    };
+    if (switchToNew) {
+      userPatch.organizationId = teamId;
+      userPatch.orgRole = 'owner';
+      userPatch.planId = 'free';
+      userPatch.organizationProfile = FieldValue.delete();
+    }
+    batch.set(userRef, userPatch, { merge: true });
+    await batch.commit();
+
+    await logServerAudit(
+      'TEAM_CREATED',
+      `Created new team "${cleanName}" (${teamId})`,
+      verified,
+      verified.uid
+    );
+
+    const [updatedUserSnap, teamsInfo] = await Promise.all([
+      userRef.get(),
+      getTeamSummariesAndInvitesForUser(verified.uid, verified.email, verified.emailVerified, {
+        ...userData,
+        organizationIds: nextOrgIds,
+        ...(switchToNew ? { organizationId: teamId } : {}),
+      }),
+    ]);
+
+    return {
+      status: 200,
+      data: {
+        user: updatedUserSnap.data(),
+        organization: normalizeOrganizationRecord(teamId, newOrg),
+        teams: teamsInfo.teams,
+        pendingTeamInvites: teamsInfo.pendingInvites,
+      },
+    };
+  } catch (err: any) {
+    return { status: err.status || 500, data: { error: err.message } };
+  }
+}
+
+// T0d. Rename a team (owner only; not personal workspaces)
+export async function handleRenameTeam(
+  authHeader: string | null | undefined,
+  body: any
+): Promise<{ status: number; data: any }> {
+  try {
+    const verified = await verifyFirebaseTokenFromHeader(authHeader);
+    const cleanName = typeof body?.name === 'string' ? body.name.trim().slice(0, 120) : '';
+    if (!cleanName) {
+      return { status: 400, data: { error: 'New team name is required.' } };
+    }
+
+    const userSnap = await adminDb.collection('users').doc(verified.uid).get();
+    if (!userSnap.exists) {
+      return { status: 404, data: { error: 'Account not found.' } };
+    }
+    const orgId = isValidFirestoreId(body?.organizationId)
+      ? body.organizationId
+      : isValidFirestoreId(userSnap.data()?.organizationId)
+      ? userSnap.data()!.organizationId
+      : `org_${verified.uid}`;
+
+    if (orgId === `org_${verified.uid}`) {
+      return { status: 400, data: { error: 'Your personal workspace cannot be renamed here.' } };
+    }
+
+    const orgRef = adminDb.collection('organizations').doc(orgId);
+    const orgSnap = await orgRef.get();
+    if (!orgSnap.exists) {
+      return { status: 404, data: { error: 'Team not found.' } };
+    }
+    const rawOrg = orgSnap.data()!;
+    if (rawOrg.ownerId !== verified.uid) {
+      return { status: 403, data: { error: 'Only the team owner can rename this team.' } };
+    }
+
+    const prevName = rawOrg.name || orgId;
+    const now = new Date().toISOString();
+    await orgRef.update({ name: cleanName, updatedAt: now });
+
+    // Sync active orgProfile.orgName for members currently viewing this team
+    const memberIds: string[] = Array.from(
+      new Set([...(Array.isArray(rawOrg.memberIds) ? rawOrg.memberIds : []), verified.uid])
+    ).filter((id) => isValidFirestoreId(id));
+    const memberSnaps = await Promise.all(memberIds.map((mId) => adminDb.collection('users').doc(mId).get()));
+    const batch = adminDb.batch();
+    let syncCount = 0;
+    for (const mSnap of memberSnaps) {
+      if (!mSnap.exists) continue;
+      const mData = mSnap.data()!;
+      if (mData.organizationId === orgId && mData.organizationProfile) {
+        batch.set(
+          mSnap.ref,
+          { organizationProfile: { ...mData.organizationProfile, orgName: cleanName }, updatedAt: now },
+          { merge: true }
+        );
+        syncCount++;
+      }
+    }
+    if (syncCount > 0) await batch.commit();
+
+    await logServerAudit(
+      'TEAM_RENAMED',
+      `Renamed team ${orgId} from "${prevName}" to "${cleanName}"`,
+      verified,
+      verified.uid
+    );
+
+    const updatedOrg = normalizeOrganizationRecord(orgId, { ...rawOrg, name: cleanName, updatedAt: now });
+    return { status: 200, data: { organization: updatedOrg } };
+  } catch (err: any) {
+    return { status: err.status || 500, data: { error: err.message } };
+  }
+}
+
+// T0e. Delete a team (owner only; not personal workspaces)
+export async function handleDeleteTeam(
+  authHeader: string | null | undefined,
+  body: any
+): Promise<{ status: number; data: any }> {
+  try {
+    const verified = await verifyFirebaseTokenFromHeader(authHeader);
+    const now = new Date().toISOString();
+    const userRef = adminDb.collection('users').doc(verified.uid);
+    const userSnap = await userRef.get();
+    if (!userSnap.exists) {
+      return { status: 404, data: { error: 'Account not found.' } };
+    }
+
+    const orgId = isValidFirestoreId(body?.organizationId)
+      ? body.organizationId
+      : isValidFirestoreId(userSnap.data()?.organizationId)
+      ? userSnap.data()!.organizationId
+      : `org_${verified.uid}`;
+
+    if (orgId === `org_${verified.uid}`) {
+      return { status: 400, data: { error: 'Your personal workspace cannot be deleted.' } };
+    }
+
+    const orgRef = adminDb.collection('organizations').doc(orgId);
+    const orgSnap = await orgRef.get();
+    if (!orgSnap.exists) {
+      return { status: 404, data: { error: 'Team not found.' } };
+    }
+    const rawOrg = orgSnap.data()!;
+    if (rawOrg.ownerId !== verified.uid) {
+      return { status: 403, data: { error: 'Only the team owner can delete this team.' } };
+    }
+
+    const memberIds: string[] = Array.from(
+      new Set([...(Array.isArray(rawOrg.memberIds) ? rawOrg.memberIds : []), verified.uid])
+    ).filter((id) => isValidFirestoreId(id));
+
+    // Remove orgId from every member's organizationIds and switch anyone active on it back to their personal workspace
+    for (const mId of memberIds) {
+      const mRef = adminDb.collection('users').doc(mId);
+      const mSnap = await mRef.get().catch(() => null);
+      if (!mSnap || !mSnap.exists) continue;
+      const mData = mSnap.data()!;
+      const personalId = `org_${mId}`;
+      const filteredOrgIds = computeUserOrganizationIds(mId, mData.organizationIds).filter((id) => id !== orgId);
+      const patch: Record<string, any> = {
+        organizationIds: filteredOrgIds,
+        updatedAt: now,
+      };
+      if (mData.organizationId === orgId) {
+        const personalOrg = await ensurePersonalWorkspace(mId, { ...mData, organizationId: personalId }, now);
+        const personalProfile = buildOrgProfileFromOrgDoc(personalOrg);
+        patch.organizationId = personalId;
+        patch.orgRole = 'owner';
+        patch.planId = personalOrg.planId || 'free';
+        patch.organizationProfile = personalProfile || FieldValue.delete();
+      }
+      await mRef.set(patch, { merge: true }).catch(() => {});
+    }
+
+    await deleteOrganizationCascade(orgId);
+
+    await logServerAudit(
+      'TEAM_DELETED',
+      `Deleted team "${rawOrg.name || orgId}" (${orgId})`,
+      verified,
+      verified.uid
+    );
+
+    const [updatedUserSnap, personalOrgSnap] = await Promise.all([
+      userRef.get(),
+      adminDb.collection('organizations').doc(
+        isValidFirestoreId((await userRef.get()).data()?.organizationId)
+          ? (await userRef.get()).data()!.organizationId
+          : `org_${verified.uid}`
+      ).get(),
+    ]);
+    const finalUser = updatedUserSnap.data();
+    const activeOrgId = isValidFirestoreId(finalUser?.organizationId) ? finalUser!.organizationId : `org_${verified.uid}`;
+    const activeOrg = personalOrgSnap.exists
+      ? normalizeOrganizationRecord(activeOrgId, personalOrgSnap.data())
+      : await ensurePersonalWorkspace(verified.uid, finalUser, now);
+    const teamsInfo = await getTeamSummariesAndInvitesForUser(
+      verified.uid,
+      verified.email,
+      verified.emailVerified,
+      finalUser
+    );
+
+    return {
+      status: 200,
+      data: {
+        success: true,
+        user: finalUser,
+        organization: activeOrg,
+        teams: teamsInfo.teams,
+        pendingTeamInvites: teamsInfo.pendingInvites,
+      },
+    };
+  } catch (err: any) {
+    return { status: err.status || 500, data: { error: err.message } };
+  }
+}
+
+// T1. Get organization team state (supports optional ?organizationId=)
+export async function handleGetTeam(
+  authHeader?: string | null,
+  requestedOrgId?: string | null
+): Promise<{ status: number; data: any }> {
+  try {
+    const verified = await verifyFirebaseTokenFromHeader(authHeader);
+    const now = new Date().toISOString();
+    const userRef = adminDb.collection('users').doc(verified.uid);
+    const userSnap = await userRef.get();
+    if (!userSnap.exists) {
+      return { status: 404, data: { error: 'Account not found. Please sign in again.' } };
+    }
+    const userData = userSnap.data()!;
+    let org: any;
+    if (requestedOrgId) {
+      if (!isValidFirestoreId(requestedOrgId)) {
+        return { status: 400, data: { error: 'Valid organizationId is required.' } };
+      }
+      const reqSnap = await adminDb.collection('organizations').doc(requestedOrgId).get();
+      if (!reqSnap.exists) {
+        return { status: 404, data: { error: 'Team not found.' } };
+      }
+      org = normalizeOrganizationRecord(requestedOrgId, reqSnap.data());
+      if (org.ownerId !== verified.uid && !org.memberIds.includes(verified.uid)) {
+        return { status: 403, data: { error: 'Forbidden: You are not a member of this team.' } };
+      }
+    } else {
+      org = await ensureOrganizationForUser(userData, verified.uid, now);
+    }
+
     const seatStats = await getOrgSeatStats(org.id, org);
 
     const members: any[] = [];
@@ -1933,7 +2390,7 @@ export async function handleGetTeam(authHeader?: string | null): Promise<{ statu
         name: mData.name || mData.email || 'Member',
         email: mData.email || '',
         avatar: mData.avatar || '',
-        orgRole: org.ownerId === mSnap.id ? 'owner' : 'member',
+        orgRole: org.memberRoles?.[mSnap.id] || (org.ownerId === mSnap.id ? 'owner' : 'member'),
         generationsUsedThisMonth: Number(mData.generationsUsedThisMonth || 0),
         totalGenerations: Number(mData.totalGenerations || mData.generationsUsedThisMonth || 0),
         signupDate: mData.signupDate || '',
@@ -1983,7 +2440,12 @@ export async function handleCreateTeamInvite(
     }
 
     const userData = userSnap.data()!;
-    const org = await ensureOrganizationForUser(userData, verified.uid, now);
+    const targetOrgId = isValidFirestoreId(body?.organizationId)
+      ? body.organizationId
+      : isValidFirestoreId(userData.organizationId)
+      ? userData.organizationId
+      : `org_${verified.uid}`;
+    const org = await ensureOrganizationForUser({ ...userData, organizationId: targetOrgId }, verified.uid, now);
     if (org.ownerId !== verified.uid) {
       return { status: 403, data: { error: 'Only the organization owner can invite team members.' } };
     }
@@ -2049,10 +2511,246 @@ export async function handleCreateTeamInvite(
   }
 }
 
+// T2b. Accept a pending team invite (adds team to organizationIds without leaving other teams or moving library items)
+export async function handleAcceptTeamInvite(
+  authHeader: string | null | undefined,
+  inviteId?: string
+): Promise<{ status: number; data: any }> {
+  try {
+    const verified = await verifyFirebaseTokenFromHeader(authHeader);
+    if (!isValidFirestoreId(inviteId)) {
+      return { status: 400, data: { error: 'Valid Invite ID is required.' } };
+    }
+    const userEmail = (verified.email || '').trim().toLowerCase();
+    if (!verified.emailVerified || !userEmail) {
+      return { status: 403, data: { error: 'A verified email address is required to accept a team invitation.' } };
+    }
+
+    const teamInvRef = adminDb.collection('teamInvites').doc(inviteId);
+    const preInvSnap = await teamInvRef.get();
+    if (!preInvSnap.exists) {
+      return { status: 404, data: { error: 'Team invitation not found.' } };
+    }
+    const preInv = preInvSnap.data()!;
+    const targetOrgId = preInv.orgId;
+    if (!isValidFirestoreId(targetOrgId)) {
+      return { status: 400, data: { error: 'Invitation references an invalid team.' } };
+    }
+
+    const now = new Date().toISOString();
+    const userRef = adminDb.collection('users').doc(verified.uid);
+    const targetOrgRef = adminDb.collection('organizations').doc(targetOrgId);
+    const orgInvRef = targetOrgRef.collection('invites').doc(inviteId);
+
+    const txResult = await adminDb.runTransaction(async (tx) => {
+      const [freshTeamInv, freshOrgInv, freshTargetOrg, freshUser] = await Promise.all([
+        tx.get(teamInvRef),
+        tx.get(orgInvRef),
+        tx.get(targetOrgRef),
+        tx.get(userRef),
+      ]);
+
+      if (!freshTeamInv.exists) {
+        throw new HttpError(404, 'Team invitation not found.');
+      }
+      const invData = freshTeamInv.data()!;
+      if ((invData.email || '').trim().toLowerCase() !== userEmail) {
+        throw new HttpError(403, 'This team invitation was sent to a different email address.');
+      }
+      if (invData.status === 'revoked') {
+        throw new HttpError(400, 'This team invitation has been revoked.');
+      }
+      if (invData.status === 'declined') {
+        throw new HttpError(400, 'This team invitation was declined.');
+      }
+      if (invData.status === 'expired' || (invData.expiresAt && new Date(invData.expiresAt).getTime() <= Date.now())) {
+        if (invData.status !== 'expired') {
+          tx.update(teamInvRef, { status: 'expired' });
+          if (freshOrgInv.exists) tx.update(orgInvRef, { status: 'expired' });
+        }
+        throw new HttpError(400, 'This team invitation has expired.');
+      }
+      if (invData.status !== 'pending') {
+        throw new HttpError(400, 'This team invitation is no longer pending.');
+      }
+      if (!freshTargetOrg.exists) {
+        throw new HttpError(404, 'Target team no longer exists.');
+      }
+      if (!freshUser.exists) {
+        throw new HttpError(404, 'Account not found. Please refresh and sign in again.');
+      }
+
+      const uData = freshUser.data()!;
+      const tOrg = freshTargetOrg.data()!;
+      const existingOrgIds = computeUserOrganizationIds(verified.uid, uData.organizationIds, uData.organizationId);
+      if (!existingOrgIds.includes(targetOrgId) && existingOrgIds.length >= MAX_TEAMS_PER_USER) {
+        throw new HttpError(
+          400,
+          `Team limit reached. You can belong to at most ${MAX_TEAMS_PER_USER} teams (including your personal workspace).`
+        );
+      }
+
+      const existingMembers: string[] = Array.from(
+        new Set([...(Array.isArray(tOrg.memberIds) ? tOrg.memberIds : []), ...(tOrg.ownerId ? [tOrg.ownerId] : [])])
+      );
+      const seatLimit = Number(tOrg.seatLimit || getDefaultSeatLimit(tOrg.planId));
+      if (!existingMembers.includes(verified.uid) && existingMembers.length >= seatLimit) {
+        throw new HttpError(
+          403,
+          `Seat limit reached (${existingMembers.length}/${seatLimit} seats in use). Ask the team owner to free a seat or upgrade.`
+        );
+      }
+
+      const updatedMembers = Array.from(new Set([...existingMembers, verified.uid]));
+      const nextRole: 'owner' | 'member' = tOrg.ownerId === verified.uid ? 'owner' : 'member';
+      const updatedMemberRoles: Record<string, 'owner' | 'member'> = {};
+      for (const mId of updatedMembers) {
+        updatedMemberRoles[mId] = mId === tOrg.ownerId ? 'owner' : 'member';
+      }
+      const nextOrgIds = computeUserOrganizationIds(verified.uid, [...existingOrgIds, targetOrgId]);
+
+      tx.set(
+        targetOrgRef,
+        {
+          memberIds: updatedMembers,
+          memberRoles: updatedMemberRoles,
+          updatedAt: now,
+        },
+        { merge: true }
+      );
+      tx.set(
+        userRef,
+        {
+          organizationIds: nextOrgIds,
+          ...(uData.organizationId === targetOrgId ? { orgRole: nextRole } : {}),
+          updatedAt: now,
+        },
+        { merge: true }
+      );
+      tx.set(teamInvRef, { status: 'accepted', acceptedAt: now, acceptedBy: verified.uid }, { merge: true });
+      if (freshOrgInv.exists) {
+        tx.set(orgInvRef, { status: 'accepted', acceptedAt: now, acceptedBy: verified.uid }, { merge: true });
+      }
+
+      return {
+        orgName: tOrg.name || targetOrgId,
+        organization: normalizeOrganizationRecord(targetOrgId, {
+          ...tOrg,
+          memberIds: updatedMembers,
+          memberRoles: updatedMemberRoles,
+        }),
+      };
+    });
+
+    await logServerAudit(
+      'TEAM_INVITE_ACCEPTED',
+      `Accepted invitation ${inviteId} to join team ${txResult.orgName} (${targetOrgId})`,
+      verified,
+      verified.uid
+    );
+    await logServerAudit(
+      'TEAM_MEMBER_ADDED',
+      `Added ${userEmail} as member to organization ${txResult.orgName} (${targetOrgId}) via team invite ${inviteId}`,
+      verified,
+      verified.uid
+    );
+
+    const updatedUserSnap = await userRef.get();
+    const teamsInfo = await getTeamSummariesAndInvitesForUser(
+      verified.uid,
+      verified.email,
+      verified.emailVerified,
+      updatedUserSnap.data()
+    );
+
+    return {
+      status: 200,
+      data: {
+        success: true,
+        user: updatedUserSnap.data(),
+        organization: txResult.organization,
+        teams: teamsInfo.teams,
+        pendingTeamInvites: teamsInfo.pendingInvites,
+      },
+    };
+  } catch (err: any) {
+    return { status: err.status || 500, data: { error: err.message } };
+  }
+}
+
+// T2c. Decline a pending team invite
+export async function handleDeclineTeamInvite(
+  authHeader: string | null | undefined,
+  inviteId?: string
+): Promise<{ status: number; data: any }> {
+  try {
+    const verified = await verifyFirebaseTokenFromHeader(authHeader);
+    if (!isValidFirestoreId(inviteId)) {
+      return { status: 400, data: { error: 'Valid Invite ID is required.' } };
+    }
+    const userEmail = (verified.email || '').trim().toLowerCase();
+    if (!verified.emailVerified || !userEmail) {
+      return { status: 403, data: { error: 'A verified email address is required to decline an invitation.' } };
+    }
+
+    const teamInvRef = adminDb.collection('teamInvites').doc(inviteId);
+    const snap = await teamInvRef.get();
+    if (!snap.exists) {
+      return { status: 404, data: { error: 'Team invitation not found.' } };
+    }
+    const invData = snap.data()!;
+    if ((invData.email || '').trim().toLowerCase() !== userEmail) {
+      return { status: 403, data: { error: 'This team invitation was sent to a different email address.' } };
+    }
+    if (invData.status !== 'pending') {
+      return { status: 400, data: { error: 'This invitation is no longer pending.' } };
+    }
+
+    const now = new Date().toISOString();
+    const batch = adminDb.batch();
+    batch.set(teamInvRef, { status: 'declined', declinedAt: now, declinedBy: verified.uid }, { merge: true });
+    if (isValidFirestoreId(invData.orgId)) {
+      batch.set(
+        adminDb.collection('organizations').doc(invData.orgId).collection('invites').doc(inviteId),
+        { status: 'declined', declinedAt: now, declinedBy: verified.uid },
+        { merge: true }
+      );
+    }
+    await batch.commit();
+
+    await logServerAudit(
+      'TEAM_INVITE_DECLINED',
+      `Declined team invitation ${inviteId} for ${invData.orgName || invData.orgId} (${invData.orgId})`,
+      verified,
+      verified.uid
+    );
+
+    const userSnap = await adminDb.collection('users').doc(verified.uid).get();
+    const teamsInfo = await getTeamSummariesAndInvitesForUser(
+      verified.uid,
+      verified.email,
+      verified.emailVerified,
+      userSnap.exists ? userSnap.data() : {}
+    );
+
+    return {
+      status: 200,
+      data: {
+        success: true,
+        teams: teamsInfo.teams,
+        pendingTeamInvites: teamsInfo.pendingInvites,
+      },
+    };
+  } catch (err: any) {
+    return { status: err.status || 500, data: { error: err.message } };
+  }
+}
+
 // T3. Revoke a pending team invite (organization owner only)
 export async function handleRevokeTeamInvite(
   authHeader: string | null | undefined,
-  inviteId?: string
+  inviteId?: string,
+  requestedOrgId?: string | null
 ): Promise<{ status: number; data: any }> {
   try {
     const verified = await verifyFirebaseTokenFromHeader(authHeader);
@@ -2064,9 +2762,17 @@ export async function handleRevokeTeamInvite(
     if (!userSnap.exists) {
       return { status: 404, data: { error: 'Account not found.' } };
     }
-    const orgId = isValidFirestoreId(userSnap.data()?.organizationId)
+
+    let orgId = isValidFirestoreId(requestedOrgId)
+      ? requestedOrgId
+      : isValidFirestoreId(userSnap.data()?.organizationId)
       ? userSnap.data()!.organizationId
       : `org_${verified.uid}`;
+
+    const teamInvSnap = await adminDb.collection('teamInvites').doc(inviteId).get();
+    if (teamInvSnap.exists && isValidFirestoreId(teamInvSnap.data()?.orgId) && !requestedOrgId) {
+      orgId = teamInvSnap.data()!.orgId;
+    }
 
     const orgRef = adminDb.collection('organizations').doc(orgId);
     const orgSnap = await orgRef.get();
@@ -2110,7 +2816,8 @@ export async function handleRevokeTeamInvite(
 // T4. Remove a member from the organization (organization owner only)
 export async function handleRemoveTeamMember(
   authHeader: string | null | undefined,
-  memberId?: string
+  memberId?: string,
+  requestedOrgId?: string | null
 ): Promise<{ status: number; data: any }> {
   try {
     const verified = await verifyFirebaseTokenFromHeader(authHeader);
@@ -2126,7 +2833,9 @@ export async function handleRemoveTeamMember(
     if (!ownerSnap.exists) {
       return { status: 404, data: { error: 'Account not found.' } };
     }
-    const orgId = isValidFirestoreId(ownerSnap.data()?.organizationId)
+    const orgId = isValidFirestoreId(requestedOrgId)
+      ? requestedOrgId
+      : isValidFirestoreId(ownerSnap.data()?.organizationId)
       ? ownerSnap.data()!.organizationId
       : `org_${verified.uid}`;
 
@@ -2149,21 +2858,28 @@ export async function handleRemoveTeamMember(
     const memberSnap = await memberRef.get();
     const memberData = memberSnap.exists ? memberSnap.data()! : { id: memberId };
 
-    const { orgId: newOrgId } = await createPersonalFreeOrgForUser(memberId, memberData, now);
-
     await orgRef.update({
       memberIds: FieldValue.arrayRemove(memberId),
+      [`memberRoles.${memberId}`]: FieldValue.delete(),
       updatedAt: now,
     });
 
     if (memberSnap.exists) {
-      await memberRef.update({
-        organizationId: newOrgId,
-        orgRole: 'owner',
-        planId: 'free',
-        generationsUsedThisMonth: 0,
+      const personalId = `org_${memberId}`;
+      const nextOrgIds = computeUserOrganizationIds(memberId, memberData.organizationIds).filter((id) => id !== orgId);
+      const patch: Record<string, any> = {
+        organizationIds: nextOrgIds,
         updatedAt: now,
-      });
+      };
+      if (memberData.organizationId === orgId) {
+        const personalOrg = await ensurePersonalWorkspace(memberId, { ...memberData, organizationId: personalId }, now);
+        const personalProfile = buildOrgProfileFromOrgDoc(personalOrg);
+        patch.organizationId = personalId;
+        patch.orgRole = 'owner';
+        patch.planId = personalOrg.planId || 'free';
+        patch.organizationProfile = personalProfile || FieldValue.delete();
+      }
+      await memberRef.set(patch, { merge: true });
     }
 
     await logServerAudit(
@@ -2200,7 +2916,9 @@ export async function handleTransferOwnership(
     if (!currentUserSnap.exists) {
       return { status: 404, data: { error: 'Account not found.' } };
     }
-    const orgId = isValidFirestoreId(currentUserSnap.data()?.organizationId)
+    const orgId = isValidFirestoreId(body?.organizationId)
+      ? body.organizationId
+      : isValidFirestoreId(currentUserSnap.data()?.organizationId)
       ? currentUserSnap.data()!.organizationId
       : `org_${verified.uid}`;
 
@@ -2208,20 +2926,35 @@ export async function handleTransferOwnership(
     const newOwnerRef = adminDb.collection('users').doc(newOwnerId);
 
     const newOwnerEmail = await adminDb.runTransaction(async (tx) => {
-      const [orgSnap, newOwnerSnap] = await Promise.all([tx.get(orgRef), tx.get(newOwnerRef)]);
+      const [orgSnap, newOwnerSnap, curUserTxSnap] = await Promise.all([
+        tx.get(orgRef),
+        tx.get(newOwnerRef),
+        tx.get(currentUserRef),
+      ]);
       if (!orgSnap.exists) throw new HttpError(404, 'Organization not found.');
       const orgData = orgSnap.data()!;
       if (orgData.ownerId !== verified.uid) {
         throw new HttpError(403, 'Only the organization owner can transfer ownership.');
       }
-      const memberIds: string[] = Array.isArray(orgData.memberIds) ? orgData.memberIds : [];
+      const memberIds: string[] = Array.from(
+        new Set([...(Array.isArray(orgData.memberIds) ? orgData.memberIds : []), verified.uid])
+      );
       if (!memberIds.includes(newOwnerId) || !newOwnerSnap.exists) {
         throw new HttpError(400, 'Selected user must be an active member of the organization.');
       }
 
-      tx.update(orgRef, { ownerId: newOwnerId, updatedAt: now });
-      tx.update(currentUserRef, { orgRole: 'member', updatedAt: now });
-      tx.update(newOwnerRef, { orgRole: 'owner', updatedAt: now });
+      const nextMemberRoles: Record<string, 'owner' | 'member'> = {};
+      for (const mId of memberIds) {
+        nextMemberRoles[mId] = mId === newOwnerId ? 'owner' : 'member';
+      }
+
+      tx.update(orgRef, { ownerId: newOwnerId, memberRoles: nextMemberRoles, updatedAt: now });
+      if (curUserTxSnap.exists && curUserTxSnap.data()?.organizationId === orgId) {
+        tx.update(currentUserRef, { orgRole: 'member', updatedAt: now });
+      }
+      if (newOwnerSnap.data()?.organizationId === orgId) {
+        tx.update(newOwnerRef, { orgRole: 'owner', updatedAt: now });
+      }
       return newOwnerSnap.data()?.email || newOwnerId;
     });
 
@@ -2238,8 +2971,11 @@ export async function handleTransferOwnership(
   }
 }
 
-// T6. Leave team organization (non-owner members only; provisions a new personal free org)
-export async function handleLeaveTeam(authHeader?: string | null): Promise<{ status: number; data: any }> {
+// T6. Leave team organization (non-owner members only; switches to personal workspace if leaving active org)
+export async function handleLeaveTeam(
+  authHeader?: string | null,
+  body?: { organizationId?: string }
+): Promise<{ status: number; data: any }> {
   try {
     const verified = await verifyFirebaseTokenFromHeader(authHeader);
     const now = new Date().toISOString();
@@ -2249,10 +2985,19 @@ export async function handleLeaveTeam(authHeader?: string | null): Promise<{ sta
       return { status: 404, data: { error: 'Account not found.' } };
     }
     const userData = userSnap.data()!;
-    const orgId = isValidFirestoreId(userData.organizationId) ? userData.organizationId : `org_${verified.uid}`;
+    const personalId = `org_${verified.uid}`;
+    const orgId = isValidFirestoreId(body?.organizationId)
+      ? body!.organizationId!
+      : isValidFirestoreId(userData.organizationId)
+      ? userData.organizationId
+      : personalId;
+
+    if (orgId === personalId) {
+      return { status: 400, data: { error: 'Your personal workspace cannot be left.' } };
+    }
+
     const orgRef = adminDb.collection('organizations').doc(orgId);
     const orgSnap = await orgRef.get();
-
     if (!orgSnap.exists) {
       return { status: 404, data: { error: 'Organization not found.' } };
     }
@@ -2260,25 +3005,45 @@ export async function handleLeaveTeam(authHeader?: string | null): Promise<{ sta
     if (orgData.ownerId === verified.uid) {
       return {
         status: 400,
-        data: { error: 'Organization owners cannot leave directly. Transfer ownership to another member first.' },
+        data: { error: 'Team owners cannot leave directly. Transfer ownership or delete the team instead.' },
       };
     }
 
-    const { orgId: newOrgId, org: newOrg } = await createPersonalFreeOrgForUser(verified.uid, userData, now);
+    const memberIds: string[] = Array.isArray(orgData.memberIds) ? orgData.memberIds : [];
+    if (!memberIds.includes(verified.uid)) {
+      return { status: 403, data: { error: 'You are not a member of this team.' } };
+    }
 
     await orgRef.update({
       memberIds: FieldValue.arrayRemove(verified.uid),
+      [`memberRoles.${verified.uid}`]: FieldValue.delete(),
       updatedAt: now,
     });
 
-    const userUpdate = {
-      organizationId: newOrgId,
-      orgRole: 'owner',
-      planId: 'free',
-      generationsUsedThisMonth: 0,
+    const nextOrgIds = computeUserOrganizationIds(verified.uid, userData.organizationIds).filter((id) => id !== orgId);
+    const wasActive = userData.organizationId === orgId;
+    const personalOrg = await ensurePersonalWorkspace(verified.uid, { ...userData, organizationId: personalId }, now);
+
+    const userUpdate: Record<string, any> = {
+      organizationIds: nextOrgIds,
       updatedAt: now,
     };
-    await userRef.update(userUpdate);
+
+    let activeOrg = personalOrg;
+    if (wasActive) {
+      const personalProfile = buildOrgProfileFromOrgDoc(personalOrg);
+      userUpdate.organizationId = personalId;
+      userUpdate.orgRole = 'owner';
+      userUpdate.planId = personalOrg.planId || 'free';
+      userUpdate.organizationProfile = personalProfile || FieldValue.delete();
+    } else if (isValidFirestoreId(userData.organizationId)) {
+      const activeSnap = await adminDb.collection('organizations').doc(userData.organizationId).get();
+      if (activeSnap.exists) {
+        activeOrg = normalizeOrganizationRecord(userData.organizationId, activeSnap.data());
+      }
+    }
+
+    await userRef.set(userUpdate, { merge: true });
 
     await logServerAudit(
       'TEAM_MEMBER_LEFT',
@@ -2287,13 +3052,22 @@ export async function handleLeaveTeam(authHeader?: string | null): Promise<{ sta
       verified.uid
     );
 
-    const updatedUserSnap = await userRef.get();
+    const [updatedUserSnap, teamsInfo] = await Promise.all([
+      userRef.get(),
+      getTeamSummariesAndInvitesForUser(verified.uid, verified.email, verified.emailVerified, {
+        ...userData,
+        ...userUpdate,
+      }),
+    ]);
+
     return {
       status: 200,
       data: {
         success: true,
         user: updatedUserSnap.data(),
-        organization: newOrg,
+        organization: activeOrg,
+        teams: teamsInfo.teams,
+        pendingTeamInvites: teamsInfo.pendingInvites,
       },
     };
   } catch (err: any) {
@@ -2345,7 +3119,7 @@ export async function handleAdminGetOrganizations(authHeader?: string | null): P
             name: mData.name || mData.email || mId,
             email: mData.email || '',
             avatar: mData.avatar || '',
-            orgRole: normalized.ownerId === mId ? 'owner' : 'member',
+            orgRole: normalized.memberRoles?.[mId] || (normalized.ownerId === mId ? 'owner' : 'member'),
             generationsUsedThisMonth: Number(mData.generationsUsedThisMonth || 0),
             totalGenerations: Number(mData.totalGenerations || mData.generationsUsedThisMonth || 0),
             signupDate: mData.signupDate || '',
@@ -2467,21 +3241,28 @@ export async function handleAdminRemoveOrgMember(
     const memberSnap = await memberRef.get();
     const memberData = memberSnap.exists ? memberSnap.data()! : { id: memberId };
 
-    const { orgId: newOrgId } = await createPersonalFreeOrgForUser(memberId, memberData, now);
-
     await orgRef.update({
       memberIds: FieldValue.arrayRemove(memberId),
+      [`memberRoles.${memberId}`]: FieldValue.delete(),
       updatedAt: now,
     });
 
     if (memberSnap.exists) {
-      await memberRef.update({
-        organizationId: newOrgId,
-        orgRole: 'owner',
-        planId: 'free',
-        generationsUsedThisMonth: 0,
+      const personalId = `org_${memberId}`;
+      const nextOrgIds = computeUserOrganizationIds(memberId, memberData.organizationIds).filter((id) => id !== orgId);
+      const patch: Record<string, any> = {
+        organizationIds: nextOrgIds,
         updatedAt: now,
-      });
+      };
+      if (memberData.organizationId === orgId) {
+        const personalOrg = await ensurePersonalWorkspace(memberId, { ...memberData, organizationId: personalId }, now);
+        const personalProfile = buildOrgProfileFromOrgDoc(personalOrg);
+        patch.organizationId = personalId;
+        patch.orgRole = 'owner';
+        patch.planId = personalOrg.planId || 'free';
+        patch.organizationProfile = personalProfile || FieldValue.delete();
+      }
+      await memberRef.set(patch, { merge: true });
     }
 
     await logServerAudit(
@@ -2926,7 +3707,9 @@ Write the complete deliverable now in full, ready to be reviewed by the marketin
               return streamedText;
             };
 
-            fullText = await Promise.race([executeStream(), timeoutPromise]);
+            const streamPromise = executeStream();
+            streamPromise.catch(() => {});
+            fullText = await Promise.race([streamPromise, timeoutPromise]);
             if (timerId) clearTimeout(timerId);
 
             const callDuration = Date.now() - callStartTime;
@@ -3460,9 +4243,35 @@ if (process.env.SERVERLESS !== 'true') {
     res.status(result.status).json(result.data);
   });
 
-  // Team Management Endpoints (Admin SDK)
+  // Multi-Team Management Endpoints (Admin SDK)
+  app.get('/api/teams', async (req, res) => {
+    const result = await handleGetUserTeams(req.headers.authorization);
+    res.status(result.status).json(result.data);
+  });
+
+  app.post('/api/team/switch', async (req, res) => {
+    const result = await handleSwitchTeam(req.headers.authorization, req.body);
+    res.status(result.status).json(result.data);
+  });
+
+  app.post('/api/team/create', async (req, res) => {
+    const result = await handleCreateTeam(req.headers.authorization, req.body);
+    res.status(result.status).json(result.data);
+  });
+
+  app.post('/api/team/rename', async (req, res) => {
+    const result = await handleRenameTeam(req.headers.authorization, req.body);
+    res.status(result.status).json(result.data);
+  });
+
+  app.post('/api/team/delete', async (req, res) => {
+    const result = await handleDeleteTeam(req.headers.authorization, req.body);
+    res.status(result.status).json(result.data);
+  });
+
   app.get('/api/team', async (req, res) => {
-    const result = await handleGetTeam(req.headers.authorization);
+    const orgIdParam = typeof req.query.organizationId === 'string' ? req.query.organizationId : undefined;
+    const result = await handleGetTeam(req.headers.authorization, orgIdParam);
     res.status(result.status).json(result.data);
   });
 
@@ -3471,13 +4280,25 @@ if (process.env.SERVERLESS !== 'true') {
     res.status(result.status).json(result.data);
   });
 
+  app.post('/api/team/invites/:inviteId/accept', async (req, res) => {
+    const result = await handleAcceptTeamInvite(req.headers.authorization, req.params.inviteId);
+    res.status(result.status).json(result.data);
+  });
+
+  app.post('/api/team/invites/:inviteId/decline', async (req, res) => {
+    const result = await handleDeclineTeamInvite(req.headers.authorization, req.params.inviteId);
+    res.status(result.status).json(result.data);
+  });
+
   app.post('/api/team/invites/:inviteId/revoke', async (req, res) => {
-    const result = await handleRevokeTeamInvite(req.headers.authorization, req.params.inviteId);
+    const orgIdParam = typeof req.body?.organizationId === 'string' ? req.body.organizationId : undefined;
+    const result = await handleRevokeTeamInvite(req.headers.authorization, req.params.inviteId, orgIdParam);
     res.status(result.status).json(result.data);
   });
 
   app.post('/api/team/members/:memberId/remove', async (req, res) => {
-    const result = await handleRemoveTeamMember(req.headers.authorization, req.params.memberId);
+    const orgIdParam = typeof req.body?.organizationId === 'string' ? req.body.organizationId : undefined;
+    const result = await handleRemoveTeamMember(req.headers.authorization, req.params.memberId, orgIdParam);
     res.status(result.status).json(result.data);
   });
 
@@ -3487,7 +4308,7 @@ if (process.env.SERVERLESS !== 'true') {
   });
 
   app.post('/api/team/leave', async (req, res) => {
-    const result = await handleLeaveTeam(req.headers.authorization);
+    const result = await handleLeaveTeam(req.headers.authorization, req.body);
     res.status(result.status).json(result.data);
   });
 
@@ -3568,5 +4389,8 @@ if (process.env.SERVERLESS !== 'true') {
     });
   }
 
-  startServer();
+  startServer().catch((err) => {
+    console.error('[Server Startup Error]:', err);
+    process.exit(1);
+  });
 }

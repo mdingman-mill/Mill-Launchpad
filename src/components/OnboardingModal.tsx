@@ -129,7 +129,13 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
     }
   };
 
+  const isOwner = user.orgRole !== 'member';
+
   const handleSave = () => {
+    if (!isOwner) {
+      setError('Only the team owner can edit the team brand profile.');
+      return;
+    }
     if (!orgName.trim()) {
       setError('Please enter your organization or startup name.');
       return;
@@ -496,7 +502,7 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
 
         {/* Action Buttons */}
         <div className="p-6 bg-slate-50 border-t border-slate-200 flex items-center justify-between">
-          {isEditing && onCancel ? (
+          {(isEditing || user.organizationId !== `org_${user.id}`) && onCancel ? (
             <button
               type="button"
               onClick={onCancel}

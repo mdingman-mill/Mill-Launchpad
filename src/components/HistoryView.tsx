@@ -59,6 +59,7 @@ export const HistoryView: React.FC<HistoryViewProps> = ({
   useEffect(() => {
     let active = true;
     const orgId = user.organizationId || organization?.id;
+    setSelectedRecord(null);
     setLoading(true);
     setError(null);
 

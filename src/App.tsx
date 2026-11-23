@@ -4,7 +4,15 @@
  */
 
 import React, { useState, useEffect } from 'react';
-import { User, Organization, SavedOutput, Invoice, PlatformSettings } from './types';
+import {
+  User,
+  Organization,
+  SavedOutput,
+  Invoice,
+  PlatformSettings,
+  TeamSummary,
+  TeamInvite,
+} from './types';
 import { authService } from './services/authService';
 import { dataService } from './services/dataService';
 import { Header } from './components/Header';
@@ -37,7 +45,14 @@ export default function App() {
   const [currentOrganization, setCurrentOrganization] = useState<Organization | null>(() =>
     dataService.getCachedOrganization()
   );
+  const [teams, setTeams] = useState<TeamSummary[]>(() => dataService.getCachedTeams());
+  const [pendingTeamInvites, setPendingTeamInvites] = useState<TeamInvite[]>(() =>
+    dataService.getCachedPendingTeamInvites()
+  );
   const [activeView, setActiveView] = useState<'tools' | 'library' | 'history' | 'account' | 'admin'>('tools');
+  const [accountTabRequest, setAccountTabRequest] = useState<
+    { tab: 'plan' | 'teams' | 'activity' | 'profile' | 'billing' | 'team' | 'danger'; key: number } | undefined
+  >(undefined);
   const [pendingToolLaunch, setPendingToolLaunch] = useState<{
     toolId: string;
     inputs: Record<string, string>;
@@ -92,11 +107,16 @@ export default function App() {
     const unsubscribe = authService.onAuthChange((user) => {
       setCurrentUser(user);
       setPlatformSettings(dataService.getPlatformSettings());
+      setTeams(dataService.getCachedTeams());
+      setPendingTeamInvites(dataService.getCachedPendingTeamInvites());
 
       if (user) {
         const cachedOrg = dataService.getCachedOrganization();
-        if (cachedOrg && (!user.organizationId || cachedOrg.id === user.organizationId)) {
-          setCurrentOrganization(cachedOrg);
+        const activeOrg =
+          cachedOrg && (!user.organizationId || cachedOrg.id === user.organizationId) ? cachedOrg : null;
+
+        if (activeOrg) {
+          setCurrentOrganization(activeOrg);
         } else if (user.organizationId) {
           dataService
             .getOrganization(user.organizationId)
@@ -105,13 +125,24 @@ export default function App() {
             })
             .catch(() => {});
         }
+
+        dataService
+          .fetchTeams()
+          .then((res) => {
+            setTeams(res.teams || []);
+            setPendingTeamInvites(res.pendingInvites || []);
+          })
+          .catch(() => {});
+
+        const isOwnerOfActiveOrg = activeOrg ? activeOrg.ownerId === user.id : user.orgRole !== 'member';
+        const isPersonalWorkspace = !user.organizationId || user.organizationId === `org_${user.id}`;
+        if (!user.organizationProfile && isOwnerOfActiveOrg && isPersonalWorkspace) {
+          setOnboardingOpen(true);
+        }
       } else {
         setCurrentOrganization(null);
-      }
-
-      // If signed in but no organization profile set yet, prompt onboarding
-      if (user && !user.organizationProfile) {
-        setOnboardingOpen(true);
+        setTeams([]);
+        setPendingTeamInvites([]);
       }
     });
 
@@ -128,7 +159,12 @@ export default function App() {
       if (cachedOrg) {
         setCurrentOrganization(cachedOrg);
       }
-      if (!user.organizationProfile) {
+      setTeams(dataService.getCachedTeams());
+      setPendingTeamInvites(dataService.getCachedPendingTeamInvites());
+
+      const isOwnerOfActiveOrg = cachedOrg ? cachedOrg.ownerId === user.id : user.orgRole !== 'member';
+      const isPersonalWorkspace = !user.organizationId || user.organizationId === `org_${user.id}`;
+      if (!user.organizationProfile && isOwnerOfActiveOrg && isPersonalWorkspace) {
         setOnboardingOpen(true);
       }
     } catch (err: any) {
@@ -145,6 +181,42 @@ export default function App() {
     } finally {
       setIsSigningIn(false);
     }
+  };
+
+  const handleSwitchTeam = async (organizationId: string) => {
+    const res = await dataService.switchTeam(organizationId);
+    setCurrentUser(res.user);
+    setCurrentOrganization(res.organization);
+    setTeams(res.teams);
+    setPendingTeamInvites(res.pendingTeamInvites);
+  };
+
+  const handleCreateTeam = async (name: string, switchActive = true) => {
+    const res = await dataService.createTeam(name, switchActive);
+    setCurrentUser(res.user);
+    if (switchActive) {
+      setCurrentOrganization(res.organization);
+    }
+    setTeams(res.teams);
+    setPendingTeamInvites(res.pendingTeamInvites);
+  };
+
+  const handleAcceptTeamInvite = async (inviteId: string) => {
+    const res = await dataService.acceptTeamInvite(inviteId);
+    setCurrentUser(res.user);
+    setTeams(res.teams);
+    setPendingTeamInvites(res.pendingTeamInvites);
+  };
+
+  const handleDeclineTeamInvite = async (inviteId: string) => {
+    const res = await dataService.declineTeamInvite(inviteId);
+    setTeams(res.teams);
+    setPendingTeamInvites(res.pendingTeamInvites);
+  };
+
+  const handleOpenManageTeams = () => {
+    setAccountTabRequest({ tab: 'teams', key: Date.now() });
+    setActiveView('account');
   };
 
   const handleToolCompleted = () => {
@@ -167,6 +239,9 @@ export default function App() {
       {/* Header */}
       <Header
         currentUser={currentUser}
+        currentOrganization={currentOrganization}
+        teams={teams}
+        pendingTeamInvites={pendingTeamInvites}
         activeView={activeView}
         onChangeView={setActiveView}
         onOpenSignIn={handleGoogleSignIn}
@@ -174,6 +249,11 @@ export default function App() {
           setUpgradeReason('upgrade_click');
           setUpgradeModalOpen(true);
         }}
+        onSwitchTeam={handleSwitchTeam}
+        onCreateTeam={(name) => handleCreateTeam(name, true)}
+        onAcceptTeamInvite={handleAcceptTeamInvite}
+        onDeclineTeamInvite={handleDeclineTeamInvite}
+        onOpenManageTeams={handleOpenManageTeams}
       />
 
       {/* Main Content Area */}
@@ -259,6 +339,9 @@ export default function App() {
               <AccountBillingView
                 user={currentUser}
                 organization={currentOrganization}
+                teams={teams}
+                pendingTeamInvites={pendingTeamInvites}
+                requestedTab={accountTabRequest}
                 inviteOnlyMode={platformSettings.inviteOnlyMode}
                 onOpenUpgrade={() => {
                   setUpgradeReason('upgrade_click');
@@ -268,6 +351,14 @@ export default function App() {
                 onViewReceipt={(inv) => setActiveReceipt(inv)}
                 onUserUpdated={(u) => setCurrentUser(u)}
                 onOrganizationUpdated={(org) => setCurrentOrganization(org)}
+                onTeamsChanged={(nextTeams, nextInvites) => {
+                  setTeams(nextTeams);
+                  setPendingTeamInvites(nextInvites);
+                }}
+                onSwitchTeam={handleSwitchTeam}
+                onCreateTeam={(name) => handleCreateTeam(name, true)}
+                onAcceptTeamInvite={handleAcceptTeamInvite}
+                onDeclineTeamInvite={handleDeclineTeamInvite}
                 onNavigateToTools={() => setActiveView('tools')}
                 onNavigateToLibrary={() => setActiveView('library')}
               />
