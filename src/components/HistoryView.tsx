@@ -19,12 +19,14 @@ import {
   User as UserIcon,
   Eye,
   AlertCircle,
+  ArrowRight,
 } from 'lucide-react';
 
 interface HistoryViewProps {
   user: User;
   organization?: Organization | null;
   onRerun: (toolId: string, inputs: Record<string, string>) => void;
+  onNavigateToTools?: () => void;
 }
 
 type DateRangePreset = 'all' | 'today' | '7d' | '30d' | 'custom';
@@ -33,6 +35,7 @@ export const HistoryView: React.FC<HistoryViewProps> = ({
   user,
   organization,
   onRerun,
+  onNavigateToTools,
 }) => {
   const [historyItems, setHistoryItems] = useState<GenerationHistoryItem[]>(() =>
     dataService.getHistory()
@@ -242,7 +245,11 @@ export const HistoryView: React.FC<HistoryViewProps> = ({
             <span>Generation History</span>
           </h1>
           <p className="text-xs sm:text-sm text-slate-500 mt-1">
-            Automatic 12-month log of all completed AI generations across your organization. Re-run inputs or save deliverables to the shared library.
+            Automatic 12-month log of completed AI generations for{' '}
+            <strong className="text-slate-800">
+              {organization?.name || user.organizationProfile?.orgName || 'your organization'}
+            </strong>
+            . Re-run inputs or save deliverables to the shared library.
           </p>
         </div>
 
@@ -355,6 +362,35 @@ export const HistoryView: React.FC<HistoryViewProps> = ({
               ? 'Successful tool generations are automatically recorded here for 12 months so your team can review, save, or re-run them.'
               : 'No history records match your selected member, tool, or date filters.'}
           </p>
+          {historyItems.length === 0 && onNavigateToTools ? (
+            <div className="pt-1">
+              <button
+                type="button"
+                onClick={onNavigateToTools}
+                className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold shadow-xs cursor-pointer"
+              >
+                <span>Open Marketing Tools</span>
+                <ArrowRight className="w-3.5 h-3.5" />
+              </button>
+            </div>
+          ) : (
+            hasActiveFilters && (
+              <div className="pt-1">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setSelectedMemberFilter('All');
+                    setSelectedToolFilter('All');
+                    setDatePreset('all');
+                    setSpecificDate('');
+                  }}
+                  className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl border border-slate-200 bg-white hover:bg-slate-50 text-slate-700 text-xs font-bold cursor-pointer"
+                >
+                  <span>Reset Filters</span>
+                </button>
+              </div>
+            )
+          )}
         </div>
       ) : (
         <div className="space-y-3">

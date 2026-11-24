@@ -45,6 +45,8 @@ import {
   RefreshCw,
   Trash2,
   Lock,
+  ChevronDown,
+  ArrowLeft,
 } from 'lucide-react';
 
 type TabKey = 'plan' | 'teams' | 'activity' | 'profile' | 'billing' | 'team' | 'danger';
@@ -291,6 +293,7 @@ export const AccountBillingView: React.FC<AccountBillingViewProps> = ({
   const [activitySearch, setActivitySearch] = useState('');
   const [copiedLogId, setCopiedLogId] = useState<string | null>(null);
   const [isExportingPdf, setIsExportingPdf] = useState(false);
+  const [mobileNavOpen, setMobileNavOpen] = useState(false);
 
   useEffect(() => {
     if (propTeams) setLocalTeams(propTeams);
@@ -831,16 +834,112 @@ export const AccountBillingView: React.FC<AccountBillingViewProps> = ({
     }
   };
 
+  const selectAccountTab = (tabKey: TabKey) => {
+    setActiveTab(tabKey);
+    setMobileNavOpen(false);
+    if (tabKey === 'activity') refreshActivities();
+    if (tabKey === 'teams') refreshUserTeams();
+    if (tabKey === 'team') {
+      setManagedTeamId(null);
+      loadTeamState();
+    }
+    if (tabKey === 'plan') loadTeamState();
+  };
+
+  const accountNavGroups: Array<{
+    groupLabel: string;
+    items: Array<{
+      key: TabKey;
+      label: string;
+      icon: typeof Zap;
+      meta?: string;
+      highlight?: boolean;
+      danger?: boolean;
+    }>;
+  }> = [
+    {
+      groupLabel: 'Workspace & Plan',
+      items: [
+        { key: 'plan', label: 'Plan & Usage', icon: Zap },
+        {
+          key: 'teams',
+          label: 'Manage Teams',
+          icon: Building2,
+          meta:
+            localPendingInvites.length > 0
+              ? `${orderedTeams.length || 1} · ${localPendingInvites.length} invite`
+              : `${orderedTeams.length || 1}`,
+          highlight: localPendingInvites.length > 0,
+        },
+        {
+          key: 'team',
+          label: 'Team Seats',
+          icon: Users,
+          meta: `${members.length}/${seatLimit}`,
+        },
+        { key: 'profile', label: 'Organization Profile', icon: ShieldCheck },
+      ],
+    },
+    {
+      groupLabel: 'Activity & Billing',
+      items: [
+        {
+          key: 'activity',
+          label: 'Activity History',
+          icon: History,
+          meta: `${activities.length}`,
+        },
+        {
+          key: 'billing',
+          label: 'Billing & Invoices',
+          icon: CreditCard,
+          meta: invoices.length > 0 ? `${invoices.length}` : undefined,
+        },
+      ],
+    },
+    {
+      groupLabel: 'Account Security',
+      items: [{ key: 'danger', label: 'Danger Zone', icon: AlertTriangle, danger: true }],
+    },
+  ];
+
+  const activeNavItem =
+    accountNavGroups.flatMap((g) => g.items).find((item) => item.key === activeTab) ||
+    accountNavGroups[0].items[0];
+  const ActiveNavIcon = activeNavItem.icon;
+
   return (
-    <div className="space-y-6 pb-12 max-w-5xl">
+    <div className="space-y-6 pb-12 max-w-7xl">
       {/* Top Banner */}
-      <div>
-        <h1 className="text-2xl sm:text-3xl font-extrabold text-slate-900 font-heading">
-          Account & Billing
-        </h1>
-        <p className="text-xs sm:text-sm text-slate-500 mt-1">
-          Manage your subscription tier, track AI generation activity history, and configure organization profiles.
-        </p>
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-2 border-b border-slate-200/80">
+        <div>
+          <div className="flex items-center gap-2 text-xs text-slate-500 mb-1">
+            <span>Account &amp; Billing</span>
+            <span aria-hidden="true">/</span>
+            <span className="font-semibold text-slate-800">{activeNavItem.label}</span>
+          </div>
+          <h1 className="text-2xl sm:text-3xl font-extrabold text-slate-900 font-heading">
+            Account &amp; Billing
+          </h1>
+          <p className="text-xs sm:text-sm text-slate-500 mt-1">
+            Active workspace:{' '}
+            <strong className="text-slate-800">
+              {activeWorkspaceOrg?.name || user.organizationProfile?.orgName || 'Personal Workspace'}
+            </strong>
+            {' · '}Manage teams, seats, brand profile, usage, and billing records.
+          </p>
+        </div>
+
+        {onNavigateToTools && (
+          <button
+            type="button"
+            onClick={() => onNavigateToTools()}
+            className="self-start sm:self-auto inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl border border-slate-200 bg-white hover:bg-slate-50 text-xs font-bold text-slate-700 transition-colors shrink-0 cursor-pointer"
+          >
+            <ArrowLeft className="w-3.5 h-3.5" />
+            <span>Back to Marketing Tools</span>
+          </button>
+        )}
       </div>
 
       {feedbackMsg && (
@@ -849,87 +948,210 @@ export const AccountBillingView: React.FC<AccountBillingViewProps> = ({
             <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
             <span>{feedbackMsg}</span>
           </div>
-          <button onClick={() => setFeedbackMsg(null)} className="text-emerald-900 font-bold">
+          <button onClick={() => setFeedbackMsg(null)} className="text-emerald-900 font-bold cursor-pointer">
             &times;
           </button>
         </div>
       )}
 
-      {/* Tabs */}
-      <div className="flex items-center gap-2 border-b border-slate-200 pb-px overflow-x-auto">
-        {[
-          { key: 'plan', label: 'Plan & Usage', icon: Zap },
-          {
-            key: 'teams',
-            label:
-              localPendingInvites.length > 0
-                ? `Manage Teams (${orderedTeams.length}) · ${localPendingInvites.length} invite`
-                : `Manage Teams (${orderedTeams.length || 1})`,
-            icon: Building2,
-          },
-          { key: 'team', label: `Team Seats (${members.length}/${seatLimit})`, icon: Users },
-          { key: 'profile', label: 'Organization Profile', icon: ShieldCheck },
-          { key: 'activity', label: `Activity History (${activities.length})`, icon: History },
-          { key: 'billing', label: 'Billing & Invoices', icon: CreditCard },
-          { key: 'danger', label: 'Danger Zone', icon: AlertTriangle },
-        ].map((tab) => {
-          const Icon = tab.icon;
-          const isActive = activeTab === tab.key;
-          return (
-            <button
-              key={tab.key}
-              onClick={() => {
-                setActiveTab(tab.key as TabKey);
-                if (tab.key === 'activity') refreshActivities();
-                if (tab.key === 'teams') refreshUserTeams();
-                if (tab.key === 'team') {
-                  setManagedTeamId(null);
-                  loadTeamState();
-                }
-                if (tab.key === 'plan') loadTeamState();
-              }}
-              className={`flex items-center gap-2 px-4 py-2.5 text-xs font-bold border-b-2 transition-all whitespace-nowrap ${
-                isActive
-                  ? 'border-rose-600 text-rose-600'
-                  : 'border-transparent text-slate-500 hover:text-slate-800 hover:border-slate-300'
-              }`}
-            >
-              <Icon className="w-4 h-4" />
-              <span>{tab.label}</span>
-            </button>
-          );
-        })}
-      </div>
-
-      {/* Tab 1: Plan & Usage */}
-      {activeTab === 'plan' && (
-        <div className="space-y-6">
-          <div className="bg-white rounded-2xl p-6 border border-slate-200 shadow-sm space-y-6">
-            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-              <div>
-                <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400">
-                  Active Organization · {activeWorkspaceOrg?.name || user.organizationProfile?.orgName || 'Workspace'}
+      {/* Vertical Sidebar + Content Workspace */}
+      <div className="flex flex-col lg:flex-row gap-6 items-start">
+        {/* Mobile Vertical Section Selector */}
+        <div className="w-full lg:hidden">
+          <button
+            type="button"
+            aria-expanded={mobileNavOpen}
+            onClick={() => setMobileNavOpen(!mobileNavOpen)}
+            className="w-full bg-white border border-slate-200 rounded-2xl px-4 py-3 flex items-center justify-between text-left shadow-xs cursor-pointer"
+          >
+            <div className="flex items-center gap-2.5 min-w-0">
+              <ActiveNavIcon className="w-4 h-4 text-rose-600 shrink-0" />
+              <div className="min-w-0">
+                <span className="block text-[10px] font-bold uppercase tracking-wider text-slate-400">
+                  Account Section
                 </span>
-                <h3 className="text-xl font-bold text-slate-900 font-heading mt-0.5 flex flex-wrap items-center gap-2">
-                  <span>{plan?.name}</span>
-                  <span className="px-2 py-0.5 rounded-md text-[10px] font-bold bg-slate-100 text-slate-700 border border-slate-200 uppercase">
-                    {isActiveWorkspaceOwner ? 'Org Owner' : 'Org Member'}
-                  </span>
-                  {hasDiscount && (
-                    <span className="px-2 py-0.5 rounded-md text-[10px] font-bold bg-emerald-50 text-emerald-800 border border-emerald-200">
-                      Nonprofit 25% Off Active
-                    </span>
-                  )}
-                </h3>
-                <p className="text-xs text-slate-500 mt-1">{plan?.description}</p>
-              </div>
-
-              <div className="flex items-center gap-2">
-                <span className="px-3.5 py-1.5 rounded-xl bg-slate-100 text-slate-600 text-xs font-bold border border-slate-200">
-                  {inviteOnlyMode ? 'Invite-Only Mode (Paid plans disabled)' : 'Paid plans coming soon'}
+                <span className="block text-sm font-bold text-slate-900 truncate">
+                  {activeNavItem.label}
                 </span>
               </div>
             </div>
+            <ChevronDown
+              className={`w-4 h-4 text-slate-500 transition-transform ${mobileNavOpen ? 'rotate-180' : ''}`}
+            />
+          </button>
+
+          {mobileNavOpen && (
+            <nav
+              aria-label="Account sections"
+              className="mt-2 bg-white border border-slate-200 rounded-2xl p-2 shadow-sm space-y-3"
+            >
+              {accountNavGroups.map((group) => (
+                <div key={group.groupLabel} className="space-y-1">
+                  <div className="px-3 pt-1 text-[10px] font-bold uppercase tracking-wider text-slate-400">
+                    {group.groupLabel}
+                  </div>
+                  <div className="space-y-0.5">
+                    {group.items.map((item) => {
+                      const Icon = item.icon;
+                      const isActive = activeTab === item.key;
+                      return (
+                        <button
+                          key={item.key}
+                          type="button"
+                          onClick={() => selectAccountTab(item.key)}
+                          className={`w-full flex items-center justify-between gap-2 px-3 py-2.5 rounded-xl text-xs font-semibold transition-colors cursor-pointer ${
+                            isActive
+                              ? item.danger
+                                ? 'bg-rose-50 text-rose-700 font-bold'
+                                : 'bg-slate-900 text-white font-bold'
+                              : item.danger
+                              ? 'text-rose-600 hover:bg-rose-50/70'
+                              : 'text-slate-700 hover:bg-slate-100/80'
+                          }`}
+                        >
+                          <span className="flex items-center gap-2.5 min-w-0">
+                            <Icon
+                              className={`w-4 h-4 shrink-0 ${
+                                isActive
+                                  ? item.danger
+                                    ? 'text-rose-600'
+                                    : 'text-rose-400'
+                                  : item.danger
+                                  ? 'text-rose-500'
+                                  : 'text-slate-400'
+                              }`}
+                            />
+                            <span className="truncate">{item.label}</span>
+                          </span>
+                          {item.meta && (
+                            <span
+                              className={`text-[10px] font-mono tabular-nums shrink-0 ${
+                                isActive
+                                  ? 'text-slate-200'
+                                  : item.highlight
+                                  ? 'text-amber-700 font-bold'
+                                  : 'text-slate-400'
+                              }`}
+                            >
+                              {item.meta}
+                            </span>
+                          )}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              ))}
+            </nav>
+          )}
+        </div>
+
+        {/* Desktop Vertical Navigation Sidebar */}
+        <aside className="hidden lg:block w-64 shrink-0 sticky top-32">
+          <nav
+            aria-label="Account sections"
+            className="bg-white rounded-2xl border border-slate-200 p-2.5 shadow-xs space-y-4"
+          >
+            {accountNavGroups.map((group) => (
+              <div key={group.groupLabel} className="space-y-1">
+                <div className="px-3 pt-1 text-[10px] font-bold uppercase tracking-wider text-slate-400">
+                  {group.groupLabel}
+                </div>
+                <div className="space-y-0.5">
+                  {group.items.map((item) => {
+                    const Icon = item.icon;
+                    const isActive = activeTab === item.key;
+                    return (
+                      <button
+                        key={item.key}
+                        type="button"
+                        onClick={() => selectAccountTab(item.key)}
+                        className={`w-full flex items-center justify-between gap-2 px-3 py-2.5 rounded-xl text-xs font-semibold transition-colors cursor-pointer ${
+                          isActive
+                            ? item.danger
+                              ? 'bg-rose-50 text-rose-700 font-bold'
+                              : 'bg-slate-900 text-white font-bold'
+                            : item.danger
+                            ? 'text-rose-600 hover:bg-rose-50/70'
+                            : 'text-slate-700 hover:bg-slate-100/80'
+                        }`}
+                      >
+                        <span className="flex items-center gap-2.5 min-w-0">
+                          <Icon
+                            className={`w-4 h-4 shrink-0 ${
+                              isActive
+                                ? item.danger
+                                  ? 'text-rose-600'
+                                  : 'text-rose-400'
+                                : item.danger
+                                ? 'text-rose-500'
+                                : 'text-slate-400'
+                            }`}
+                          />
+                          <span className="truncate">{item.label}</span>
+                        </span>
+                        {item.meta && (
+                          <span
+                            className={`text-[10px] font-mono tabular-nums shrink-0 ${
+                              isActive
+                                ? 'text-slate-200'
+                                : item.highlight
+                                ? 'text-amber-700 font-bold'
+                                : 'text-slate-400'
+                            }`}
+                          >
+                            {item.meta}
+                          </span>
+                        )}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            ))}
+          </nav>
+        </aside>
+
+        {/* Main Content Viewport */}
+        <div className="flex-1 min-w-0 w-full space-y-6">
+          {/* Tab 1: Plan & Usage */}
+          {activeTab === 'plan' && (
+            <div className="space-y-6">
+              <div className="bg-white rounded-2xl p-6 border border-slate-200 shadow-sm space-y-6">
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+                  <div>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400">
+                        Active Organization · {activeWorkspaceOrg?.name || user.organizationProfile?.orgName || 'Workspace'}
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => selectAccountTab('teams')}
+                        className="text-[11px] font-semibold text-rose-600 hover:text-rose-700 underline cursor-pointer"
+                      >
+                        Manage Teams &rarr;
+                      </button>
+                    </div>
+                    <h3 className="text-xl font-bold text-slate-900 font-heading mt-0.5 flex flex-wrap items-center gap-2">
+                      <span>{plan?.name}</span>
+                      <span className="px-2 py-0.5 rounded-md text-[10px] font-bold bg-slate-100 text-slate-700 border border-slate-200 uppercase">
+                        {isActiveWorkspaceOwner ? 'Org Owner' : 'Org Member'}
+                      </span>
+                      {hasDiscount && (
+                        <span className="px-2 py-0.5 rounded-md text-[10px] font-bold bg-emerald-50 text-emerald-800 border border-emerald-200">
+                          Nonprofit 25% Off Active
+                        </span>
+                      )}
+                    </h3>
+                    <p className="text-xs text-slate-500 mt-1">{plan?.description}</p>
+                  </div>
+
+                  <div className="flex items-center gap-2">
+                    <span className="px-3.5 py-1.5 rounded-xl bg-slate-100 text-slate-600 text-xs font-bold border border-slate-200">
+                      {inviteOnlyMode ? 'Invite-Only Mode (Paid plans disabled)' : 'Paid plans coming soon'}
+                    </span>
+                  </div>
+                </div>
 
             {/* Usage Progress */}
             <div className="p-4 rounded-xl bg-slate-50 border border-slate-100 space-y-3">
@@ -2136,6 +2358,8 @@ export const AccountBillingView: React.FC<AccountBillingViewProps> = ({
           )}
         </div>
       )}
+        </div>
+      </div>
     </div>
   );
 };

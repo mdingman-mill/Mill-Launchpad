@@ -254,6 +254,10 @@ export default function App() {
         onAcceptTeamInvite={handleAcceptTeamInvite}
         onDeclineTeamInvite={handleDeclineTeamInvite}
         onOpenManageTeams={handleOpenManageTeams}
+        onOpenAccountTab={(tab) => {
+          setAccountTabRequest({ tab, key: Date.now() });
+          setActiveView('account');
+        }}
       />
 
       {/* Main Content Area */}
@@ -308,6 +312,10 @@ export default function App() {
                   setUpgradeModalOpen(true);
                 }}
                 onEditProfile={() => setOnboardingOpen(true)}
+                onViewProfile={() => {
+                  setAccountTabRequest({ tab: 'profile', key: Date.now() });
+                  setActiveView('account');
+                }}
                 onSavedToLibrary={() => {}}
                 onToolCompleted={handleToolCompleted}
               />
@@ -321,6 +329,7 @@ export default function App() {
                   setPendingToolLaunch({ toolId, inputs, key: Date.now() });
                   setActiveView('tools');
                 }}
+                onNavigateToTools={() => setActiveView('tools')}
               />
             )}
 
@@ -332,6 +341,7 @@ export default function App() {
                   setPendingToolLaunch({ toolId, inputs, key: Date.now() });
                   setActiveView('tools');
                 }}
+                onNavigateToTools={() => setActiveView('tools')}
               />
             )}
 
@@ -369,9 +379,7 @@ export default function App() {
                 currentUser={currentUser}
                 inviteOnlyMode={platformSettings.inviteOnlyMode}
                 onPlatformSettingsChanged={setPlatformSettings}
-                onImpersonateUser={() => {}}
                 onViewReceipt={(inv) => setActiveReceipt(inv)}
-                onDataReset={() => {}}
               />
             )}
           </>

@@ -18,6 +18,7 @@ import {
   Settings,
   Building2,
   Mail,
+  ShieldCheck,
 } from 'lucide-react';
 
 interface HeaderProps {
@@ -34,6 +35,7 @@ interface HeaderProps {
   onAcceptTeamInvite?: (inviteId: string) => Promise<void> | void;
   onDeclineTeamInvite?: (inviteId: string) => Promise<void> | void;
   onOpenManageTeams?: () => void;
+  onOpenAccountTab?: (tab: 'plan' | 'teams' | 'activity' | 'profile' | 'billing' | 'team' | 'danger') => void;
 }
 
 export const Header: React.FC<HeaderProps> = ({
@@ -49,6 +51,7 @@ export const Header: React.FC<HeaderProps> = ({
   onAcceptTeamInvite,
   onDeclineTeamInvite,
   onOpenManageTeams,
+  onOpenAccountTab,
 }) => {
   const [userDropdownOpen, setUserDropdownOpen] = useState(false);
   const [teamDropdownOpen, setTeamDropdownOpen] = useState(false);
@@ -235,7 +238,11 @@ export const Header: React.FC<HeaderProps> = ({
                         type="button"
                         onClick={() => {
                           setUserDropdownOpen(false);
-                          onChangeView('account');
+                          if (onOpenAccountTab) {
+                            onOpenAccountTab('plan');
+                          } else {
+                            onChangeView('account');
+                          }
                         }}
                         className="w-full text-left px-3 py-2 rounded-lg hover:bg-slate-50 font-medium flex items-center justify-between cursor-pointer"
                       >
@@ -249,7 +256,27 @@ export const Header: React.FC<HeaderProps> = ({
                         type="button"
                         onClick={() => {
                           setUserDropdownOpen(false);
-                          onOpenManageTeams?.();
+                          if (onOpenAccountTab) {
+                            onOpenAccountTab('profile');
+                          } else {
+                            onChangeView('account');
+                          }
+                        }}
+                        className="w-full text-left px-3 py-2 rounded-lg hover:bg-slate-50 font-medium flex items-center gap-2 cursor-pointer"
+                      >
+                        <ShieldCheck className="w-3.5 h-3.5 text-slate-500" />
+                        <span>Organization Profile</span>
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setUserDropdownOpen(false);
+                          if (onOpenAccountTab) {
+                            onOpenAccountTab('teams');
+                          } else {
+                            onOpenManageTeams?.();
+                          }
                         }}
                         className="w-full text-left px-3 py-2 rounded-lg hover:bg-slate-50 font-medium flex items-center justify-between cursor-pointer"
                       >

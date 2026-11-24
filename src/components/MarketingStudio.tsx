@@ -41,6 +41,7 @@ interface MarketingStudioProps {
   onUsageUpdated: (newOrgUsage: number, newMemberUsage?: number) => void;
   onRequireUpgrade: () => void;
   onEditProfile: () => void;
+  onViewProfile?: () => void;
   onSavedToLibrary: (output: SavedOutput) => void;
   onToolCompleted: () => void;
 }
@@ -61,6 +62,7 @@ export const MarketingStudio: React.FC<MarketingStudioProps> = ({
   onUsageUpdated,
   onRequireUpgrade,
   onEditProfile,
+  onViewProfile,
   onSavedToLibrary,
   onToolCompleted,
 }) => {
@@ -546,10 +548,19 @@ export const MarketingStudio: React.FC<MarketingStudioProps> = ({
                   </span>
                   {isTeamOwner ? (
                     <button
+                      type="button"
                       onClick={onEditProfile}
-                      className="text-xs font-bold text-rose-600 hover:text-rose-700 underline"
+                      className="text-xs font-bold text-rose-600 hover:text-rose-700 underline cursor-pointer"
                     >
                       Edit Profile
+                    </button>
+                  ) : onViewProfile ? (
+                    <button
+                      type="button"
+                      onClick={onViewProfile}
+                      className="text-[11px] font-semibold text-slate-600 hover:text-slate-900 underline cursor-pointer"
+                    >
+                      View Team Profile
                     </button>
                   ) : (
                     <span className="text-[11px] text-slate-400 font-medium">

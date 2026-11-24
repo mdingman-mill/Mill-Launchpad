@@ -51,7 +51,7 @@ export const Footer: React.FC = () => {
           <div className="text-center md:text-right text-[11px] text-slate-400">
             <p className="font-semibold text-slate-200">Powered by Millennium Agency.</p>
             <p className="text-slate-500 text-[10px] mt-0.5">
-              Proof of Concept • Simulated Google Auth & Stripe Billing
+              Client Growth Portal • Nonprofit &amp; Startup Suite
             </p>
           </div>
         </div>

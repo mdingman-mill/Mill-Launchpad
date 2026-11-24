@@ -22,18 +22,21 @@ import {
   Eye,
   Users,
   FolderInput,
+  ArrowRight,
 } from 'lucide-react';
 
 interface LibraryViewProps {
   user: User;
   organization?: Organization | null;
   onOpenToolWithInputs?: (toolId: string, inputs: Record<string, string>) => void;
+  onNavigateToTools?: () => void;
 }
 
 export const LibraryView: React.FC<LibraryViewProps> = ({
   user,
   organization,
   onOpenToolWithInputs,
+  onNavigateToTools,
 }) => {
   const [outputs, setOutputs] = useState<SavedOutput[]>(() => dataService.getOutputs(user.id));
   const [teamMembers, setTeamMembers] = useState<TeamMember[]>([]);
@@ -171,6 +174,19 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
       return true;
     });
   }, [outputs, scopeFilter, selectedToolFilter, selectedMemberFilter, titleSearch, user.id]);
+
+  const hasActiveFilters =
+    scopeFilter !== 'all' ||
+    titleSearch.trim().length > 0 ||
+    selectedToolFilter !== 'All' ||
+    selectedMemberFilter !== 'All';
+
+  const resetFilters = () => {
+    setScopeFilter('all');
+    setTitleSearch('');
+    setSelectedToolFilter('All');
+    setSelectedMemberFilter('All');
+  };
 
   const handleOpenModal = (item: SavedOutput, startEditing = false) => {
     setSelectedOutput(item);
@@ -330,7 +346,11 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
             <span>Team Marketing Library</span>
           </h1>
           <p className="text-xs sm:text-sm text-slate-500 mt-1">
-            Shared organization repository. Browse saved deliverables from your team, edit your items, or save your own copy.
+            Shared library for{' '}
+            <strong className="text-slate-800">
+              {organization?.name || user.organizationProfile?.orgName || 'your organization'}
+            </strong>
+            . Browse saved deliverables from your team, edit items, or save your own copy.
           </p>
         </div>
 
@@ -425,6 +445,15 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
               ))}
             </select>
           </div>
+          {hasActiveFilters && (
+            <button
+              type="button"
+              onClick={resetFilters}
+              className="text-xs font-semibold text-rose-600 hover:text-rose-700 px-2 py-1 cursor-pointer whitespace-nowrap"
+            >
+              Reset Filters
+            </button>
+          )}
         </div>
       </div>
 
@@ -438,6 +467,30 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
               ? 'When your team generates marketing copy with any tool, click "Save to Library" to share it here.'
               : 'No saved deliverables match your current filters. Try clearing your search or filter selections.'}
           </p>
+          {outputs.length === 0 && onNavigateToTools ? (
+            <div className="pt-1">
+              <button
+                type="button"
+                onClick={onNavigateToTools}
+                className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold shadow-xs cursor-pointer"
+              >
+                <span>Open Marketing Tools</span>
+                <ArrowRight className="w-3.5 h-3.5" />
+              </button>
+            </div>
+          ) : (
+            hasActiveFilters && (
+              <div className="pt-1">
+                <button
+                  type="button"
+                  onClick={resetFilters}
+                  className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl border border-slate-200 bg-white hover:bg-slate-50 text-slate-700 text-xs font-bold cursor-pointer"
+                >
+                  <span>Reset Filters</span>
+                </button>
+              </div>
+            )
+          )}
         </div>
       ) : (
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5">
